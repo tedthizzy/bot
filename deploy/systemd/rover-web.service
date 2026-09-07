@@ -1,0 +1,38 @@
+[Unit]
+Description=rover web — face page, teleop, and the always-live STOP button
+Documentation=https://github.com/tedthizzy/bot/blob/main/ARCHITECTURE.md
+After=rover-robotd.service network-online.target
+# Wants=, not just After=: systemd only pulls network-online.target in when
+# a unit asks for it, so the ordering above was inert and this started as
+# soon as multi-user.target was reached -- before NetworkManager had an
+# address, which is the box probe failing on every boot.
+Wants=rover-robotd.service network-online.target
+# The rover behaves identically with rover-web dead: it is an ADDITIONAL stop
+# authority, never a link in any other stop path (4.5).
+
+[Service]
+Type=simple
+User=rover-web
+Group=rover
+WorkingDirectory=/opt/rover
+Environment=PYTHONUNBUFFERED=1
+# No --host here: the bind address comes from [web] bind, which defaults to
+# loopback. POST /utter reaches a motion skill and POST /clear clears the
+# software e-stop, and neither is authenticated, so exposing the page on the
+# house Wi-Fi is a value someone types in config/robot.toml.
+ExecStart=/opt/rover/.venv/bin/rover-web --config /opt/rover/config/robot.toml
+
+Restart=always
+RestartSec=1
+StartLimitIntervalSec=0
+
+ReadWritePaths=/run/rover /data/logs
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=full
+LockPersonality=yes
+
+[Install]
+WantedBy=rover.target

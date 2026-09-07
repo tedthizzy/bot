@@ -1,0 +1,176 @@
+# config/robot.example.toml -- the committed reference configuration.
+#
+# ARCHITECTURE 5.8 is the key list; this file carries every key with the
+# document's value and the reason it is that value.  Copy it to
+# config/robot.toml (deploy/install.sh does), which is gitignored because it is
+# the one that ends up holding a real box address.
+#
+# As shipped, this file runs against the fake endpoint:
+#     make sim                      # fakebox on 127.0.0.1:8000
+#     [box] url is localhost, so nothing here names a machine on your network.
+# For a real box, export the address instead of editing the file:
+#     ROVER__BOX__URL="http://<your-box>:8000/v1"
+#
+# Overrides are ROVER__SECTION__KEY, parsed with TOML's own value grammar, and
+# every applied override logs at WARN (A33).  Every [limits] and [safety] key
+# has a compiled ceiling: a value above it REFUSES STARTUP and is never clamped.
+# Every one of them is republished in welcome.limits / welcome.safety, so a gate
+# reads the running value rather than this file.
+#
+# No credential ever appears here.  A key ending _key, _token or _secret holding
+# a literal is a load error; [box] api_key_env names the variable instead.
+
+[robot]
+wheel_radius_m = 0.045          # 90 mm wheels
+track_m        = 0.150
+ticks_per_rev  = 2200           # JGB37-520 50:1, 11 PPR quadrature
+name           = "rover"        # wake-word and TTS identity (open item 11)
+
+[limits]
+# Operational bounds.  Every one of these is at or below the cap the MCU
+# compiled in; the MCU enforces its own and cannot be raised by any frame (I-4).
+drive_m               = 1.0
+speed_mps             = 0.30    # the speed every A21 stopping-distance number assumes
+speed_default_mps     = 0.20    # unlocked to speed_mps only when front ToF > 1.0 m
+turn_deg              = 180.0
+rate_dps              = 60.0
+accel_mps2            = 0.5     # increases only; every decrease uses the 2000 mm/s^2 abort ramp
+alpha_radps2          = 1.0
+frame_ttl_ms          = 300     # T1, on the MCU's own clock
+goal_ttl_ms_max       = 5000    # T2 ceiling
+budget_path_m         = 1.5     # I-15, per user instruction
+budget_motion_s       = 12.0    # I-15, per user instruction
+motion_cooldown_ms    = 3000    # first motion of a turn_id only
+motion_idle_disarm_ms = 5000
+twist_linear_mps      = 0.30
+twist_angular_radps   = 1.047
+twist_renew_ms        = 200
+
+[serial]
+backend             = "uart"
+port                = "/dev/rover-mcu"   # the udev symlink; ttyAMA4 appears nowhere in code (A4)
+baud                = 921600
+setpoint_hz         = 20
+cmd_gate_max_age_ms = 150      # T0: below link_alive_max_age_ms, a validator rule
+reseed_wait_ms      = 500      # bounded wait for one T before adopting ack_seq + 1 (A8)
+open_retry_ms       = 500      # retry open() so an unplugged MCU is not a start-order bug
+
+[bus]
+sock        = "/run/rover/robotd.sock"
+frames_sock = "/run/rover/frames.sock"
+brain_sock  = "/run/rover/brain.sock"
+state_hz    = 10
+allow_sources = ["brain", "web"]          # may command motion
+allow_stream  = []                        # twist sources; EMPTY in production (A35)
+clear_sources = ["web"]                   # may clear estop_sw -- never brain (4.2)
+source_uids   = { brain = "rover-brain", web = "rover-web", teleop = "rover-web" }
+teleop_input_max_age_ms = 250             # browser -> rover-web TTL (4.5)
+client_ping_hz  = 5
+client_ping_gap_ms = 400                  # covers kill -STOP, where no EOF arrives
+
+[camera]
+backend      = "picamera2"
+encoder      = "mjpeg"
+main         = [896, 672]     # describe_scene / find still
+lores        = [640, 480]     # motion-turn still and the preview stream: 20x15 = 300 Qwen tokens
+jpeg_quality = 80
+# The 4:3 CROP of the Camera Module 3 Wide's 102 deg horizontal, NOT the 120 deg
+# diagonal on the box.  bearing_deg is computed from this and center_x_permille;
+# 120 here would inflate every bearing by 45%.  preflight logs the value implied
+# by ScalerCrop; recalibrate at G3a.
+hfov_deg     = 83.0
+
+[audio]
+device_match  = "ReSpeaker"   # PortAudio name substring, not an ALSA string
+device_index  = -1            # -1 = resolve from device_match; preflight logs the index
+duplex        = "half"        # v1 is half-duplex (A29); no TTS while ARMED_MOVING
+input         = "text"        # text -> ptt at deploy step 14 -> wake only after G3b
+# aplay -D. Empty is ALSA's default, which on a Pi 4 is card 0 -- vc4-hdmi or
+# the headphone jack, NOT the ReSpeaker Lite's amp. `aplay -l` names the card.
+output_device = ""
+
+[wake]
+backend   = "hotkey"          # "pyopen" after G3b, with a self-trained model
+# Absolute: the process cwd is not where the model lives. NOTHING SHIPS ONE --
+# openWakeWord's pre-trained models are CC BY-NC-SA, so train your own (~1 h in
+# the provided notebook) and put it here before flipping [audio] input="wake".
+model     = "/data/models/wake/rover.tflite"
+threshold = 0.5
+
+[vad]
+backend        = "sherpa"     # Silero through sherpa_onnx.VoiceActivityDetector
+# Absolute, and not in the repo: fetch it into /data/models/stt before G3b.
+model          = "/data/models/stt/silero_vad.onnx"
+min_silence_ms = 400          # VAD owns end-of-speech (A27); inside the 9 latency totals
+chunk          = 512
+
+[stt]
+backend        = "text"       # "sherpa" after the G3b bake-off
+model_dir      = "/data/models/stt"
+min_confidence = 0.5          # authorized_motion; a null confidence counts as authorized
+min_chars      = 2
+
+[tts]
+backend = "piper"             # a subprocess, never imported: piper-tts is GPL-3.0-or-later (A28)
+bin     = "/opt/rover/.venv-tts/bin/piper"
+# The absolute path install.sh downloads to, handed to `piper -m`. A bare name
+# resolves against the process cwd, where nothing is. The `-low` in the stem is
+# what selects the 16 kHz sample rate.
+voice   = "/data/models/tts/en_US-lessac-low.onnx"
+threads = 1
+
+[web]
+# Loopback by default: POST /utter reaches a motion skill and POST /clear clears
+# the software e-stop, both unauthenticated. Putting the page on the house Wi-Fi
+# is a value you type here, never a default -- see the README's safety section.
+bind = "127.0.0.1"
+port = 8080
+
+[box]
+# Localhost by default so this committed file names no machine on anyone's
+# network and `make sim` works with no edit.  Point it at the real box with
+# ROVER__BOX__URL rather than by editing this line.
+url    = "http://localhost:8000/v1"
+model  = "rover-vlm"          # vLLM --served-model-name
+api_key_env = "ROVER_BOX_API_KEY"   # the NAME of a variable; never a key
+structured_output_mode = "json_schema"   # "json_object" + compat profile if the probe says so
+timeout_s   = 8.0
+connect_s   = 1.0
+ttft_s      = 2.5
+max_tokens  = 160
+temperature = 0.0             # greedy; the G1 variance sweep is reported apart
+health_probe_s     = 0.8      # T3: 3 x 0.8 = 2.4 s, inside A20's 3 s
+health_probe_fails = 3        # probe runs only while a brain-owned motion command is active
+
+[battery]
+# 3S Samsung INR18650-35E open-circuit volts per cell -> state of charge.
+# Evaluated on V_oc = vbat_mv + imotor_ma * R_pack_mOhm/1000 (A25), never on the
+# sagging terminal voltage.
+ocv_per_cell = [4.20, 4.00, 3.85, 3.70, 3.60, 3.50, 3.30, 3.20]
+soc_pct      = [ 100,   85,   70,   50,   35,   20,    8,    0]
+
+[safety]
+obs_max_age_ms        = 5000   # I-23, on the monotonic clock
+link_alive_max_age_ms = 200    # readiness and is_connected
+
+# --- read-only MIRRORS of firmware constants --------------------------------
+# preflight asserts CRC-32 over the seven values below, in exactly this order,
+# equals the B banner's safety_hash.  Editing them changes nothing on the MCU --
+# it makes preflight fail, which is the point.
+tof_stop_mm          = 250
+tof_slow_mm          = 600
+slow_zone_w_mrad_s   = 500
+tof_timing_budget_ms = 20      # short distance mode; long-mode fallback is 33/40 (4.1)
+tof_inter_period_ms  = 30
+tof_poll_hz          = 50
+cliff_delta_mm       = 80
+# ----------------------------------------------------------------------------
+
+cliff_baseline_mm   = 98       # ASSERTED against the MCU's E CAL_STORED, never written
+obstacle_escalate_s = 30       # or >=2 rejected escape attempts, whichever comes first
+r_pack_mohm = 65                # mirror of ROVER_R_PACK_MOHM; state.battery.oc_v is computed from it
+
+[log]
+dir                = "/data/logs"   # JSONL only, no SQLite (A34)
+state_decimate_hz  = 5
+retain_days        = 7              # install.sh writes a matching logrotate stanza

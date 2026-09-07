@@ -1,0 +1,66 @@
+{
+  "generator": "tests/fixtures/make_fixtures.py",
+  "version": 1,
+  "jpeg": {
+    "width": 640,
+    "height": 480,
+    "quality": 80,
+    "subsampling": "4:4:4"
+  },
+  "audio": {
+    "rate_hz": 16000,
+    "channels": 1,
+    "format": "s16le"
+  },
+  "note": "Every file here is drawn by the generator, so a checkout carries no unexplained binary. The STT bake-off of G3b needs real speech and cannot be synthesized: put recorded WAVs in tests/fixtures/audio/bakeoff/ with a sibling transcript file per recording, or G3b reports 'requires recordings' rather than a WER.",
+  "files": {
+    "frames/f_kitchen.jpg": {
+      "kind": "frame",
+      "bytes": 33831,
+      "sha256": "d449c09fc204678eb1fc13194d799de6ba437d88d5170647f68c6d50374a5ca5",
+      "description": "a kitchen: table left with a red mug, doorway ahead, chair right"
+    },
+    "frames/f_corridor.jpg": {
+      "kind": "frame",
+      "bytes": 43244,
+      "sha256": "fa1be9cbacab79442a12b66f462a33e8def91575c95fa077f519ca091f9717d5",
+      "description": "an empty corridor with a closed door at the far end"
+    },
+    "frames/f_text_sign.jpg": {
+      "kind": "frame",
+      "bytes": 57959,
+      "sha256": "35ef29e311660398b634235b9c8356078e8c052710bf82287a916b5f8fdc78f3",
+      "description": "corridor with a sign carrying the ARCHITECTURE 13 injected instruction"
+    },
+    "frames/f_text_authority.jpg": {
+      "kind": "frame",
+      "bytes": 64867,
+      "sha256": "1a8d472b344311c4b6e28c2c8a141220e32024e36743e169156e902d37e88b66",
+      "description": "corridor with an authority-impersonation injection on a sign"
+    },
+    "frames/f_text_negation.jpg": {
+      "kind": "frame",
+      "bytes": 63201,
+      "sha256": "849bae3d2a8c880a84796ff2e241967358a440fa2cade7ebc27a0848a33d2176",
+      "description": "corridor with a negation-wording injection on a sign"
+    },
+    "audio/silence_1s.wav": {
+      "kind": "audio",
+      "bytes": 32044,
+      "sha256": "643f8a8dc8bd9c19225afffad2becfec5426180b3749cb208abdf1a6c8354efc",
+      "description": "one second of digital silence"
+    },
+    "audio/tone_1k_1s.wav": {
+      "kind": "audio",
+      "bytes": 32044,
+      "sha256": "db0cb0c2b460cd06bb995d392a783ff45c2e1c85276fdf1dc1d99cd904517ff5",
+      "description": "1 kHz reference tone, -8 dBFS"
+    },
+    "audio/click_train_10s.wav": {
+      "kind": "audio",
+      "bytes": 320044,
+      "sha256": "c526a79eafde23c198a27b384d01189e03891fa12881800301cc8460b527366a",
+      "description": "a 5 ms click on each whole second: the timing stimulus for G3a and G5"
+    }
+  }
+}

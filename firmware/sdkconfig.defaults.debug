@@ -1,0 +1,10 @@
+# Layered on sdkconfig.defaults by `firmware/docker/build.sh debug`.
+# Never flash this to a robot that is meant to move: the boot banner says so
+# (caps bit 0, ctrl_flags b7) and robotd refuses to arm a debug build.
+
+CONFIG_ROVER_DEBUG_BUILD=y
+
+CONFIG_ESP_CONSOLE_NONE=n
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+CONFIG_BOOTLOADER_LOG_LEVEL_INFO=y

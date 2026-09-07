@@ -1,0 +1,153 @@
+/* rover-web, every page.  No external assets: no font, no icon, no CDN. */
+:root {
+  color-scheme: dark;
+  --bg: #0d1013;
+  --panel: #161b21;
+  --line: #2a323b;
+  --ink: #e6edf3;
+  --dim: #8b98a5;
+  --ok: #3fb950;
+  --bad: #f85149;
+  --accent: #58a6ff;
+}
+* { box-sizing: border-box; }
+html, body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--ink);
+  font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+  overscroll-behavior: none;
+}
+body { display: flex; flex-direction: column; }
+
+.bar {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 8px 14px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+}
+.bar a {
+  color: var(--dim);
+  text-decoration: none;
+  padding: 4px 8px;
+  border-radius: 6px;
+}
+.bar a[aria-current="page"] { color: var(--ink); background: #222b33; }
+.bar .spacer { flex: 1; }
+
+.dot { display: inline-flex; align-items: center; gap: 6px; color: var(--dim); font-size: 13px; }
+.dot::before {
+  content: "";
+  width: 9px; height: 9px;
+  border-radius: 50%;
+  background: var(--bad);
+}
+.dot[data-up="true"]::before { background: var(--ok); }
+
+main { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 16px; padding: 16px; min-height: 0; }
+
+/* The STOP button sits outside every other control and needs no script: it is
+   a plain form POST, so it still works with JavaScript broken or the WebSocket
+   down.  It is never behind the model or the validator. */
+.stop { padding: 12px 14px 20px; background: var(--panel); border-top: 1px solid var(--line); }
+.stop button {
+  width: 100%;
+  min-height: 84px;
+  font: 700 30px/1 system-ui, sans-serif;
+  letter-spacing: 0.12em;
+  color: #fff;
+  background: #b62324;
+  border: 3px solid #ff7b72;
+  border-radius: 14px;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+.stop button:active { background: #8c1a1b; }
+.stop .note { margin: 8px 2px 0; font-size: 12px; color: var(--dim); text-align: center; }
+
+button.plain {
+  font: 15px system-ui, sans-serif;
+  color: var(--ink);
+  background: #21262d;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 9px 14px;
+  cursor: pointer;
+}
+button.plain:active { background: #2d333b; }
+
+#face-svg { width: min(80vw, 62vh); height: auto; }
+
+.pad {
+  position: relative;
+  width: min(84vw, 56vh);
+  aspect-ratio: 1;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  touch-action: none;
+}
+.pad .cross { position: absolute; inset: 0; }
+.pad .knob {
+  position: absolute;
+  width: 22%;
+  height: 22%;
+  margin: -11% 0 0 -11%;
+  border-radius: 50%;
+  background: var(--accent);
+  opacity: 0.85;
+  pointer-events: none;
+  left: 50%;
+  top: 50%;
+}
+.readout { font-variant-numeric: tabular-nums; color: var(--dim); font-size: 13px; }
+
+.row { display: flex; gap: 10px; width: min(92vw, 620px); }
+textarea {
+  flex: 1;
+  min-height: 84px;
+  resize: vertical;
+  font: 15px system-ui, sans-serif;
+  color: var(--ink);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 10px;
+}
+#ptt {
+  width: min(92vw, 620px);
+  min-height: 96px;
+  font-size: 20px;
+}
+#ptt[data-held="true"] { background: #1f6feb; border-color: #58a6ff; }
+
+.log {
+  width: min(92vw, 620px);
+  max-height: 26vh;
+  overflow: auto;
+  font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--dim);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 8px 10px;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+.warn { color: #d29922; }
+
+/* The latched-fault recovery panel.  It sits above STOP and never in front of
+   it: a clear is not a stop authority and must not be reachable by mistake. */
+.faults {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  background: var(--panel);
+  border-top: 1px solid var(--line);
+}
+.faults .note { width: 100%; margin: 0; font-size: 12px; color: #d29922; }

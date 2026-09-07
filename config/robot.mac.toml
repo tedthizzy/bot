@@ -1,0 +1,158 @@
+# config/robot.mac.toml -- the MacBook simulation profile (ARCHITECTURE 10).
+#
+# Same key set as config/robot.example.toml.  Only the adapter selections and
+# the paths differ, because principle 6 says fakes are configuration, never a
+# code branch: there is no `if sys.platform` anywhere in the components.
+#
+#     make sim        # uses this file
+#
+# Everything under ./run and ./data is relative to the repo root and gitignored.
+# `make sim` must never try to write /data.
+
+[robot]
+wheel_radius_m = 0.045
+track_m        = 0.150
+ticks_per_rev  = 2200
+name           = "rover"
+
+[limits]
+# Identical to the Pi.  The gates assert against welcome.limits, so a simulation
+# that quietly ran wider bounds would prove nothing.
+drive_m               = 1.0
+speed_mps             = 0.30
+speed_default_mps     = 0.20
+turn_deg              = 180.0
+rate_dps              = 60.0
+accel_mps2            = 0.5
+alpha_radps2          = 1.0
+frame_ttl_ms          = 300
+goal_ttl_ms_max       = 5000
+budget_path_m         = 1.5
+budget_motion_s       = 12.0
+motion_cooldown_ms    = 3000
+motion_idle_disarm_ms = 5000
+twist_linear_mps      = 0.30
+twist_angular_radps   = 1.047
+twist_renew_ms        = 200
+
+[serial]
+backend             = "pty"
+# mcu-sim symlinks this to whatever pty slave the OS allocated -- /dev/ttysNNN
+# on macOS is unpredictable -- and removes it on exit.  robotd retries open()
+# every open_retry_ms until it appears, which is what removes `make sim`'s
+# start-order dependency.
+port                = "./run/mcu.pty"
+baud                = 921600
+setpoint_hz         = 20
+cmd_gate_max_age_ms = 150
+reseed_wait_ms      = 500
+open_retry_ms       = 500
+
+[bus]
+sock        = "./run/robotd.sock"
+frames_sock = "./run/frames.sock"
+brain_sock  = "./run/brain.sock"
+state_hz    = 10
+# 4.2's validator table gates a twist on BOTH rows: the source must be in
+# allow_sources ("teleop and phone opt-in") *and* in allow_stream.  The Mac
+# profile opts teleop in on both, because I-19 needs a live teleop stream and
+# G4-b needs one to freeze; production ships allow_stream empty and teleop out
+# of allow_sources, which closes the joystick without touching the STOP button.
+allow_sources = ["brain", "web", "teleop"]
+# Non-empty here and only here, so the teleop path is exercisable: I-19 needs a
+# live teleop stream to prove box-link loss leaves it running, and G6's episode
+# recording needs it too.  Production ships it empty.
+allow_stream  = ["teleop"]
+clear_sources = ["web"]
+# Empty on the Mac: every process runs as the developer, so there is no
+# per-source system user for SO_PEERCRED to bind against.  On the Pi this map is
+# what turns a self-declared "source" into an isolation boundary (4.2).
+source_uids   = {}
+teleop_input_max_age_ms = 250
+client_ping_hz  = 5
+client_ping_gap_ms = 400
+
+[camera]
+backend      = "fake"          # replays tests/fixtures frames on the same frames.sock
+encoder      = "mjpeg"
+main         = [896, 672]
+lores        = [640, 480]
+jpeg_quality = 80
+hfov_deg     = 83.0            # same crop as the real lens, so bearings match the gate
+
+[audio]
+device_match  = "ReSpeaker"
+output_device = ""
+device_index = -1
+duplex       = "half"
+input        = "text"          # the only mode fully exercisable with no mic (A30)
+
+[wake]
+backend   = "hotkey"
+model     = "./data/models/wake/rover.tflite"
+threshold = 0.5
+
+[vad]
+backend        = "sherpa"
+model          = "./data/models/stt/silero_vad.onnx"
+min_silence_ms = 400
+chunk          = 512
+
+[stt]
+backend        = "text"
+model_dir      = "./data/models/stt"
+min_confidence = 0.5
+min_chars      = 2
+
+[tts]
+backend = "say"                # macOS `say`; piper is Linux-only and GPL-fenced (A28)
+bin     = "/usr/bin/say"
+voice   = "./data/models/tts/en_US-lessac-low.onnx"  # ignored by "say"; kept so the key set matches
+threads = 1
+
+[web]
+# Loopback by default: POST /utter reaches a motion skill and POST /clear clears
+# the software e-stop, both unauthenticated. Putting the page on the house Wi-Fi
+# is a value you type here, never a default -- see the README's safety section.
+bind = "127.0.0.1"
+port = 8080
+
+[box]
+url    = "http://127.0.0.1:8000/v1"   # fakebox, started by `make sim`
+model  = "rover-vlm"
+api_key_env = "ROVER_BOX_API_KEY"
+structured_output_mode = "json_schema"
+timeout_s   = 8.0
+connect_s   = 1.0
+ttft_s      = 2.5
+max_tokens  = 160
+temperature = 0.0
+health_probe_s     = 0.8
+health_probe_fails = 3
+
+[battery]
+ocv_per_cell = [4.20, 4.00, 3.85, 3.70, 3.60, 3.50, 3.30, 3.20]
+soc_pct      = [ 100,   85,   70,   50,   35,   20,    8,    0]
+
+[safety]
+obs_max_age_ms        = 5000
+link_alive_max_age_ms = 200
+
+# The seven mirror keys, unchanged: mcu-sim links the same firmware/core/ C
+# code, so its compiled safety_hash is the same number the Pi asserts.
+tof_stop_mm          = 250
+tof_slow_mm          = 600
+slow_zone_w_mrad_s   = 500
+tof_timing_budget_ms = 20
+tof_inter_period_ms  = 30
+tof_poll_hz          = 50
+cliff_delta_mm       = 80
+
+cliff_baseline_mm   = 98
+obstacle_escalate_s = 30
+r_pack_mohm = 65                # mirror of ROVER_R_PACK_MOHM; state.battery.oc_v is computed from it
+
+[log]
+dir                = "./data/logs"
+state_decimate_hz  = 5
+retain_days        = 7

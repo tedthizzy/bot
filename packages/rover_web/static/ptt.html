@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>rover talk</title>
+<link rel="stylesheet" href="/static/rover.css">
+</head>
+<body>
+<nav class="bar">
+  <a href="/">face</a>
+  <a href="/teleop">teleop</a>
+  <a href="/ptt" aria-current="page">talk</a>
+  <span class="spacer"></span>
+  <span class="dot" data-dot="brain">brain</span>
+  <span class="dot" data-dot="ws">ws</span>
+</nav>
+
+<main>
+  <button class="plain" id="ptt" type="button">hold to talk</button>
+  <div class="row">
+    <textarea id="text" placeholder="turn left ninety degrees" maxlength="500"></textarea>
+    <button class="plain" id="send" type="button">send</button>
+  </div>
+  <div class="log" id="log"></div>
+</main>
+
+<form class="stop" method="post" action="/estop">
+  <button type="submit">STOP</button>
+  <p class="note">the spoken stop word is best effort; this button is not</p>
+</form>
+
+<script src="/static/rover.js"></script>
+<script>
+"use strict";
+/* Text, PTT and the wake word emit the identical Utterance (A30).  Both
+   controls here reach brain.sock, never robotd: robotd holds no conversational
+   state, so this is the only path in. */
+const ptt = document.getElementById("ptt");
+const text = document.getElementById("text");
+const log = document.getElementById("log");
+
+const send = Rover.connect((message) => {
+  if (message.type === "fsm") Rover.appendLog(log, "fsm " + message.state);
+  else if (message.type === "face") Rover.appendLog(log, "face " + message.expr);
+  else if (message.type === "result") Rover.appendLog(log, `result ${message.status} ${message.reason || ""}`);
+  else if (message.type === "event") Rover.appendLog(log, "event " + message.kind);
+});
+
+function submit() {
+  const value = text.value.trim();
+  if (!value) return;
+  text.value = "";
+  Rover.appendLog(log, "> " + value);
+  fetch("/utter", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ text: value }),
+  })
+    .then((r) => r.json())
+    .then((body) => {
+      if (!body.delivered) Rover.appendLog(log, "brain is not connected");
+    })
+    .catch(() => Rover.appendLog(log, "rover-web unreachable"));
+}
+
+document.getElementById("send").addEventListener("click", submit);
+text.addEventListener("keydown", (event) => {
+  if (event.key === "Enter" && !event.shiftKey) {
+    event.preventDefault();
+    submit();
+  }
+});
+
+function hold(down) {
+  ptt.dataset.held = down ? "true" : "false";
+  ptt.textContent = down ? "listening - release to send" : "hold to talk";
+  send({ type: down ? "ptt_start" : "ptt_end" });
+}
+ptt.addEventListener("pointerdown", (event) => {
+  ptt.setPointerCapture(event.pointerId);
+  hold(true);
+});
+for (const name of ["pointerup", "pointercancel", "pointerleave"]) {
+  ptt.addEventListener(name, () => {
+    if (ptt.dataset.held === "true") hold(false);
+  });
+}
+
+Rover.wireStop();
+Rover.pollStatus();
+</script>
+</body>
+</html>

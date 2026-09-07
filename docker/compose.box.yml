@@ -1,0 +1,143 @@
+# The GPU box: one 27B VLM behind an OpenAI-compatible endpoint, and nothing
+# else that the rover depends on.  ARCHITECTURE 4.6, 5.7 and 11 step 1.
+#
+#   docker compose -f docker/compose.box.yml up -d vllm
+#
+# This file is a convenience, not a dependency: brain speaks
+# /v1/chat/completions and does not care what serves it.  The box is in no
+# safety path, holds no robot state, and a dead box degrades the rover to the
+# router's local intents.
+#
+# Secrets come from the environment.  Copy box/.env.example to box/.env (which
+# is gitignored) or export the variables; nothing here carries a value.
+
+name: rover-box
+
+services:
+  vllm:
+    # Pin the exact 0.28.x patch and then the digest before build day.  An
+    # unrecognised image tag fails at `up`, which is the cheap failure; an
+    # unrecognised *flag* makes vLLM refuse to start on the first command of
+    # the day, which is the expensive one.
+    image: vllm/vllm-openai:${VLLM_TAG:-v0.28.0}
+    container_name: rover-vllm
+    restart: unless-stopped
+    ports:
+      - "${BOX_BIND:-0.0.0.0}:8000:8000"
+    volumes:
+      - ${HF_CACHE:-./hf-cache}:/root/.cache/huggingface
+    ipc: host
+    environment:
+      # GeForce drivers ship without peer-to-peer.  Without this, TP=2 hangs or
+      # errors at init on a stock driver with no diagnosis path.  Single-stream
+      # decode is unaffected (92-95 tok/s either way); only long prefill loses.
+      NCCL_P2P_DISABLE: "1"
+      HF_TOKEN: ${HF_TOKEN:-}
+      # vLLM reads this and requires it as a bearer token.  Leave it unset for a
+      # trusted LAN; brain reads the same value from ROVER_BOX_API_KEY.
+      VLLM_API_KEY: ${ROVER_BOX_API_KEY:-}
+    command:
+      - --model
+      # A15: fallbacks are Lorbus/Qwen3.6-27B-int4-AutoRound, then
+      # gemma-4-31B-it-qat-w4a16-ct.  G1 re-runs the spread on the real box at
+      # int4 with thinking disabled before the pick is settled.
+      - ${BOX_MODEL:-philbert440/Qwen3.8-27B-W4A16-AWQ}
+      - --served-model-name
+      - rover-vlm
+      - --tensor-parallel-size
+      - "2"
+      - --max-model-len
+      - "16384"
+      # 0.85, dropped to 0.75 in the same change that enables the speech
+      # profile below (Kokoro's long-form peak is 3.98 GB).  vLLM's own default
+      # is 0.92.
+      - --gpu-memory-utilization
+      - "${BOX_GPU_UTIL:-0.85}"
+      - --max-num-seqs
+      - "4"
+      - --limit-mm-per-prompt.image
+      - "1"
+      - --mm-processor-cache-gb
+      - "4"
+      - --structured-outputs-config.backend
+      - auto
+      # Beside NCCL_P2P_DISABLE if init still hangs on a stock driver:
+      #   - --disable-custom-all-reduce
+      #
+      # Deliberately NOT pinned: --default-chat-template-kwargs.  No source
+      # confirms the flag exists in 0.28.x, and A16 already sends
+      # enable_thinking:false client-side on every request.  Check
+      # `vllm serve --help | grep default-chat-template-kwargs` before build day.
+      # Also not set: --enable-auto-tool-choice, --tool-call-parser,
+      # --speculative-config.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 2
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/v1/models')"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 300s
+
+  # --- opt-in speech profile, dark until G3b (A32) ---------------------------
+  # Start these only AFTER vllm is up and only in the same change that drops
+  # --gpu-memory-utilization to 0.75.  Verify both image tags before enabling;
+  # the honest saving is 0.05-0.35 s of first audio, with or without an image.
+  # The real wins are WER 9.85% -> ~2% and about one Pi core freed.
+  stt:
+    profiles: ["speech"]
+    image: rhasspy/wyoming-faster-whisper:${WHISPER_TAG:-3.7.0}
+    container_name: rover-stt
+    restart: unless-stopped
+    depends_on:
+      vllm:
+        condition: service_healthy
+    ports:
+      - "${BOX_BIND:-0.0.0.0}:10300:10300"
+    volumes:
+      - ${WHISPER_DATA:-./whisper-data}:/data
+    command:
+      - --model
+      - large-v3-turbo
+      - --language
+      - en
+      - --beam-size
+      - "1"
+      - --device
+      - cuda
+      - --compute-type
+      - float16
+      - --data-dir
+      - /data
+      - --uri
+      - tcp://0.0.0.0:10300
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  tts:
+    profiles: ["speech"]
+    image: ghcr.io/remsky/kokoro-fastapi-gpu:${KOKORO_TAG:-v0.8.2}
+    container_name: rover-tts
+    restart: unless-stopped
+    depends_on:
+      vllm:
+        condition: service_healthy
+    ports:
+      - "${BOX_BIND:-0.0.0.0}:8880:8880"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

@@ -1,0 +1,32 @@
+[Unit]
+Description=rover cam — picamera2 preview stream and on-demand stills
+Documentation=https://github.com/tedthizzy/bot/blob/main/ARCHITECTURE.md
+# Deliberately not ordered against robotd: cam MUST NOT talk to robotd, and a
+# stalled camera must not stall the FSM. Its staleness gates motion at robotd
+# instead (I-23).
+
+[Service]
+Type=simple
+User=rover-cam
+Group=rover
+SupplementaryGroups=video
+WorkingDirectory=/opt/rover
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/rover/.venv/bin/rover-cam --config /opt/rover/config/robot.toml
+
+Restart=always
+# 2 s, not 1: libcamera stalls are the commonest Pi camera hang and a tighter
+# loop just hammers a device that has not finished releasing.
+RestartSec=2
+StartLimitIntervalSec=0
+
+ReadWritePaths=/run/rover /data/logs
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=full
+LockPersonality=yes
+
+[Install]
+WantedBy=rover.target

@@ -1,0 +1,47 @@
+[Unit]
+Description=rover brain — wake, VAD, STT, TTS, router, prompt, FSM, validator
+Documentation=https://github.com/tedthizzy/bot/blob/main/ARCHITECTURE.md
+After=rover-robotd.service network-online.target
+# Wants=, not just After=: systemd only pulls network-online.target in when
+# a unit asks for it, so the ordering above was inert and this started as
+# soon as multi-user.target was reached -- before NetworkManager had an
+# address, which is the box probe failing on every boot.
+Wants=rover-robotd.service network-online.target
+# brain dead means text, PTT, wake word and set_face are dead. robotd, the web
+# STOP button and teleop are unaffected, which is why this is Wants= and not
+# Requires=.
+
+[Service]
+Type=simple
+User=rover-brain
+Group=rover
+# /dev/snd/* is root:audio 0660 on Debian: without this brain can open neither
+# the ReSpeaker for capture nor aplay for playback.
+SupplementaryGroups=audio
+WorkingDirectory=/opt/rover
+Environment=PYTHONUNBUFFERED=1
+# The box address and its bearer token come from the environment, never from a
+# tracked file. Drop them in /etc/rover/box.env; install.sh creates it 0640
+# root:rover with the variable names and no values.
+EnvironmentFile=-/etc/rover/box.env
+# Its own venv, with no --system-site-packages: the [speech] extra carries
+# numpy, and a PyPI numpy in /opt/rover/.venv would shadow apt's python3-numpy
+# for rover-cam's picamera2 and python3-kms++ (ARCHITECTURE 12).
+ExecStart=/opt/rover/.venv-brain/bin/rover-brain --config /opt/rover/config/robot.toml
+
+Restart=always
+RestartSec=1
+StartLimitIntervalSec=0
+
+ReadWritePaths=/run/rover /data/logs
+# STT and TTS models, read-only at run time; install.sh downloads them.
+ReadOnlyPaths=/data/models
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=full
+LockPersonality=yes
+
+[Install]
+WantedBy=rover.target

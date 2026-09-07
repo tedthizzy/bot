@@ -1,0 +1,65 @@
+# linux/arm64 parity image: the Pi's OS, interpreter and dependency resolution,
+# on the Mac. Used by `make docker-dev` and by the ubuntu-24.04-arm CI job.
+#
+# THERE IS NO DOCKER ON THE PI (A36). Bridge networking costs 10.1 ms against
+# host networking's 2.5 ms, about 14% throughput, and 1-10 ms per peripheral I/O
+# on a Pi 4 — all of it inside the 100 Hz control path. Docker exists here for
+# arm64 parity on a developer machine and for the box compose, and nowhere else.
+# deploy/install.sh installs onto the bare Pi.
+#
+# What this image DOES mirror: Debian Trixie arm64, apt's Python 3.13, the
+# libportaudio/alsa/psmisc userland, uv, the venv layout, and — the point of the
+# exercise — that `uv pip install -e .[speech]` resolves on aarch64 Linux,
+# including the pyopen-wakeword wheel that exists for no other platform.
+#
+# What it does NOT mirror: the camera stack. python3-picamera2 and
+# python3-libcamera come from the Raspberry Pi archive, not from Debian, and
+# there is no camera behind a container on a Mac anyway. [camera] backend stays
+# "fake" here, which is the same configuration `make sim` uses. Open item 6 —
+# picamera2 inside a --system-site-packages venv on Trixie — is answered on the
+# Pi at G3a and cannot be answered here.
+
+FROM --platform=linux/arm64 debian:trixie-slim
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    UV_LINK_MODE=copy \
+    VIRTUAL_ENV=/opt/rover-venv \
+    PATH=/opt/rover-venv/bin:/usr/local/bin:/usr/bin:/bin
+
+# The Debian-available half of deploy/apt-packages.txt. libportaudio2 is what
+# sounddevice needs and does not bundle; psmisc provides the fuser I-18 is
+# tested with; alsa-utils provides arecord.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      python3 python3-venv python3-dev \
+      libportaudio2 alsa-utils psmisc \
+      ca-certificates curl git cmake build-essential \
+ && rm -rf /var/lib/apt/lists/*
+
+# Same uv, same fixed path as the Pi.
+RUN curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR=/usr/local/bin sh
+
+WORKDIR /opt/rover
+
+# The lock first, so a source edit does not re-resolve the world.
+COPY pyproject.toml uv.lock .python-version ./
+COPY packages/rover_contracts/pyproject.toml packages/rover_contracts/
+
+# --system-site-packages for the same reason the Pi's venv has it: rover-cam
+# must be able to see an apt-installed camera stack when there is one.
+RUN uv venv --python /usr/bin/python3 --system-site-packages "$VIRTUAL_ENV"
+
+COPY . .
+
+# [speech] deliberately: this install failing on aarch64 Linux, or succeeding on
+# the Mac when it should not, is the whole reason the image exists.
+RUN uv pip install --python "$VIRTUAL_ENV/bin/python" \
+      -e /opt/rover/packages/rover_contracts -e '/opt/rover[speech]' \
+ && uv pip install --python "$VIRTUAL_ENV/bin/python" \
+      pytest pytest-asyncio pytest-timeout hypothesis ruff
+
+# `make test` shells out to $(PY); point it at this venv rather than a .venv
+# bind-mounted from a macOS host, which would be the wrong architecture.
+CMD ["make", "test", "PY=/opt/rover-venv/bin/python"]

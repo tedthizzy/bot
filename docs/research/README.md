@@ -27,3 +27,18 @@ author, so treat their numbers as provisional and confirm anything you would gat
 | `bom_parts` | concrete 2026 parts and prices | no |
 
 The five unverified notes lost their verifier to a session limit, not to a finding.
+
+The table is re-derivable rather than asserted: a note counts as independently
+verified when it carries a heading matching `verification`.
+
+```bash
+cd docs/research && for f in *.md; do
+  [ "$f" = README.md ] && continue
+  printf '%-22s %s\n' "$f" "$(grep -ciE '^#+ .*verification' "$f")"
+done
+```
+
+That list is the same five `[UNREVIEWED]` notes ARCHITECTURE names in its
+evidence-tag legend — `bom_parts`, `box_speech`, `host_hardware`, `merge_path`,
+`phone_peripheral` — and a number sourced only from one of them may never be a
+gate criterion.

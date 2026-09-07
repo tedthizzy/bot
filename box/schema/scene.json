@@ -1,0 +1,72 @@
+{
+  "$defs": {
+    "Hazard": {
+      "description": "Model-reported hazards.\n\n``text_in_frame`` drives ARCHITECTURE 6's speed cap, which is a\n**model-reported mitigation, not a deterministic control**: its only input\nis a field the model itself writes, and an attacker who put text in the\nframe is the same party writing it (A12).  It is reported at G1 beside the\nattack-success rate, never counted among the Pi-side controls.",
+      "enum": [
+        "clutter",
+        "text_in_frame",
+        "stairs",
+        "drop_off",
+        "people",
+        "low_light"
+      ],
+      "title": "Hazard",
+      "type": "string"
+    },
+    "Lighting": {
+      "description": "Scene illumination, which bounds how far the vision answer is worth.",
+      "enum": [
+        "dark",
+        "dim",
+        "normal",
+        "bright"
+      ],
+      "title": "Lighting",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "description": "The answer to ``describe_scene``, spoken back through ``say``.",
+  "properties": {
+    "description": {
+      "maxLength": 240,
+      "title": "Description",
+      "type": "string"
+    },
+    "hazards": {
+      "items": {
+        "$ref": "#/$defs/Hazard"
+      },
+      "maxItems": 6,
+      "title": "Hazards",
+      "type": "array"
+    },
+    "kind": {
+      "const": "scene",
+      "title": "Kind",
+      "type": "string"
+    },
+    "labels": {
+      "items": {
+        "maxLength": 32,
+        "minLength": 1,
+        "type": "string"
+      },
+      "maxItems": 12,
+      "title": "Labels",
+      "type": "array"
+    },
+    "lighting": {
+      "$ref": "#/$defs/Lighting"
+    }
+  },
+  "required": [
+    "kind",
+    "description",
+    "labels",
+    "lighting",
+    "hazards"
+  ],
+  "title": "SceneObservation",
+  "type": "object"
+}

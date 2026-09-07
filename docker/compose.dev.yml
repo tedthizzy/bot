@@ -1,0 +1,56 @@
+# linux/arm64 parity, on the Mac. See the header of Dockerfile.services for what
+# this does and does not mirror, and for why there is no Docker on the Pi (A36).
+#
+#   make docker-dev                                    # build, then run the tests
+#   docker compose -f docker/compose.dev.yml run --rm services
+#   docker compose -f docker/compose.dev.yml run --rm sim
+#   docker compose -f docker/compose.dev.yml run --rm shell
+
+name: rover-dev
+
+x-common: &common
+  build:
+    context: ..
+    dockerfile: docker/Dockerfile.services
+    platforms: ["linux/arm64"]
+  image: rover-services:dev
+  platform: linux/arm64
+  environment:
+    # Both are Makefile variables, declared with ?= so the environment wins.
+    CONFIG: config/robot.mac.toml
+    PY: /opt/rover-venv/bin/python
+  volumes:
+    # The source, live, so an edit on the Mac is visible here without a rebuild.
+    # Everything the host venv and the caches occupy is masked by an anonymous
+    # volume: a macOS arm64 .venv is the right architecture and still the wrong
+    # interpreter, and a shared __pycache__ is worse than useless.
+    - ..:/opt/rover
+    - /opt/rover/.venv
+    - /opt/rover/.pytest_cache
+    - /opt/rover/run
+  working_dir: /opt/rover
+  init: true
+
+services:
+  # The default: the same `make test` the Mac runs, on the Pi's OS and
+  # interpreter. This is what the ubuntu-24.04-arm CI job runs.
+  services:
+    <<: *common
+    command: ["make", "test", "PY=/opt/rover-venv/bin/python"]
+
+  # The whole simulated rover inside the container. Ports are published so the
+  # face page and the fake box are reachable from the Mac's browser.
+  sim:
+    <<: *common
+    command: ["make", "sim", "PY=/opt/rover-venv/bin/python"]
+    ports:
+      - "127.0.0.1:8080:8080"   # rover-web
+      - "127.0.0.1:8000:8000"   # fakebox
+    # mcu-sim allocates a pty and symlinks ./run/mcu.pty to it.
+    tty: true
+
+  shell:
+    <<: *common
+    command: ["bash"]
+    tty: true
+    stdin_open: true

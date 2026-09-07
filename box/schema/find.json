@@ -1,0 +1,50 @@
+{
+  "$defs": {
+    "Confidence": {
+      "description": "How sure the model is that it found the object.",
+      "enum": [
+        "low",
+        "medium",
+        "high"
+      ],
+      "title": "Confidence",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "description": "The answer to one ``find`` sweep.\n\n``center_x_permille`` is 0..1000 across the frame; it is meaningless when\n``present`` is false and the executor ignores it then.",
+  "properties": {
+    "center_x_permille": {
+      "maximum": 1000,
+      "minimum": 0,
+      "title": "Center X Permille",
+      "type": "integer"
+    },
+    "confidence": {
+      "$ref": "#/$defs/Confidence"
+    },
+    "description": {
+      "maxLength": 240,
+      "title": "Description",
+      "type": "string"
+    },
+    "kind": {
+      "const": "find",
+      "title": "Kind",
+      "type": "string"
+    },
+    "present": {
+      "title": "Present",
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "kind",
+    "present",
+    "center_x_permille",
+    "confidence",
+    "description"
+  ],
+  "title": "FindObservation",
+  "type": "object"
+}

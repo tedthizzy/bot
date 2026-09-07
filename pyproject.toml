@@ -1,0 +1,119 @@
+[project]
+name = "rover"
+version = "0.1.0"
+description = "Indoor voice-and-vision rover: Pi 4 host, ESP32-S3 motion controller, one 27B VLM on an owned GPU box"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+
+# ARCHITECTURE 12, verbatim, and the list is closed.
+#
+# Four core packages resolve on macOS *and* aarch64 Linux, which is what makes
+# `make sim` and `make test` run on a bare MacBook (principle 6).  numpy sits in
+# the speech extra and not here: rover-cam runs in the --system-site-packages
+# venv, and a base-set numpy would shadow apt's python3-numpy, which apt's
+# python3-picamera2 and python3-kms++ were built against.  No base dependency
+# may shadow an apt package picamera2 links against.
+#
+# pyserial-asyncio-fast, not pyserial-asyncio: the old package sleeps inside the
+# event loop and Home Assistant blocks it.
+dependencies = [
+    "pydantic",
+    "pyserial-asyncio-fast",
+    "openai",
+    "aiohttp",
+]
+
+[project.optional-dependencies]
+# The Pi's four.  pyopen-wakeword ships a manylinux_2_35 aarch64 wheel only, so
+# the marker is what keeps `uv sync` working on the M4 (A30).
+speech = [
+    "sounddevice",
+    "sherpa-onnx>=1.12",
+    "numpy",
+    "pyopen-wakeword==1.1.0; sys_platform == 'linux'",
+    # pymicro-wakeword is open item 11's fallback for [wake] backend="pymicro".
+    # Commented, not installed: "pymicro-wakeword".
+]
+
+# Not a runtime dependency of anything: piper-tts is GPL-3.0-or-later, is never
+# imported, and install.sh puts it in its own venv at /opt/rover/.venv-tts (A28).
+
+[project.scripts]
+# systemd and the Makefile both invoke `python -m <module>` so an uninstalled
+# checkout behaves identically; these exist because ARCHITECTURE 12 says the CLI
+# is `roverctl` everywhere.
+roverctl = "rover_devtools.roverctl:main"
+rover-robotd = "rover_robotd.main:main"
+rover-brain = "rover_brain.main:main"
+rover-cam = "rover_cam.publisher:main"
+rover-web = "rover_web.app:main"
+
+[dependency-groups]
+# Test and lint tooling only.  Never installed on the robot: deploy/install.sh
+# runs `uv pip install` without a group, and the CI dependency-closure check
+# asserts the runtime closure separately.
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+    "pytest-timeout>=2.3",
+    "hypothesis>=6.100",
+    "ruff>=0.6",
+    "mypy>=1.11",
+    # The Makefile falls back to .venv/bin/cmake when no system cmake exists,
+    # so a bare Mac with Xcode CLT and no Homebrew still builds firmware/core/
+    # under host clang -- which is directive 3.  Without these in the lock,
+    # `uv sync --frozen` deletes them and `make test` dies with
+    # ".venv/bin/cmake: No such file or directory".
+    "cmake>=3.27",
+    "ninja>=1.11",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+# One distribution, whose source is every package under packages/, which is
+# what ARCHITECTURE 12's layout shows: one pyproject.toml and one uv.lock at
+# the root, and no per-package build metadata.  It is also what makes deploy
+# step 9's `uv pip install -e /opt/rover[speech]` install the whole robot in one
+# command.  Discovery rather than an explicit list, because the component
+# packages land one at a time and a missing directory must not break `uv lock`
+# for everyone else.
+[tool.setuptools.packages.find]
+where = ["packages"]
+
+[tool.setuptools.package-data]
+"*" = ["py.typed"]
+rover_web = ["static/*"]
+rover_brain = ["filler/*.wav"]
+
+[tool.ruff]
+line-length = 90
+target-version = "py311"
+extend-exclude = ["firmware", "docker", "deploy"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.pytest.ini_options]
+# packages/ on the path so every component's tests import rover_contracts (and
+# each other) whether or not the workspace has been installed.  This is what
+# lets `make test` work from a bare clone.
+pythonpath = ["packages"]
+testpaths = ["tests"]
+addopts = "-q --strict-markers --strict-config"
+asyncio_mode = "auto"
+# No test may hang CI; the gates that legitimately wait out a cooldown pass
+# their own longer @pytest.mark.timeout.
+timeout = 120
+markers = [
+    "gate: a gate script from ARCHITECTURE 13, not part of `make test`",
+    "hardware: needs the real rover; never runs in CI",
+]
+
+[tool.mypy]
+python_version = "3.11"
+mypy_path = "packages"
+strict = true
+warn_unused_ignores = true

@@ -1,0 +1,49 @@
+# Release defaults for the rover MCU. ESP-IDF v5.5.5.
+# firmware/docker/build.sh debug layers sdkconfig.defaults.debug on top.
+
+CONFIG_IDF_TARGET="esp32s3"
+
+# --- Board: ESP32-S3-DevKitC-1-N8R8, 8 MB quad flash + 8 MB octal PSRAM ---
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+
+# --- I-20: a wedged control task must reboot the MCU within 1 s ---
+# IDF's default is 5 s, which at 0.30 m/s is 1.5 m of held motion because
+# MCPWM keeps the last duty. Even 1 s is ~300 mm and is a stated residual
+# risk in ARCHITECTURE 8. Panic, not just a log: the reset is the point.
+CONFIG_ESP_TASK_WDT_INIT=y
+CONFIG_ESP_TASK_WDT_PANIC=y
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=1
+# The three rover tasks subscribe themselves; the idle tasks are not the
+# thing being watched, and a 100 Hz control task would trip them.
+CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0=n
+CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1=n
+CONFIG_ESP_SYSTEM_PANIC_PRINT_REBOOT=y
+
+# --- BROWNOUT is latched from the RTC reset reason under this ---
+CONFIG_ESP_BROWNOUT_DET=y
+CONFIG_ESP_BROWNOUT_DET_LVL_SEL_7=y
+
+# --- A37: no writable console on any interface in a release build ---
+# USB-Serial/JTAG, the CP2102 UART0 bridge and UART1 all stay silent. A live
+# text path into the motor controller is a second writer bypassing session,
+# seq and CRC (I-18).
+CONFIG_ESP_CONSOLE_NONE=y
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+CONFIG_LOG_DEFAULT_LEVEL_NONE=y
+CONFIG_BOOTLOADER_LOG_LEVEL_NONE=y
+
+# --- Wi-Fi and Bluetooth compiled out (ARCHITECTURE 4.1, "Threads") ---
+CONFIG_ESP_WIFI_ENABLED=n
+CONFIG_BT_ENABLED=n
+
+# --- Control loop timing ---
+# 1 kHz tick so the comms task's 5 ms UART poll and the sensor task's 20 ms
+# period land where they are asked to.
+CONFIG_FREERTOS_HZ=1000
+CONFIG_COMPILER_OPTIMIZATION_PERF=y

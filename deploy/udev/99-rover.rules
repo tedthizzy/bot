@@ -1,0 +1,13 @@
+# The motion controller's port, restricted to one group.
+#
+# Keyed on the device-tree node, not the tty number: UART5 is a platform PL011
+# and no idVendor matches it, so a KERNEL=="ttyAMA4" rule would silently follow
+# a kernel renumbering.  Confirm the address on a new kernel with
+#   ls -l /sys/class/tty/ttyAMA*/device
+#
+# 0660 root:rover is how "only robotd writes the port" becomes a filesystem
+# fact: robotd's user is in group rover, and I-18 asserts one pid holds it.
+# [serial] port is always /dev/rover-mcu; the string ttyAMA4 appears nowhere in
+# any component.
+
+SUBSYSTEM=="tty", KERNELS=="fe201a00.serial", SYMLINK+="rover-mcu", GROUP="rover", MODE="0660"

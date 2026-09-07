@@ -1,0 +1,234 @@
+{
+  "oneOf": [
+    {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "additionalProperties": false,
+          "properties": {
+            "distance_cm": {
+              "maximum": 100,
+              "minimum": -100,
+              "type": "integer"
+            },
+            "speed_cms": {
+              "maximum": 30,
+              "minimum": 5,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "distance_cm",
+            "speed_cms"
+          ],
+          "type": "object"
+        },
+        "skill": {
+          "const": "drive"
+        },
+        "speech": {
+          "maxLength": 160,
+          "type": "string"
+        }
+      },
+      "required": [
+        "speech",
+        "skill",
+        "args"
+      ],
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "additionalProperties": false,
+          "properties": {
+            "angle_deg": {
+              "maximum": 180,
+              "minimum": -180,
+              "type": "integer"
+            },
+            "rate_dps": {
+              "maximum": 60,
+              "minimum": 5,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "angle_deg",
+            "rate_dps"
+          ],
+          "type": "object"
+        },
+        "skill": {
+          "const": "turn"
+        },
+        "speech": {
+          "maxLength": 160,
+          "type": "string"
+        }
+      },
+      "required": [
+        "speech",
+        "skill",
+        "args"
+      ],
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "additionalProperties": false,
+          "properties": {},
+          "required": [],
+          "type": "object"
+        },
+        "skill": {
+          "const": "stop"
+        },
+        "speech": {
+          "maxLength": 160,
+          "type": "string"
+        }
+      },
+      "required": [
+        "speech",
+        "skill",
+        "args"
+      ],
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "additionalProperties": false,
+          "properties": {
+            "text": {
+              "maxLength": 240,
+              "type": "string"
+            }
+          },
+          "required": [
+            "text"
+          ],
+          "type": "object"
+        },
+        "skill": {
+          "const": "say"
+        },
+        "speech": {
+          "maxLength": 160,
+          "type": "string"
+        }
+      },
+      "required": [
+        "speech",
+        "skill",
+        "args"
+      ],
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "additionalProperties": false,
+          "properties": {},
+          "required": [],
+          "type": "object"
+        },
+        "skill": {
+          "const": "describe_scene"
+        },
+        "speech": {
+          "maxLength": 160,
+          "type": "string"
+        }
+      },
+      "required": [
+        "speech",
+        "skill",
+        "args"
+      ],
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "additionalProperties": false,
+          "properties": {
+            "max_sweeps": {
+              "maximum": 8,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "object": {
+              "maxLength": 48,
+              "type": "string"
+            }
+          },
+          "required": [
+            "object",
+            "max_sweeps"
+          ],
+          "type": "object"
+        },
+        "skill": {
+          "const": "find"
+        },
+        "speech": {
+          "maxLength": 160,
+          "type": "string"
+        }
+      },
+      "required": [
+        "speech",
+        "skill",
+        "args"
+      ],
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "additionalProperties": false,
+          "properties": {
+            "expr": {
+              "enum": [
+                "neutral",
+                "happy",
+                "thinking",
+                "confused",
+                "alert",
+                "sleepy"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "expr"
+          ],
+          "type": "object"
+        },
+        "skill": {
+          "const": "set_face"
+        },
+        "speech": {
+          "maxLength": 160,
+          "type": "string"
+        }
+      },
+      "required": [
+        "speech",
+        "skill",
+        "args"
+      ],
+      "type": "object"
+    }
+  ]
+}

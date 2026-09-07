@@ -1,0 +1,11 @@
+[Unit]
+Description=rover — all four Pi processes
+Documentation=https://github.com/tedthizzy/bot/blob/main/ARCHITECTURE.md
+Wants=rover-robotd.service rover-cam.service rover-brain.service rover-web.service
+After=rover-robotd.service
+
+# install.sh only `systemctl enable`s the units. The target is started by hand
+# after deploy/preflight.sh passes, so robotd does not restart-loop against an
+# MCU that is not yet wired.
+[Install]
+WantedBy=multi-user.target

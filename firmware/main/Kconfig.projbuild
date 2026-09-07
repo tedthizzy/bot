@@ -1,0 +1,18 @@
+menu "Rover firmware"
+
+    config ROVER_DEBUG_BUILD
+        bool "Debug build (console and logging enabled)"
+        default n
+        help
+            A37: the debug console is build-time and off in release. A release
+            build sets CONFIG_ESP_CONSOLE_NONE and has no console on
+            USB-Serial/JTAG, on the CP2102 UART0 bridge, or on UART1 -- a live
+            text path into the motor controller is a second writer bypassing
+            session, seq and CRC (I-18).
+
+            Enabling this only advertises the fact: it sets caps bit 0 and
+            ctrl_flags b7 in the boot banner, so the Pi can see which kind of
+            build it is talking to and refuse to arm a debug build. Build with
+            sdkconfig.defaults.debug to also turn the console back on.
+
+endmenu
