@@ -1,0 +1,2 @@
+# Future fakebox package metadata and dependencies for the deterministic test server.
+# Request and response contracts, skill catalogs, and bounds will derive from roverlib.

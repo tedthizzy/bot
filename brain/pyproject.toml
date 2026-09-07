@@ -1,0 +1,2 @@
+# Future brain package metadata, dependencies, and command entry point.
+# brain will use roverlib contracts and derive all rover skill bounds from roverlib.

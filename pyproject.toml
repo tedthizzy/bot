@@ -1,0 +1,2 @@
+# TODO: Define a uv workspace containing roverlib, robotd, brain, web, and fakebox.
+# TODO: Pin compatible interpreter and dependency versions after confirming the target Pi OS.

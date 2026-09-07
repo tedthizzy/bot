@@ -1,0 +1,2 @@
+# Future web package metadata and FastAPI dependencies.
+# Web request contracts and rover skill bounds will derive from roverlib.

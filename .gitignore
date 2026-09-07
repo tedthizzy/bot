@@ -8,6 +8,12 @@ logs/
 .ruff_cache/
 .pytest_cache/
 
+# Private robot configuration and generated local artifacts
+/config/robot.yaml
+*.jsonl
+build/
+.env
+
 # Local host investigation notes (contain home network details) — never publish
 rasberrypi.md
 raspberrypi.md
