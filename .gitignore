@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.pyc
+logs/
+.pio/
+*.egg-info/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# Local host investigation notes (contain home network details) — never publish
+rasberrypi.md
+raspberrypi.md
+*.local.md
