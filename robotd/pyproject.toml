@@ -1,3 +1,0 @@
-# Package metadata with exactly three direct dependencies: roverlib, pyserial-asyncio, websockets.
-# CI will reject ML dependencies in robotd's resolved dependency closure.
-# Check that closure for torch, onnxruntime, vosk, and numpy-heavy packages.

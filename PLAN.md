@@ -8,9 +8,12 @@ Tracker for the rover build. Checked items are done and verified on this machine
 - [x] Critique v2 (policy robots, Pi 5, teleop dataset path, LeRobot-shaped robotd)
 - [x] Recommendations v3 (ESP-IDF, three timeouts, constrained decoding + validation, half-duplex first)
 - [x] 2026 research notes per subsystem (13 notes, 78k words; 8 of 13 adversarially verified — 5 verifiers lost to a session limit, their notes are marked lower confidence)
-- [~] Reconciled `ARCHITECTURE.md` (5 architects → chief architect → 4 critics → revision; running)
+- [x] Reconciled `ARCHITECTURE.md` — 21,094 words, 38 numbered decisions, 24 safety invariants, exact serial grammar with golden frame vectors, two adversarial critique rounds applied
 
 ## 1. Contracts (shared, written first)
+
+Build running: contracts first, then nine components in parallel, integration to green, two adversarial code-review rounds.
+
 - [ ] `roverlib`: pydantic models for SkillCall, Observation, WorldState, WS messages, config
 - [ ] Serial protocol spec + reference encoder/decoder (Python) with CRC test vectors
 - [ ] JSON schemas exported from the models (`box/schema/*.json`)

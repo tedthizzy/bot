@@ -1,5 +1,0 @@
-# TODO: Run pytest, firmware host tests, and simulation end-to-end checks on linux/arm64.
-# TODO: Fail on exported schema drift from roverlib and on roverlib bounds exceeding firmware/config/caps.h.
-# TODO: Enforce robotd's three direct dependencies: roverlib, pyserial-asyncio, and websockets.
-# TODO: Check the lockfile dependency closure for robotd and reject torch, onnxruntime, vosk, and numpy-heavy packages.
-# TODO: Scope the ML dependency check to robotd; the workspace also contains brain's speech dependencies.
