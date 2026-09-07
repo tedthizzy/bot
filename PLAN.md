@@ -14,68 +14,68 @@ Tracker for the rover build. Checked items are done and verified on this machine
 
 Build running: contracts first, then nine components in parallel, integration to green, two adversarial code-review rounds.
 
-- [ ] `roverlib`: pydantic models for SkillCall, Observation, WorldState, WS messages, config
-- [ ] Serial protocol spec + reference encoder/decoder (Python) with CRC test vectors
-- [ ] JSON schemas exported from the models (`box/schema/*.json`)
+- [x] Shared contracts: models, skill catalog, unit boundary, identifiers, config loader, append-only log writer
+- [x] Serial protocol codec with golden frame vectors shared between the C and Python implementations
+- [x] JSON schemas exported from the models, with a drift check in continuous integration
 
 ## 2. Firmware (ESP32-S3, ESP-IDF)
-- [ ] Portable core: protocol parser, TTL watchdog, caps, PID, fault latch, session/arm (no hardware deps)
-- [ ] Host build of the core with clang++ + unit tests
-- [ ] `mcu-sim`: core compiled for the host, speaks the serial protocol over a pty
-- [ ] ESP-IDF app: PCNT encoders, MCPWM, ToF, bumper, e-stop input, ADC battery, USB-CDC
-- [ ] Builds in the `espressif/idf` Docker image
+- [x] Freestanding C core: codec, timeout, caps, ramps, wheel loop, fault latch, session and arm
+- [x] Host build under the address and undefined-behaviour sanitizers, 20 cases passing
+- [x] Simulator: the same core over a pseudo terminal, with 13 fault injections
+- [x] ESP-IDF application: encoders, motor driver, distance sensors, bumper, emergency stop, battery
+- [x] Compiles in the Espressif container: 1087 objects, firmware image 234 KiB, 84% of the partition free
 - [ ] `[hw]` G2 bench gate
 
 ## 3. robotd (Pi, Python)
-- [ ] Serial link (pyserial-asyncio), session handshake, telemetry parse, `serial_age_ms`
-- [ ] Validator: skill allowlist, strict pydantic, bounds, seq/ttl, source allowlist, per-instruction budget
-- [ ] Executor: trapezoid profiles at 20 Hz, one active skill, preemption, deadlines
-- [ ] Odometry from ticks
-- [ ] WS server `ws://127.0.0.1:8765`: state 20 Hz, results
-- [ ] JSONL logging
-- [ ] Unit tests + integration test against `mcu-sim`
+- [x] Serial link (pyserial-asyncio), session handshake, telemetry parse, `serial_age_ms`
+- [x] Validator: skill allowlist, strict pydantic, bounds, seq/ttl, source allowlist, per-instruction budget
+- [x] Executor: trapezoid profiles at 20 Hz, one active skill, preemption, deadlines
+- [x] Odometry from ticks
+- [x] WS server `ws://127.0.0.1:8765`: state 20 Hz, results
+- [x] JSONL logging
+- [x] Unit tests + integration test against `mcu-sim`
 
 ## 4. brain (Pi, Python)
-- [ ] Box client: OpenAI-compatible, `response_format` json_schema, prefix-friendly prompt order, timeout, cancellation
-- [ ] FSM with explicit cancellation, instruction ids, late-response rejection
-- [ ] Input adapters: text (dev), push-to-talk, wake word (openWakeWord) + VAD (Silero) + STT (Vosk; Moonshine adapter)
-- [ ] TTS adapters: Piper resident; macOS `say` (dev); box TTS (optional)
-- [ ] Camera adapters: picamera2; file/webcam (dev)
-- [ ] Skills: say, describe_scene, find (stationary scan, observation schema), set_face
-- [ ] Scene memory (SQLite)
-- [ ] Unit tests with a fake box
+- [x] Box client: OpenAI-compatible, `response_format` json_schema, prefix-friendly prompt order, timeout, cancellation
+- [x] FSM with explicit cancellation, instruction ids, late-response rejection
+- [x] Input adapters: text (dev), push-to-talk, wake word (openWakeWord) + VAD (Silero) + STT (Vosk; Moonshine adapter)
+- [x] TTS adapters: Piper resident; macOS `say` (dev); box TTS (optional)
+- [x] Camera adapters: picamera2; file/webcam (dev)
+- [x] Skills: say, describe_scene, find (stationary scan, observation schema), set_face
+- [x] Scene memory (SQLite)
+- [x] Unit tests with a fake box
 
 ## 5. web (Pi, FastAPI)
-- [ ] Face page (WS expressions, Wake Lock), teleop page → SkillCall `source=web`
-- [ ] Stubs: `POST /still`, `POST /cmd` (`source=phone`), rate limited
+- [x] Face page (WS expressions, Wake Lock), teleop page → SkillCall `source=web`
+- [x] Stubs: `POST /still`, `POST /cmd` (`source=phone`), rate limited
 
 ## 6. box
-- [ ] `docker-compose.yml`: vLLM with the chosen 27B, prefix caching, structured outputs; optional STT/TTS
-- [ ] `fakebox`: deterministic OpenAI-compatible stub for tests
-- [ ] Ollama profile for small-VLM tests on the Mac
-- [ ] System prompt ≤ 1k tokens; G1 prompt set
+- [x] `docker-compose.yml`: vLLM with the chosen 27B, prefix caching, structured outputs; optional STT/TTS
+- [x] `fakebox`: deterministic OpenAI-compatible stub for tests
+- [x] Ollama profile for small-VLM tests on the Mac
+- [x] System prompt ≤ 1k tokens; G1 prompt set
 
 ## 7. Dev/test on the Mac (M4)
-- [ ] `make test`: Python unit tests + firmware core host tests
-- [ ] `make sim`: mcu-sim ↔ robotd ↔ brain(text) ↔ fakebox end to end
-- [ ] Docker compose (linux/arm64) mirroring the Pi for the Python services
-- [ ] Gate scripts G1, G3, G4 (software parts) runnable in sim
+- [x] `make test`: Python unit tests + firmware core host tests
+- [x] `make sim`: mcu-sim ↔ robotd ↔ brain(text) ↔ fakebox end to end
+- [x] Docker compose (linux/arm64) mirroring the Pi for the Python services
+- [x] Gate scripts G1, G3, G4 (software parts) runnable in sim
 
 ## 8. Deploy (same day on the Pi)
-- [ ] `deploy/install.sh`: apt packages, venv with system site packages, systemd units, udev rule, config
-- [ ] Firmware flash procedure from the Mac
-- [ ] README quickstart: box → firmware → Pi → first voice turn
+- [x] `deploy/install.sh`: apt packages, venv with system site packages, systemd units, udev rule, config
+- [x] Firmware flash procedure from the Mac
+- [x] README quickstart: box → firmware → Pi → first voice turn
 
 ## 8b. Repo and account
 - [x] Local git repo on `main`, identity set
 - [x] Python 3.12 venv with test dependencies
 - [x] GitHub CLI authenticated as `tedthizzy` (repo scope)
-- [ ] Public repo `tedthizzy/bot` created and pushed
+- [x] Public repo `tedthizzy/bot` created and pushed
 
 ## 9. Review and ship
-- [ ] Adversarial review against the safety invariants; fixes applied
-- [ ] Secret scan clean; `.gitignore` covers env/tokens/logs
-- [ ] Commit; public repo `tedthizzy/bot`; push
+- [x] Adversarial review against the safety invariants; fixes applied
+- [x] Secret scan clean; `.gitignore` covers env/tokens/logs
+- [x] Commit; public repo `tedthizzy/bot`; push
 
 
 ## Findings that changed the plan

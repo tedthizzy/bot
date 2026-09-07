@@ -18,6 +18,9 @@ static mcpwm_oper_handle_t s_oper[CH_COUNT];
 static mcpwm_cmpr_handle_t s_cmp[CH_COUNT][GEN_COUNT];
 static mcpwm_gen_handle_t s_gen[CH_COUNT][GEN_COUNT];
 static pcnt_unit_handle_t s_pcnt[CH_COUNT];
+/* One-shot recovery names the fault it clears, so the handles outlive fault_init. */
+#define FAULT_COUNT 2
+static mcpwm_fault_handle_t s_fault[FAULT_COUNT];
 
 static const int k_gen_gpio[CH_COUNT][GEN_COUNT] = {
     {BOARD_GPIO_M1A, BOARD_GPIO_M1B},
@@ -84,10 +87,10 @@ static void fault_init(void)
      * all four MDD3A inputs high -- driver brake -- and cannot be cleared
      * while the signal is still asserted. Only these two are on this path:
      * an INA226 over-current ALERT and the e-stop monitor. */
-    const int fault_gpio[] = {BOARD_GPIO_FAULT_INA_ALERT, BOARD_GPIO_FAULT_ESTOP};
-    const bool internal_pull_up[] = {true, false};
+    const int fault_gpio[FAULT_COUNT] = {BOARD_GPIO_FAULT_INA_ALERT, BOARD_GPIO_FAULT_ESTOP};
+    const bool internal_pull_up[FAULT_COUNT] = {true, false};
 
-    for (size_t f = 0; f < sizeof fault_gpio / sizeof fault_gpio[0]; f++) {
+    for (size_t f = 0; f < FAULT_COUNT; f++) {
         mcpwm_fault_handle_t fault = NULL;
         const mcpwm_gpio_fault_config_t cfg = {
             .group_id = 0,
@@ -96,6 +99,7 @@ static void fault_init(void)
             .flags.pull_up = internal_pull_up[f],
         };
         ESP_ERROR_CHECK(mcpwm_new_gpio_fault(&cfg, &fault));
+        s_fault[f] = fault;
 
         for (int ch = 0; ch < CH_COUNT; ch++) {
             const mcpwm_brake_config_t brake = {
@@ -224,7 +228,9 @@ void motion_apply(const rover_out_t *out)
         if (--recover_countdown <= 0) {
             recover_countdown = ROVER_CTRL_HZ / 10;
             for (int ch = 0; ch < CH_COUNT; ch++) {
-                (void)mcpwm_operator_recover_from_fault(s_oper[ch]);
+                for (size_t f = 0; f < FAULT_COUNT; f++) {
+                    (void)mcpwm_operator_recover_from_fault(s_oper[ch], s_fault[f]);
+                }
             }
         }
     } else {

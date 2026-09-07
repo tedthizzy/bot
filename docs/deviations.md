@@ -1763,3 +1763,21 @@ deploy step rather than changes to behaviour:
   and is refused by the validator, so marking it invalid would make G4-b fail for
   the wrong reason. The rule is covered by four parametrised unit cases instead,
   and the corpus's valid controls now carry the trace a real sender sends.
+
+## Firmware compile, verified 2026-09-07
+
+`firmware/docker/build.sh release` was run in `espressif/idf:v5.5.5` on the
+MacBook, the check the build agent could not complete because the disk was at
+98% and Docker would not start a container.
+
+It found one real error, and only one, in 1087 objects. `motion.c` called
+`mcpwm_operator_recover_from_fault(oper)` with one argument; the function takes
+the operator and the fault handle it is clearing. The fault handles were local
+to `fault_init` and thrown away, so there was nothing to pass. Fixed by keeping
+them in `s_fault[FAULT_COUNT]` and recovering each operator from each fault it
+is armed against.
+
+Worth recording because two adversarial review rounds read this file and did not
+catch it. A cross-check that every symbol exists cannot see an arity change in a
+vendor header; only the compiler can. The rest of the application, and every
+file in `firmware/core/`, compiled clean.
