@@ -1,20 +1,20 @@
-"""wirecat renders what the codec decoded, and nothing it invented.
+"""wirecat renders what ``wave_proto`` decoded, and nothing it invented.
 
-The frames come from ``tests/contract/serial_vectors.jsonl`` -- the same golden
-lines the C firmware core is built against -- so a rendering that drifts from
-the wire is caught here rather than at deploy step 10, where the ``B`` banner is
-the only thing standing between an operator and a wrongly flashed MCU.
+The lines are the protocol document's own examples, so a rendering that drifts
+from the wire is caught here rather than on the bench, where the banner is the
+only thing standing between an operator and a controller running the wrong
+firmware.
 """
 
 from __future__ import annotations
 
-import json
 import os
 import pty
 import shutil
 import socket
 import sys
 import tempfile
+import threading
 import tty
 from pathlib import Path
 
@@ -22,116 +22,172 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "packages"))
 
-from rover_contracts.serial_codec import (  # noqa: E402
-    AckReason,
-    DecodeErr,
-    DecodeOk,
+from rover_contracts.wave_proto import (  # noqa: E402
+    Banner,
+    Dropped,
+    Feedback,
+    banner_request,
     decode_line,
+    feedback_flow,
 )
-from rover_devtools.wirecat import main, open_serial, render  # noqa: E402
+from rover_devtools.wirecat import (  # noqa: E402
+    Counters,
+    LineSplitter,
+    banner_verdict,
+    main,
+    open_serial,
+    render,
+)
 
-VECTORS = Path(__file__).resolve().parents[1] / "contract" / "serial_vectors.jsonl"
-
-
-def frames() -> dict[str, list[str]]:
-    """Every golden frame line, grouped by type letter in document order.
-
-    There are two ``T`` frames and three ``K`` frames in ARCHITECTURE 5.1, and
-    they say different things, so the index matters.
-    """
-    lines: dict[str, list[str]] = {}
-    for raw in VECTORS.read_text().splitlines():
-        row = json.loads(raw)
-        if row.get("kind") == "frame":
-            lines.setdefault(row["type"], []).append(row["line"])
-    return lines
-
-
-@pytest.fixture(scope="module")
-def golden() -> dict[str, list[str]]:
-    return frames()
+FEEDBACK = (
+    '{"T":1001,"L":0.2,"R":0.2,"r":0.5,"p":-1.2,"y":87.3,"temp":36.5,"v":11.62,'
+    '"hb":1,"st":6,"tf":1204,"bp":1,"cc":3}'
+)
+STOCK = '{"T":1001,"L":0,"R":0,"r":0,"p":0,"y":12.0,"temp":35.0,"v":11.9}'
+BANNER = '{"T":1006,"fw":"bot-wr-1","hb_ms":300,"cap":0.3,"proto":1}'
+IMU = (
+    '{"T":1002,"r":0.1,"p":0.2,"y":3.0,"ax":0,"ay":0,"az":9.8,"gx":1.5,"gy":0,'
+    '"gz":-2.0,"mx":0,"my":0,"mz":0,"temp":30.0}'
+)
+UNKNOWN = '{"T":1003,"x":1}'
+GARBAGE = "UGV started."
+CAPTURE = "\n".join([BANNER, FEEDBACK, STOCK, IMU, UNKNOWN, GARBAGE]) + "\n"
 
 
 def rendered(line: str) -> str:
-    result = decode_line(line.encode())
-    assert isinstance(result, DecodeOk), result
-    return render(result)
+    return render(decode_line(line.encode()), raw=line.encode())
 
 
-def test_the_boot_banner_shows_what_deploy_step_10_reads(
-    golden: dict[str, list[str]],
-) -> None:
-    text = rendered(golden["B"][0])
-    assert "fw=0.1.0" in text
-    assert "proto=2" in text
-    assert "caps=0x3[DEBUG_BUILD|CLIFF_SENSOR]" in text
-    assert "safety_hash=3381018647" in text
+# --------------------------------------------------------------------------
+# Rendering
+# --------------------------------------------------------------------------
 
 
-def test_telemetry_names_the_state_the_flags_and_the_faults(
-    golden: dict[str, list[str]],
-) -> None:
-    text = rendered(golden["T"][0])
-    assert "ARMED_MOVING" in text
-    assert "cap_clamped" in text
-    assert "TOF_FL_OK" in text and "TOF_FR_OK" in text
-    assert "v=248/255mm/s" in text
+def test_patched_feedback_shows_the_fork_fields_by_name() -> None:
+    text = rendered(FEEDBACK)
+    assert "feedback" in text
+    assert "L=+0.200 R=+0.200" in text
+    assert "yaw=+87.3" in text
+    assert "v=11.62V" in text
+    assert "hb=1" in text
+    assert "st=0x6[tof|bumper]" in text
+    assert "tf=1204mm" in text
+    assert "bp=1" in text
+    assert "cc=3" in text
+    assert "stock" not in text
 
 
-def test_an_ack_names_the_acked_type_and_the_reason(
-    golden: dict[str, list[str]],
-) -> None:
-    arm_ack, velocity_ack = rendered(golden["K"][0]), rendered(golden["K"][1])
-    assert "acks A seq=2 OK reason=NONE echo=90210" in arm_ack
-    assert "acks V seq=4 CLAMPED reason=CAP_EXCEEDED echo=0" in velocity_ack
+def test_stock_feedback_is_marked_stock() -> None:
+    decoded = decode_line(STOCK.encode())
+    assert isinstance(decoded, Feedback) and not decoded.patched
+    text = rendered(STOCK)
+    assert text.rstrip().endswith("stock")
+    assert "hb=" not in text
 
 
-def test_an_event_names_its_code(golden: dict[str, list[str]]) -> None:
-    assert "CAL_STORED" in rendered(golden["E"][0])
+def test_the_banner_shows_what_robotd_compares() -> None:
+    text = rendered(BANNER)
+    assert "banner" in text
+    assert "fw=bot-wr-1 hb_ms=300 cap=0.3 proto=1" in text
 
 
-def test_a_velocity_frame_shows_its_ttl_and_flags(
-    golden: dict[str, list[str]],
-) -> None:
-    text = rendered(golden["V"][0])
-    assert "ttl=300ms" in text
-    assert "flags=0x0[-]" in text
+def test_an_imu_line_shows_its_rates() -> None:
+    text = rendered(IMU)
+    assert "imu" in text
+    assert "gyro=(+1.5,+0.0,-2.0)dps" in text
 
 
-def test_a_clear_names_the_latched_bits(golden: dict[str, list[str]]) -> None:
-    assert "overcurrent|stall" in rendered(golden["C"][0])
+def test_an_unknown_type_shows_its_number() -> None:
+    text = rendered(UNKNOWN)
+    assert "unknown" in text and "T=1003" in text
 
 
-def test_every_golden_frame_renders(golden: dict[str, list[str]]) -> None:
-    for group in golden.values():
-        for line in group:
-            assert rendered(line).strip()
+def test_garbage_is_dropped_with_its_reason_and_bytes_not_hidden() -> None:
+    decoded = decode_line(GARBAGE.encode())
+    assert isinstance(decoded, Dropped)
+    text = rendered(GARBAGE)
+    assert " ! " in text
+    assert "dropped" in text
+    assert "not_json" in text
+    assert "UGV started." in text
 
 
-def test_a_rejected_line_shows_its_reason_rather_than_vanishing() -> None:
-    result = decode_line(b"$V,2,3,40010,250,210,300,0*0000")
-    assert isinstance(result, DecodeErr)
-    text = render(result)
-    assert AckReason.BAD_CRC.name in text
-    assert "CRC mismatch" in text
+def test_raw_appends_the_line_bytes() -> None:
+    text = render(decode_line(BANNER.encode()), raw=BANNER.encode(), show_raw=True)
+    assert BANNER in text
 
 
-def test_raw_round_trips_the_frame_bytes(golden: dict[str, list[str]]) -> None:
-    result = decode_line(golden["S"][0].encode())
-    assert isinstance(result, DecodeOk)
-    assert golden["S"][0].strip() in render(result, raw=True)
+def test_banner_verdict_is_robotds_test() -> None:
+    banner = decode_line(BANNER.encode())
+    assert isinstance(banner, Banner)
+    matched, text = banner_verdict(banner, 300)
+    assert matched and "MATCH" in text
+    matched, text = banner_verdict(banner, 250)
+    assert not matched and "MISMATCH" in text and "config 250" in text
+    matched, _ = banner_verdict(Banner("x", 300, 0.5, 1), 300)
+    assert not matched
+
+
+# --------------------------------------------------------------------------
+# Splitting and counting
+# --------------------------------------------------------------------------
+
+
+def test_the_splitter_reassembles_partial_lines_and_skips_blank_ones() -> None:
+    splitter = LineSplitter()
+    assert splitter.feed(b'{"T":10') == []
+    assert splitter.feed(b'06}\r\n\r\n{"T":1') == [b'{"T":1006}\r']
+    assert splitter.feed(b"}\n") == [b'{"T":1}']
+
+
+def test_an_endless_line_is_handed_on_whole_so_decode_drops_it() -> None:
+    splitter = LineSplitter()
+    lines = splitter.feed(b"x" * 600)
+    assert len(lines) == 1
+    assert decode_line(lines[0]) == Dropped("oversize")
+    assert splitter.feed(b"\n") == []
+
+
+def test_counters_tell_stock_from_patched() -> None:
+    counters = Counters()
+    for line in (BANNER, FEEDBACK, STOCK, IMU, UNKNOWN, GARBAGE):
+        counters.count(decode_line(line.encode()))
+    assert counters.summary() == (
+        "2 feedback (1 stock), 1 imu, 1 banner, 1 unknown, 1 dropped"
+    )
+
+
+# --------------------------------------------------------------------------
+# Sources
+# --------------------------------------------------------------------------
 
 
 def test_open_serial_reads_a_pty_slave_raw() -> None:
     master, slave = pty.openpty()
     tty.setraw(slave)
-    device = os.ttyname(slave)
-    fd = open_serial(device, 921600)
+    fd = open_serial(os.ttyname(slave))
     try:
-        os.write(master, b"$D,2,8,40010*DFCC\n")
-        assert os.read(fd, 4096) == b"$D,2,8,40010*DFCC\n"
+        os.write(master, BANNER.encode() + b"\n")
+        assert os.read(fd, 4096) == BANNER.encode() + b"\n"
     finally:
         os.close(fd)
+        os.close(slave)
+        os.close(master)
+
+
+def test_the_default_fd_cannot_write() -> None:
+    """Read-only is the fd itself rather than a promise in the help string:
+    only robotd writes the port (I-18)."""
+    master, slave = pty.openpty()
+    tty.setraw(master)
+    try:
+        fd = open_serial(os.ttyname(slave))
+        try:
+            with pytest.raises(OSError):
+                os.write(fd, banner_request())
+        finally:
+            os.close(fd)
+    finally:
         os.close(slave)
         os.close(master)
 
@@ -143,48 +199,96 @@ def test_a_missing_device_is_reported_not_raised(
     assert "cannot open" in capsys.readouterr().err
 
 
-def test_count_stops_and_the_config_hash_is_asserted(
-    tmp_path: Path, golden: dict[str, list[str]], capsys: pytest.CaptureFixture[str]
+def test_a_capture_file_is_decoded_counted_and_the_banner_judged(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    device = tmp_path / "frames"
-    device.write_bytes(golden["B"][0].encode())
+    capture = tmp_path / "capture.txt"
+    capture.write_text(CAPTURE)
     config = tmp_path / "robot.toml"
     config.write_text('[robot]\nname = "rover"\n')
-    assert main([str(device), "--count", "1", "--config", str(config)]) == 0
+    assert main([str(capture), "--config", str(config)]) == 0
     captured = capsys.readouterr()
-    assert "safety_hash MATCH" in captured.out
-    assert "1 ok, 0 dropped" in captured.err
+    assert "banner MATCH: hb_ms 300 (config 300), cap 0.3 (ceiling 0.3)" in captured.out
+    shown = [line for line in captured.out.splitlines() if line[:1] == " "]
+    assert len(shown) == 6
+    assert "2 feedback (1 stock), 1 imu, 1 banner, 1 unknown, 1 dropped" in captured.err
 
 
-# ---------------------------------------------------------------------------
-# I-18: only robotd writes the port
-# ---------------------------------------------------------------------------
-
-
-def test_the_default_fd_cannot_write(tmp_path: Path) -> None:
-    """Read-only is the default, and it is the fd itself rather than a promise
-    in the help string: a second writer advancing the MCU's last_down makes
-    robotd's next V stale, and at 20 Hz roughly every other V is dropped."""
-    master, slave = pty.openpty()
-    tty.setraw(master)
-    try:
-        fd = open_serial(os.ttyname(slave), 921600)
-        try:
-            with pytest.raises(OSError):
-                os.write(fd, b"$P,2,1,40010,1*0000\n")
-        finally:
-            os.close(fd)
-    finally:
-        os.close(slave)
-        os.close(master)
-
-
-def test_ping_refuses_while_something_is_listening_on_the_bus(
-    tmp_path: Path, golden: dict[str, list[str]], capsys: pytest.CaptureFixture[str]
+def test_a_banner_that_disagrees_with_the_config_is_a_mismatch_exit(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """The guard roverctl's arm/disarm already has (I-18).  Without it a
-    `wirecat --ping` run during a drive is a second writer into the motor
-    controller, and a diagnostic tool stops the robot."""
+    capture = tmp_path / "capture.txt"
+    capture.write_text(BANNER + "\n")
+    config = tmp_path / "robot.toml"
+    config.write_text("[safety]\nheartbeat_ms = 250\n")
+    assert main([str(capture), "--config", str(config)]) == 1
+    assert "banner MISMATCH" in capsys.readouterr().out
+
+
+def test_kind_filters_hide_or_keep_and_count_stops(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    capture = tmp_path / "capture.txt"
+    capture.write_text(CAPTURE)
+    assert main([str(capture), "--exclude", "feedback,dropped"]) == 0
+    out = capsys.readouterr().out
+    assert "feedback" not in out and "not_json" not in out
+    assert "banner" in out and "T=1003" in out
+
+    assert main([str(capture), "--only", "banner"]) == 0
+    shown = [line for line in capsys.readouterr().out.splitlines() if line[:1] == " "]
+    assert len(shown) == 1 and "fw=bot-wr-1" in shown[0]
+
+    assert main([str(capture), "--count", "2"]) == 0
+    shown = [line for line in capsys.readouterr().out.splitlines() if line[:1] == " "]
+    assert len(shown) == 2
+
+
+def test_an_unknown_kind_is_a_usage_error(tmp_path: Path) -> None:
+    with pytest.raises(SystemExit):
+        main([str(tmp_path / "x"), "--only", "frames"])
+
+
+def test_tcp_reads_a_rover_stub_port(capsys: pytest.CaptureFixture[str]) -> None:
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    port = listener.getsockname()[1]
+
+    def serve() -> None:
+        conn, _ = listener.accept()
+        with conn:
+            conn.sendall(CAPTURE.encode())
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    try:
+        assert main(["--tcp", f"127.0.0.1:{port}", "--only", "banner,feedback"]) == 0
+    finally:
+        thread.join(timeout=3.0)
+        listener.close()
+    captured = capsys.readouterr()
+    assert "fw=bot-wr-1" in captured.out
+    assert "1 banner" in captured.err
+
+
+def test_a_device_and_tcp_together_is_a_usage_error() -> None:
+    with pytest.raises(SystemExit):
+        main(["/dev/null", "--tcp", "127.0.0.1:1"])
+    with pytest.raises(SystemExit):
+        main([])
+
+
+# --------------------------------------------------------------------------
+# I-18: only robotd writes the port
+# --------------------------------------------------------------------------
+
+
+def test_request_refuses_while_something_is_listening_on_the_bus(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Without this a `wirecat --request` run during a drive is a second writer
+    into the motor controller, and a diagnostic tool changes the robot."""
     # A short directory: an AF_UNIX path is capped at ~104 bytes and pytest's
     # tmp_path is longer than that on macOS.
     run_dir = Path(tempfile.mkdtemp(prefix="wc"))
@@ -194,14 +298,35 @@ def test_ping_refuses_while_something_is_listening_on_the_bus(
     listener.listen(1)
     config = tmp_path / "robot.toml"
     config.write_text(f'[bus]\nsock = "{sock_path}"\n')
-    device = tmp_path / "frames"
-    device.write_bytes(golden["B"][0].encode())
+    capture = tmp_path / "capture.txt"
+    capture.write_text(BANNER + "\n")
     try:
-        assert main([str(device), "--ping", "--config", str(config)]) == 2
+        assert main([str(capture), "--request", "--config", str(config)]) == 2
         err = capsys.readouterr().err
         assert "Only robotd writes the port" in err
         # ...and read-only still works against the same live bus.
-        assert main([str(device), "--count", "1", "--config", str(config)]) == 0
+        assert main([str(capture), "--config", str(config)]) == 0
     finally:
         listener.close()
         shutil.rmtree(run_dir, ignore_errors=True)
+
+
+def test_request_sends_feedback_on_and_a_banner_request_once(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config = tmp_path / "robot.toml"
+    config.write_text(f'[bus]\nsock = "{tmp_path / "absent.sock"}"\n')
+    master, slave = pty.openpty()
+    tty.setraw(master)
+    os.set_blocking(master, False)
+    try:
+        os.write(master, BANNER.encode() + b"\n")
+        code = main(
+            [os.ttyname(slave), "--request", "--count", "1", "--config", str(config)]
+        )
+        assert code == 0
+        assert "fw=bot-wr-1" in capsys.readouterr().out
+        assert os.read(master, 4096) == feedback_flow(True) + banner_request()
+    finally:
+        os.close(slave)
+        os.close(master)

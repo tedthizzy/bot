@@ -22,6 +22,7 @@ import grp
 import importlib.util
 import json
 import os
+import re
 import shutil
 import socket
 import stat
@@ -35,17 +36,38 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from rover_contracts.config import RobotConfig
+from rover_contracts.config import LinkConfig, RobotConfig, SafetyConfig
+from rover_contracts.wave_proto import POWER_CAP
 
 from rover_devtools import load_config_or_default
-from rover_devtools.mcu_sim import SimulatorMissing, find_binary
 
-__all__ = ["Check", "Dependency", "DEFAULT_IMPORTS", "main", "run_checks"]
+__all__ = [
+    "Check",
+    "DEFAULT_IMPORTS",
+    "Dependency",
+    "FORK_HEADER",
+    "fork_check",
+    "fork_constants",
+    "link_check",
+    "link_fix",
+    "link_timing",
+    "main",
+    "report",
+    "run_checks",
+    "stub_check",
+]
 
 OK, WARN, FAIL = "ok", "warn", "fail"
 
 MIN_PYTHON = (3, 11)
 """``requires-python = ">=3.11"`` (ARCHITECTURE 12)."""
+
+FORK_HEADER = Path("firmware/General_Driver/bot_config.h")
+"""Where the firmware fork compiles its safety constants.  Relative to the
+repo; resolved against the working directory, then the source tree."""
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_FORK_CONSTANTS = ("BOT_HEARTBEAT_MS", "BOT_POWER_CAP")
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,13 +101,9 @@ class Dependency:
 
 DEFAULT_IMPORTS: tuple[Dependency, ...] = (
     Dependency("rover_contracts", "every wire format", True,
-               "uv pip install -e packages/rover_contracts"),
+               "uv pip install -e ."),
     Dependency("pydantic", "A12 stage two, strict validation", True, "uv sync"),
-    # ARCHITECTURE 12 pins it in the base set, but robotd's link opens the
-    # device itself (os.open + termios) and nothing imports this in v1, so its
-    # absence is informational, not a fault.
-    Dependency("serial_asyncio_fast", "pinned by ARCHITECTURE 12; unused in v1",
-               False, "uv sync"),
+    Dependency("serial_asyncio_fast", "pinned by ARCHITECTURE 12", False, "uv sync"),
     Dependency("openai", "brain's box client", False, "uv sync"),
     Dependency("aiohttp", "rover-web", False, "uv sync"),
     Dependency("picamera2", "rover-cam, Pi only", False,
@@ -138,15 +156,28 @@ def _import_check(dep: Dependency) -> Check:
     )
 
 
-def _simulator() -> Check:
+def stub_check() -> Check:
+    """``rover-stub`` is the simulated controller; a checkout without it has no
+    way to run robotd on a Mac."""
+    script = shutil.which("rover-stub")
+    if script is not None:
+        return Check("rover-stub", OK, f"console script {script}")
     try:
-        binary = find_binary()
-    except SimulatorMissing as exc:
-        return Check("mcu-sim", WARN, "not built", str(exc).splitlines()[-1])
-    return Check("mcu-sim", OK, str(binary))
+        spec = importlib.util.find_spec("rover_devtools.rover_stub")
+    except (ImportError, ValueError):
+        spec = None
+    if spec is not None:
+        return Check(
+            "rover-stub", OK,
+            f"module {spec.origin} (python -m rover_devtools.rover_stub --pty)",
+        )
+    return Check(
+        "rover-stub", WARN, "neither the console script nor the module is present",
+        "uv sync, or uv pip install -e . -- then rover-stub --pty",
+    )
 
 
-def _writers(path: Path) -> str:
+def _holders(path: Path) -> str:
     """Who has the port open, when the host has a tool that can say (I-18)."""
     fuser = shutil.which("fuser")
     if fuser is None:
@@ -161,31 +192,158 @@ def _writers(path: Path) -> str:
     return f", {len(pids)} holder(s)" if pids else ", no holder"
 
 
-def _serial_device(config: RobotConfig) -> Check:
-    port = Path(config.serial.port)
-    backend = config.serial.backend
-    if not port.exists():
-        fix = (
-            f"start the simulator: python -m rover_devtools.mcu_sim --link {port}"
-            if backend == "pty"
-            else "check dtoverlay=uart5 in /boot/firmware/config.txt and the udev "
-            "rule (deploy steps 8 and 9); udevadm info -q all -n /dev/rover-mcu"
+def link_fix(port: str) -> str:
+    """What to do about a missing ``[link] port``: the Pi's UART needs
+    enabling; anything else is a stub path that is not running."""
+    if port == "/dev/serial0" or port.startswith(("/dev/ttyAMA", "/dev/ttyS")):
+        return (
+            "Pi: enable_uart=1 and no serial console in /boot/firmware/config.txt "
+            "(raspi-config > Interface Options > Serial Port), then reboot; "
+            "on a Mac run rover-stub --pty and set [link] port to the path it prints"
         )
-        return Check("serial device", WARN, f"{port} does not exist ({backend})", fix)
+    return (
+        "start the simulator: rover-stub --pty, and set [link] port to the path it prints"
+    )
+
+
+def link_check(config: RobotConfig) -> Check:
+    """The rover link named by ``[link]``: a readable serial device, or a TCP
+    peer that accepts."""
+    link = config.link
+    if link.backend == "tcp":
+        where = f"{link.tcp_host}:{link.tcp_port}"
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(0.3)
+        try:
+            sock.connect((link.tcp_host, link.tcp_port))
+        except OSError as exc:
+            return Check(
+                "link", WARN, f"tcp {where} does not accept: {exc}",
+                f"rover-stub --tcp {link.tcp_port}, or set [link] backend = \"serial\"",
+            )
+        finally:
+            sock.close()
+        return Check("link", OK, f"tcp {where} accepting")
+
+    port = Path(link.port)
+    if not port.exists():
+        return Check("link", WARN, f"{port} does not exist (serial)", link_fix(link.port))
     target = os.readlink(port) if port.is_symlink() else ""
     info = os.stat(port)
-    kind = "char device" if stat.S_ISCHR(info.st_mode) else "not a char device"
-    access = "rw" if os.access(port, os.R_OK | os.W_OK) else "no rw access"
-    detail = (
-        f"{port}{f' -> {target}' if target else ''}: {kind}, {access}, "
-        f"mode {stat.filemode(info.st_mode)}{_writers(port)}"
-    )
-    if access != "rw":
+    if not stat.S_ISCHR(info.st_mode):
         return Check(
-            "serial device", FAIL, detail,
-            "add your user to group rover, or check the udev rule's GROUP/MODE",
+            "link", WARN, f"{port} is not a character device",
+            "point [link] port at the UART or at the pty rover-stub printed",
         )
-    return Check("serial device", OK, detail)
+    readable = os.access(port, os.R_OK | os.W_OK)
+    detail = (
+        f"{port}{f' -> {target}' if target else ''}: char device, "
+        f"{'rw' if readable else 'no rw access'}, mode {stat.filemode(info.st_mode)}"
+        f"{_holders(port)}"
+    )
+    if not readable:
+        return Check(
+            "link", FAIL, detail,
+            "add your user to the device's group (dialout on a Pi), then log in again",
+        )
+    return Check("link", OK, detail)
+
+
+def link_timing(link: LinkConfig, safety: SafetyConfig) -> Check:
+    """The three periods that make the heartbeat a stop guarantee, in order:
+    at least three speed commands per heartbeat, and feedback that goes stale
+    before the controller's own watchdog does (T0)."""
+    period_ms = 1000.0 / link.command_hz
+    problems: list[str] = []
+    if period_ms * 3 > safety.heartbeat_ms:
+        problems.append(
+            f"command_hz {link.command_hz} gives {period_ms:.0f} ms per command, "
+            f"x3 = {period_ms * 3:.0f} > heartbeat_ms {safety.heartbeat_ms}"
+        )
+    if safety.feedback_max_age_ms >= safety.heartbeat_ms:
+        problems.append(
+            f"feedback_max_age_ms {safety.feedback_max_age_ms} >= "
+            f"heartbeat_ms {safety.heartbeat_ms}"
+        )
+    if link.feedback_interval_ms >= safety.feedback_max_age_ms:
+        problems.append(
+            f"feedback_interval_ms {link.feedback_interval_ms} >= "
+            f"feedback_max_age_ms {safety.feedback_max_age_ms}"
+        )
+    if problems:
+        return Check(
+            "link timing", FAIL, "; ".join(problems),
+            "keep feedback_interval_ms < feedback_max_age_ms < heartbeat_ms and "
+            "command_hz >= 3000 / heartbeat_ms",
+        )
+    return Check(
+        "link timing", OK,
+        f"{link.command_hz} Hz = {period_ms:.0f} ms/command, x3 = {period_ms * 3:.0f} "
+        f"<= heartbeat {safety.heartbeat_ms} ms; feedback {link.feedback_interval_ms} "
+        f"< max_age {safety.feedback_max_age_ms} < heartbeat {safety.heartbeat_ms}",
+    )
+
+
+def fork_constants(text: str) -> dict[str, float]:
+    """``#define BOT_HEARTBEAT_MS 300`` and ``#define BOT_POWER_CAP 0.30f``,
+    whatever the spelling of the number, as a name -> value map."""
+    found: dict[str, float] = {}
+    for name in _FORK_CONSTANTS:
+        match = re.search(
+            rf"^\s*#\s*define\s+{name}\s+\(?\s*([-+]?\d+(?:\.\d+)?)\s*[fFuUlL]*\s*\)?",
+            text, re.MULTILINE,
+        )
+        if match:
+            found[name] = float(match.group(1))
+    return found
+
+
+def fork_header_path() -> Path:
+    """The header in the working directory if a checkout is there, else in the
+    source tree this module was imported from."""
+    for base in (Path.cwd(), _REPO_ROOT):
+        candidate = base / FORK_HEADER
+        if candidate.exists():
+            return candidate
+    return _REPO_ROOT / FORK_HEADER
+
+
+def fork_check(config: RobotConfig, header: Path | None = None) -> Check:
+    """The fork's compiled constants against the host's: robotd refuses motion
+    unless the banner it sees matches ``[safety] heartbeat_ms`` and the 0.30
+    ceiling, so a disagreement here is a rover that will not move."""
+    header = fork_header_path() if header is None else header
+    fix = "the fork under firmware/ is being written; docs/protocol.md is its contract"
+    if not header.parent.is_dir():
+        return Check(
+            "firmware fork", WARN,
+            f"firmware fork not present ({header.parent} does not exist)", fix,
+        )
+    if not header.is_file():
+        return Check(
+            "firmware fork", WARN, f"firmware fork not present ({header} missing)", fix
+        )
+    values = fork_constants(header.read_text(encoding="utf-8", errors="replace"))
+    missing = [name for name in _FORK_CONSTANTS if name not in values]
+    if missing:
+        return Check(
+            "firmware fork", FAIL, f"{header} does not define {', '.join(missing)}",
+            "add #define BOT_HEARTBEAT_MS 300 and #define BOT_POWER_CAP 0.30f to "
+            "the header",
+        )
+    hb, cap = values["BOT_HEARTBEAT_MS"], values["BOT_POWER_CAP"]
+    wanted_hb = config.safety.heartbeat_ms
+    detail = (
+        f"{header}: BOT_HEARTBEAT_MS={hb:g} vs [safety] heartbeat_ms={wanted_hb}, "
+        f"BOT_POWER_CAP={cap:g} vs ceiling {POWER_CAP:g}"
+    )
+    if hb != wanted_hb or abs(cap - POWER_CAP) > 1e-6:
+        return Check(
+            "firmware fork", FAIL, detail,
+            "the host and the fork must agree: rebuild the fork or fix [safety] "
+            "heartbeat_ms; robotd refuses motion until the banner matches",
+        )
+    return Check("firmware fork", OK, detail)
 
 
 _SOCKET_OWNERS = {
@@ -295,7 +453,7 @@ def _storage_check(label: str, path_text: str) -> Check:
             f"storage {label}", WARN, f"{path} does not exist ({free_gib:.1f} GiB free "
             f"on {existing})",
             f"install -d -o rover -g rover {path}, or point [{label}] at a Mac path "
-            "-- `make dev` must never write /data",
+            "-- `make sim` must never write /data",
         )
     if not os.access(path, os.W_OK):
         return Check(f"storage {label}", FAIL, f"{path} is not writable",
@@ -334,18 +492,22 @@ def run_checks(
     *,
     imports: Sequence[Dependency] | None = None,
     probe_box: bool = True,
+    fork_header: Path | None = None,
 ) -> tuple[RobotConfig, str, list[Check]]:
     """Every check, in the order a stuck user should read them.
 
     ``imports`` defaults to :data:`DEFAULT_IMPORTS`; pass a shorter table to ask
-    about a different set of modules.
+    about a different set of modules.  ``fork_header`` overrides where the
+    firmware fork's ``bot_config.h`` is looked for.
     """
     try:
         config, origin = load_config_or_default(config_path)
+        link = config.link
+        where = (
+            f"{link.tcp_host}:{link.tcp_port}" if link.backend == "tcp" else link.port
+        )
         config_check = Check(
-            "config", OK,
-            f"{origin}; safety_hash={config.safety_hash()}, "
-            f"serial.backend={config.serial.backend}",
+            "config", OK, f"{origin}; link.backend={link.backend} port={where}"
         )
     except (OSError, ValueError) as exc:
         config, origin = RobotConfig(), "built-in defaults (config did not load)"
@@ -360,8 +522,10 @@ def run_checks(
         _import_check(dep)
         for dep in (DEFAULT_IMPORTS if imports is None else imports)
     ]
-    checks.append(_simulator())
-    checks.append(_serial_device(config))
+    checks.append(stub_check())
+    checks.append(link_check(config))
+    checks.append(link_timing(config.link, config.safety))
+    checks.append(fork_check(config, fork_header))
     checks += [
         _socket_check(key, getattr(config.bus, key)) for key in _SOCKET_OWNERS
     ]
@@ -373,13 +537,15 @@ def run_checks(
 
 
 def _limits_line(config: RobotConfig) -> str:
-    limits = config.limits
+    limits, safety, link = config.limits, config.safety, config.link
     return (
-        f"speed_mps={limits.speed_mps} default={limits.speed_default_mps} "
-        f"drive_m={limits.drive_m} turn_deg={limits.turn_deg} "
-        f"rate_dps={limits.rate_dps} budget={limits.budget_path_m}m/"
-        f"{limits.budget_motion_s}s twist={limits.twist_linear_mps}mps/"
-        f"{limits.twist_angular_radps}radps stream={config.bus.allow_stream or 'off'}"
+        f"power_max={limits.power_max} default={limits.power_default} "
+        f"min={limits.power_min} drive_for_max_s={limits.drive_for_max_s} "
+        f"turn_timeout_max_s={limits.turn_timeout_max_s} "
+        f"budget_motion_s={limits.budget_motion_s} twist_power={limits.twist_power} "
+        f"heartbeat_ms={safety.heartbeat_ms} "
+        f"feedback_max_age_ms={safety.feedback_max_age_ms} "
+        f"command_hz={link.command_hz} stream={config.bus.allow_stream or 'off'}"
     )
 
 
@@ -423,8 +589,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.json:
         payload: dict[str, Any] = {
             "config_origin": origin,
-            "safety_hash": config.safety_hash(),
             "limits": config.limits.model_dump(),
+            "safety": config.safety.model_dump(),
+            "link": config.link.model_dump(),
             "checks": [check.as_dict() for check in checks],
         }
         print(json.dumps(payload, indent=2))

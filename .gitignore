@@ -39,3 +39,6 @@ raspberrypi.md
 # Editor and OS
 .DS_Store
 *.swp
+
+# firmware/build.sh: arduino-cli core, toolchains and libraries (about 2.5 GB)
+firmware/.cache/

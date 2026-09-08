@@ -1,8 +1,10 @@
 """``find``'s bounds, and the rest of the brain-side executors.
 
 A14 bounds the scan three ways -- eight sweeps, sixty seconds, cancellable --
-and 5.5 says the turn angle is a pure function of ``center_x_permille`` and
-``hfov_deg``, computed on the Pi.  Both are asserted here.
+and 5.5 says the turn is a pure function of ``center_x_permille`` and
+``hfov_deg``, computed on the Pi.  Open loop, every turn is a ``turn_to`` an
+absolute heading: the sweep steps 45 degrees round from where it started, and
+centring turns to the heading the object was seen at.
 """
 
 from __future__ import annotations
@@ -18,9 +20,9 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "packages"))
 
 from rover_brain import skills_local  # noqa: E402
+from rover_brain.heading import heading_left_of  # noqa: E402
 from rover_brain.scene import SceneRing  # noqa: E402
 from rover_brain.skills_local import (  # noqa: E402
-    FIND_RATE_DPS,
     MAX_SWEEPS,
     SWEEP_DEG,
     LocalSkills,
@@ -65,13 +67,11 @@ class FakeStills:
 
 class FakeMotion:
     def __init__(self, script: list[tuple[ResultStatus, ResultReason]] | None = None):
-        self.turns: list[tuple[float, float]] = []
+        self.turns: list[int] = []
         self._script = list(script or [])
 
-    async def turn(
-        self, angle_deg: float, rate_dps: float
-    ) -> tuple[ResultStatus, ResultReason]:
-        self.turns.append((angle_deg, rate_dps))
+    async def turn_to(self, heading_deg: int) -> tuple[ResultStatus, ResultReason]:
+        self.turns.append(heading_deg)
         if self._script:
             return self._script.pop(0)
         return ResultStatus.DONE, ResultReason.NONE
@@ -131,6 +131,7 @@ def build(
     vision: FakeVision,
     motion: FakeMotion | None = None,
     clock: Clock | None = None,
+    heading: float = 0.0,
 ) -> tuple[LocalSkills, FakeStills, FakeMotion, FakeTts, SceneRing, list[Face]]:
     stills, tts = FakeStills(), FakeTts()
     motion = motion or FakeMotion()
@@ -148,6 +149,7 @@ def build(
         scene=scene,
         face=set_face,
         hfov_deg=HFOV,
+        heading_deg=lambda: heading,
         clock=clock or Clock(),
     )
     return skills, stills, motion, tts, scene, faces
@@ -164,9 +166,22 @@ async def test_a_fruitless_scan_stops_at_eight_captures() -> None:
     assert outcome.found is False
     assert outcome.sweeps == MAX_SWEEPS
     assert stills.calls == MAX_SWEEPS
-    # One turn between captures, and none after the last: eight captures span
-    # 360 degrees with an 83 degree field of view.
-    assert motion.turns == [(SWEEP_DEG, FIND_RATE_DPS)] * (MAX_SWEEPS - 1)
+    # One turn_to between captures, and none after the last: eight captures
+    # 45 degrees apart span 360 degrees with an 83 degree field of view.
+    assert motion.turns == [315, 270, 225, 180, 135, 90, 45]
+    assert len(motion.turns) == MAX_SWEEPS - 1
+
+
+@pytest.mark.asyncio
+async def test_the_sweep_headings_are_laid_out_from_the_starting_heading() -> None:
+    vision = FakeVision([absent()] * 20)
+    skills, _, motion, *_ = build(vision, heading=100.0)
+    await skills.find("red mug", MAX_SWEEPS)
+    assert motion.turns == [
+        heading_left_of(100.0, SWEEP_DEG * step) for step in range(1, MAX_SWEEPS)
+    ]
+    assert motion.turns == [55, 10, 325, 280, 235, 190, 145]
+    assert all(isinstance(h, int) and 0 <= h <= 359 for h in motion.turns)
 
 
 @pytest.mark.asyncio
@@ -210,6 +225,17 @@ async def test_a_refused_turn_aborts_the_sweep_without_retrying() -> None:
 
 
 @pytest.mark.asyncio
+async def test_a_turn_that_times_out_ends_the_scan_with_a_reason() -> None:
+    vision = FakeVision([absent()] * 20)
+    motion = FakeMotion([(ResultStatus.TIMEOUT, ResultReason.NONE)])
+    skills, stills, motion, *_ = build(vision, motion)
+    outcome = await skills.find("red mug", MAX_SWEEPS)
+    assert outcome.found is False and outcome.aborted is True
+    assert outcome.reason is ResultReason.NOT_READY  # never a silent stop
+    assert stills.calls == 1
+
+
+@pytest.mark.asyncio
 async def test_the_scan_is_cancellable() -> None:
     gate = asyncio.Event()
     vision = FakeVision([absent()] * 20, gate=gate)
@@ -227,16 +253,25 @@ async def test_the_scan_is_cancellable() -> None:
 
 
 @pytest.mark.asyncio
-async def test_the_turn_angle_is_a_pure_function_of_the_permille_and_hfov() -> None:
+async def test_the_centring_turn_is_a_pure_function_of_the_permille_and_hfov() -> None:
     vision = FakeVision([seen(610), seen(500)])
     skills, stills, motion, _, scene, _ = build(vision)
     outcome = await skills.find("red mug", MAX_SWEEPS)
     assert outcome.found is True
-    expected = bearing_deg_from_center_x(610, HFOV)
-    assert motion.turns[0][0] == pytest.approx(expected)
-    assert motion.turns[0][0] == pytest.approx(-9.13)  # + is left, so 610 is right
+    bearing = bearing_deg_from_center_x(610, HFOV)
+    assert bearing == pytest.approx(-9.13)  # + is left, so 610 is to the right
+    assert motion.turns == [heading_left_of(0.0, bearing)] == [9]
     assert stills.calls == 2  # capture, turn, re-capture
     assert len(motion.turns) == 1  # already centred on the second look
+
+
+@pytest.mark.asyncio
+async def test_centring_is_relative_to_the_heading_now() -> None:
+    vision = FakeVision([seen(390), seen(500)])
+    skills, _, motion, *_ = build(vision, heading=87.0)
+    await skills.find("red mug", MAX_SWEEPS)
+    bearing = bearing_deg_from_center_x(390, HFOV)  # +9.13, to the left
+    assert motion.turns == [heading_left_of(87.0, bearing)] == [78]
 
 
 @pytest.mark.asyncio
@@ -259,13 +294,15 @@ async def test_an_object_already_centred_is_not_turned_to() -> None:
 
 
 @pytest.mark.asyncio
-async def test_a_sighting_is_remembered_at_the_computed_bearing() -> None:
+async def test_a_sighting_is_remembered_at_the_heading_it_was_seen_at() -> None:
     vision = FakeVision([seen(610), seen(500)])
-    skills, _, _, _, scene, _ = build(vision)
+    skills, _, _, _, scene, _ = build(vision, heading=87.0)
     await skills.find("red mug", MAX_SWEEPS)
     entries = scene.recently_seen()
     assert entries[0].label == "red mug"
-    assert entries[0].where_deg in (0, -9)
+    # The second look is centred, so the object is where the robot faces.
+    assert entries[0].heading_deg == 87
+    assert 0 <= entries[0].heading_deg <= 359
 
 
 @pytest.mark.asyncio

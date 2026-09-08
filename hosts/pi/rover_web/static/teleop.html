@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>rover teleop</title>
+<link rel="stylesheet" href="/static/rover.css">
+</head>
+<body>
+<nav class="bar">
+  <a href="/">face</a>
+  <a href="/teleop" aria-current="page">teleop</a>
+  <a href="/ptt">talk</a>
+  <span class="spacer"></span>
+  <span class="dot" data-dot="teleop">teleop</span>
+  <span class="dot" data-dot="ws">ws</span>
+</nav>
+
+<main>
+  <div class="pad" id="pad">
+    <svg class="cross" viewBox="0 0 100 100" aria-hidden="true">
+      <line x1="50" y1="6" x2="50" y2="94" stroke="#2a323b" stroke-width="0.7"/>
+      <line x1="6" y1="50" x2="94" y2="50" stroke="#2a323b" stroke-width="0.7"/>
+      <circle cx="50" cy="50" r="42" fill="none" stroke="#2a323b" stroke-width="0.7"/>
+    </svg>
+    <div class="knob" id="knob"></div>
+  </div>
+  <div class="readout" id="readout">lin 0.00 &middot; ang 0.00</div>
+  <div class="readout state" id="state">no state from robotd yet</div>
+  <div class="readout" id="teleop-note"></div>
+</main>
+
+<form class="stop" method="post" action="/estop">
+  <button type="submit">STOP</button>
+  <p class="note">STOP is a plain POST and never waits on this pad</p>
+</form>
+
+<script src="/static/rover.js"></script>
+<script>
+"use strict";
+/* The browser must send at >=10 Hz including while the stick is centred
+   (ARCHITECTURE 4.5).  Stop sending, and rover-web's 250 ms input TTL emits one
+   zero twist and shuts the stream down.  The stick is normalised here; rover-web
+   scales it by [limits] twist_power into TwistPayload(lin, ang), so this page
+   cannot name a power. */
+const SEND_HZ = 20;
+const pad = document.getElementById("pad");
+const knob = document.getElementById("knob");
+const readout = document.getElementById("readout");
+const note = document.getElementById("teleop-note");
+
+let x = 0, y = 0, active = false, timer = null;
+
+const updateState = Rover.stateReadout(document.getElementById("state"));
+const send = Rover.connect((message) => {
+  if (message.type === "error" && message.code === "source_not_allowed") {
+    note.textContent = "teleop is not in [bus] allow_stream - production ships it empty";
+    note.className = "readout warn";
+  } else if (message.type === "state") {
+    updateState(message);
+  }
+});
+
+function place(clientX, clientY) {
+  const box = pad.getBoundingClientRect();
+  const nx = ((clientX - box.left) / box.width) * 2 - 1;
+  const ny = 1 - ((clientY - box.top) / box.height) * 2;
+  x = Math.max(-1, Math.min(1, nx));
+  y = Math.max(-1, Math.min(1, ny));
+  paint();
+}
+
+function centre() {
+  x = 0;
+  y = 0;
+  paint();
+}
+
+function paint() {
+  knob.style.left = ((x + 1) / 2) * 100 + "%";
+  knob.style.top = ((1 - y) / 2) * 100 + "%";
+  readout.textContent = `lin ${y.toFixed(2)} · ang ${x.toFixed(2)}`;
+}
+
+function startStream() {
+  if (timer !== null) return;
+  timer = setInterval(() => send({ type: "twist", x, y }), 1000 / SEND_HZ);
+}
+
+function stopStream() {
+  if (timer === null) return;
+  clearInterval(timer);
+  timer = null;
+  centre();
+  send({ type: "twist", x: 0, y: 0 });
+}
+
+pad.addEventListener("pointerdown", (event) => {
+  active = true;
+  pad.setPointerCapture(event.pointerId);
+  place(event.clientX, event.clientY);
+  startStream();
+});
+pad.addEventListener("pointermove", (event) => {
+  if (active) place(event.clientX, event.clientY);
+});
+for (const name of ["pointerup", "pointercancel", "pointerleave"]) {
+  pad.addEventListener(name, () => {
+    if (!active) return;
+    active = false;
+    stopStream();
+  });
+}
+/* A backgrounded tab or a sleeping phone is an immediate zero, not a hold. */
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState !== "visible") {
+    active = false;
+    stopStream();
+  }
+});
+window.addEventListener("blur", () => {
+  active = false;
+  stopStream();
+});
+
+Rover.wireStop();
+Rover.pollStatus();
+paint();
+</script>
+</body>
+</html>

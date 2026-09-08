@@ -1,7 +1,7 @@
 [project]
 name = "rover"
 version = "0.1.0"
-description = "Indoor voice-and-vision rover: Pi 4 host, ESP32-S3 motion controller, one 27B VLM on an owned GPU box"
+description = "Indoor voice-and-vision rover: WAVE ROVER chassis, Pi 4 host, one 27B VLM on an owned GPU box"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
@@ -44,6 +44,7 @@ speech = [
 # checkout behaves identically; these exist because ARCHITECTURE 12 says the CLI
 # is `roverctl` everywhere.
 roverctl = "rover_devtools.roverctl:main"
+rover-stub = "rover_devtools.rover_stub:main"
 rover-robotd = "rover_robotd.main:main"
 rover-brain = "rover_brain.main:main"
 rover-cam = "rover_cam.publisher:main"
@@ -81,7 +82,7 @@ build-backend = "setuptools.build_meta"
 # packages land one at a time and a missing directory must not break `uv lock`
 # for everyone else.
 [tool.setuptools.packages.find]
-where = ["packages"]
+where = ["packages", "hosts/pi"]
 
 [tool.setuptools.package-data]
 "*" = ["py.typed"]
@@ -100,7 +101,7 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 # packages/ on the path so every component's tests import rover_contracts (and
 # each other) whether or not the workspace has been installed.  This is what
 # lets `make test` work from a bare clone.
-pythonpath = ["packages"]
+pythonpath = ["packages", "hosts/pi"]
 testpaths = ["tests"]
 addopts = "-q --strict-markers --strict-config"
 asyncio_mode = "auto"
@@ -114,6 +115,6 @@ markers = [
 
 [tool.mypy]
 python_version = "3.11"
-mypy_path = "packages"
+mypy_path = "packages:hosts/pi"
 strict = true
 warn_unused_ignores = true

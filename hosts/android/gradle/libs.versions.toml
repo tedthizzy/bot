@@ -1,0 +1,28 @@
+# Version catalog for the phone host.  Nothing here has been resolved on the
+# machine this skeleton was written on (it has no Android SDK), so before the
+# first build bump each entry to the current stable release and let Gradle
+# report what disagrees.  Two pairs must agree: the Android Gradle Plugin with
+# the Gradle version it requires (8.7 needs Gradle 8.9 or newer), and the Kotlin
+# plugin with the kotlinx.serialization runtime built for it.
+[versions]
+agp = "8.7.3"                    # bump: Android Gradle Plugin 8.x
+kotlin = "2.1.0"                 # bump: Kotlin 2.x; the serialization plugin shares it
+kotlinx-serialization = "1.7.3"  # bump: kotlinx.serialization runtime
+androidx-test-runner = "1.6.2"   # bump
+androidx-test-ext-junit = "1.2.1"  # bump
+junit = "4.13.2"
+compileSdk = "35"
+minSdk = "26"
+targetSdk = "35"
+
+[libraries]
+kotlinx-serialization-json = { module = "org.jetbrains.kotlinx:kotlinx-serialization-json", version.ref = "kotlinx-serialization" }
+androidx-test-runner = { module = "androidx.test:runner", version.ref = "androidx-test-runner" }
+androidx-test-ext-junit = { module = "androidx.test.ext:junit", version.ref = "androidx-test-ext-junit" }
+junit = { module = "junit:junit", version.ref = "junit" }
+
+[plugins]
+android-application = { id = "com.android.application", version.ref = "agp" }
+android-library = { id = "com.android.library", version.ref = "agp" }
+kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }
+kotlin-serialization = { id = "org.jetbrains.kotlin.plugin.serialization", version.ref = "kotlin" }

@@ -46,7 +46,7 @@ services:
     ports:
       - "127.0.0.1:8080:8080"   # rover-web
       - "127.0.0.1:8000:8000"   # fakebox
-    # mcu-sim allocates a pty and symlinks ./run/mcu.pty to it.
+    # rover-stub listens on TCP 7777 inside the container; robotd connects to it there.
     tty: true
 
   shell:

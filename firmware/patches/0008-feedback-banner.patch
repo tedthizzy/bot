@@ -1,0 +1,103 @@
+diff --color -ruN a/General_Driver/General_Driver.ino b/General_Driver/General_Driver.ino
+--- a/General_Driver/General_Driver.ino	2026-09-07 18:58:03
++++ b/General_Driver/General_Driver.ino	2026-09-07 18:58:03
+@@ -257,6 +257,9 @@
+   // bot: no boot mission. A stored speed step would move the robot at power-on.
+   if(InfoPrint == 1){Serial.println("Boot mission disabled (bot).");}
+ #endif
++
++  // bot: announce the fork; the host refuses to move without this line.
++  bot_printBanner();
+ }
+ 
+ 
+diff --color -ruN a/General_Driver/bot_safety.h b/General_Driver/bot_safety.h
+--- a/General_Driver/bot_safety.h	2026-09-07 18:58:03
++++ b/General_Driver/bot_safety.h	2026-09-07 18:58:03
+@@ -188,3 +188,27 @@
+     bot_driveMotors();  // stop now under the new flags, not at the next host command
+   }
+ }
++
++
++// --- feedback helpers ----------------------------------------------------
++
++// Round a float to three decimals as a double, so ArduinoJson prints 0.3 rather
++// than the widened float 0.300000012. Host units carry no more precision than
++// the 8-bit duty anyway.
++double bot_round3(float v) {
++  return lroundf(v * 1000.0f) / 1000.0;
++}
++
++// {"T":1006,"fw":"bot-wr-1","hb_ms":300,"cap":0.3,"proto":1}
++// hb_ms and cap are the compiled constants, not the current settings.
++void bot_printBanner() {
++  jsonInfoHttp.clear();
++  jsonInfoHttp["T"] = FEEDBACK_BOT_BANNER;
++  jsonInfoHttp["fw"] = BOT_FW_TAG;
++  jsonInfoHttp["hb_ms"] = BOT_HEARTBEAT_MS;
++  jsonInfoHttp["cap"] = bot_round3(BOT_POWER_CAP);
++  jsonInfoHttp["proto"] = BOT_PROTO;
++  String bannerJsonString;
++  serializeJson(jsonInfoHttp, bannerJsonString);
++  Serial.println(bannerJsonString);
++}
+diff --color -ruN a/General_Driver/json_cmd.h b/General_Driver/json_cmd.h
+--- a/General_Driver/json_cmd.h	2026-09-07 18:58:03
++++ b/General_Driver/json_cmd.h	2026-09-07 18:58:03
+@@ -15,6 +15,13 @@
+ // {"T":1005,"id":1,"status":1}
+ #define CMD_BUS_SERVO_ERROR 1005
+ 
++// bot: fork banner, sent at the end of setup() and on request (docs/protocol.md)
++// {"T":1006,"fw":"bot-wr-1","hb_ms":300,"cap":0.3,"proto":1}
++#define FEEDBACK_BOT_BANNER 1006
++// bot: ask for the banner again
++// {"T":1007}
++#define CMD_BOT_BANNER 1007
++
+ 
+ 
+ // ---===< EoAT type settings. >===---
+diff --color -ruN a/General_Driver/uart_ctrl.h b/General_Driver/uart_ctrl.h
+--- a/General_Driver/uart_ctrl.h	2026-09-07 18:58:03
++++ b/General_Driver/uart_ctrl.h	2026-09-07 18:58:03
+@@ -56,6 +56,8 @@
+ 												jsonCmdReceive["z"]);break;
+ 	case CMD_BASE_FEEDBACK:
+ 												baseInfoFeedback();break;
++	case CMD_BOT_BANNER:
++												bot_printBanner();break;  // bot: T:1007
+ 	case CMD_BASE_FEEDBACK_FLOW:
+ 												setBaseInfoFeedbackMode(
+ 												jsonCmdReceive["cmd"]);break;
+diff --color -ruN a/General_Driver/ugv_advance.h b/General_Driver/ugv_advance.h
+--- a/General_Driver/ugv_advance.h	2026-09-07 18:58:03
++++ b/General_Driver/ugv_advance.h	2026-09-07 18:58:03
+@@ -385,6 +385,12 @@
+ 
+ 	jsonInfoHttp["L"] = speedGetA;
+ 	jsonInfoHttp["R"] = speedGetB;
++	if (mainType != 3) {
++		// bot: open loop. Report the speed actually applied, in the host's units,
++		// after the cap and the stop flags; stock reports the raw PWM integer here.
++		jsonInfoHttp["L"] = bot_round3(bot_applied_L);
++		jsonInfoHttp["R"] = bot_round3(bot_applied_R);
++	}
+ 
+ 	jsonInfoHttp["r"] = icm_roll;
+ 	jsonInfoHttp["p"] = icm_pitch;
+@@ -399,6 +405,13 @@
+ 	jsonInfoHttp["temp"] = temp;
+ 
+ 	jsonInfoHttp["v"] = loadVoltage_V;
++
++	// bot: fork fields (docs/protocol.md). Their absence means stock firmware.
++	jsonInfoHttp["hb"] = heartbeatStopFlag ? 0 : 1;
++	jsonInfoHttp["st"] = bot_stopFlags | (heartbeatStopFlag ? BOT_ST_HEARTBEAT : 0);
++	jsonInfoHttp["tf"] = bot_tof_mm;
++	jsonInfoHttp["bp"] = bot_bumper ? 1 : 0;
++	jsonInfoHttp["cc"] = bot_clamp_count;
+ 
+ 	switch(moduleType) {
+ 	case 1:

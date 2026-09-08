@@ -1,0 +1,189 @@
+diff --color -ruN a/General_Driver/bot_safety.h b/General_Driver/bot_safety.h
+--- a/General_Driver/bot_safety.h	2026-09-07 18:58:03
++++ b/General_Driver/bot_safety.h	2026-09-07 18:58:03
+@@ -27,6 +27,9 @@
+ // Low-battery latch: stop flag 8.
+ bool bot_lowbatLatched = false;
+ 
++// Defined in movtion_module.h; re-applies the last request when a flag asserts.
++void bot_driveMotors();
++
+ #if BOT_TOF_ENABLED
+ VL53L1X bot_tof;
+ bool bot_tofPresent = false;
+@@ -179,5 +182,9 @@
+   if (bot_lowbatLatched) {
+     flags |= BOT_ST_LOWBAT;
+   }
++  uint8_t asserted = flags & ~bot_stopFlags;
+   bot_stopFlags = flags;
++  if (asserted & (BOT_ST_TOF | BOT_ST_BUMPER | BOT_ST_LOWBAT)) {
++    bot_driveMotors();  // stop now under the new flags, not at the next host command
++  }
+ }
+diff --color -ruN a/General_Driver/movtion_module.h b/General_Driver/movtion_module.h
+--- a/General_Driver/movtion_module.h	2026-09-07 18:58:03
++++ b/General_Driver/movtion_module.h	2026-09-07 18:58:03
+@@ -229,7 +229,8 @@
+   pidB.SetMode(PID::Automatic);
+ }
+ 
+-void leftCtrl(float pwmInputA){
++// bot: stock bodies, now reached only through bot_driveMotors() below.
++void leftCtrlRaw(float pwmInputA){
+   int pwmIntA = round(pwmInputA);
+   if (mainType != 3) {
+     speedGetA = pwmIntA;
+@@ -259,7 +260,7 @@
+   }
+ }
+ 
+-void rightCtrl(float pwmInputB){
++void rightCtrlRaw(float pwmInputB){
+   int pwmIntB = round(pwmInputB);
+   if (mainType != 3) {
+     speedGetB = pwmIntB;
+@@ -289,7 +290,91 @@
+   }
+ }
+ 
++// bot: power cap, forward block and the single motor chokepoint.
++//
++// Every path that moves the wheels ends in bot_driveMotors(): T:1 and T:13
++// through setGoalSpeed(), T:11 raw PWM and the closed-loop PID through
++// leftCtrl()/rightCtrl(), and the heartbeat stop through setGoalSpeed(0, 0).
++
++// Cap a speed request in host units (+-0.5 full scale). Counts each clamp (cc).
++float bot_clampPower(float v) {
++  if (v > BOT_POWER_CAP) {
++    v = BOT_POWER_CAP;
++    bot_clamp_count++;
++  } else if (v < -BOT_POWER_CAP) {
++    v = -BOT_POWER_CAP;
++    bot_clamp_count++;
++  }
++  return v;
++}
++
++// Cap a PWM value on the common path, so T:11 raw PWM is capped as well.
++// Counts each clamp (cc).
++float bot_clampPwm(float pwm) {
++  if (pwm > BOT_PWM_CAP) {
++    pwm = BOT_PWM_CAP;
++    bot_clamp_count++;
++  } else if (pwm < -BOT_PWM_CAP) {
++    pwm = -BOT_PWM_CAP;
++    bot_clamp_count++;
++  }
++  return pwm;
++}
++
++// The last requested PWM per side, after the cap, and the speed actually
++// applied after the stop flags, in host units (reported as L and R in T:1001).
++float bot_req_A = 0;
++float bot_req_B = 0;
++float bot_applied_L = 0;
++float bot_applied_R = 0;
++
++// Applies the request pair under the stop flags and drives both H-bridges.
++// Forward block (docs/protocol.md): with st bit 2 or 4 set, a pair with L>0
++// and R>0 is applied as zeros; reverse and rotation pass. Low battery (bit 8)
++// zeroes everything. Also called by bot_safetyUpdate() when a flag asserts,
++// so the stop does not wait for the next host command.
++void bot_driveMotors() {
++  float a = bot_req_A;
++  float b = bot_req_B;
++  if ((bot_stopFlags & (BOT_ST_TOF | BOT_ST_BUMPER)) && a > 0 && b > 0) {
++    a = 0;
++    b = 0;
++  }
++  if (bot_stopFlags & BOT_ST_LOWBAT) {
++    a = 0;
++    b = 0;
++  }
++  leftCtrlRaw(a);
++  rightCtrlRaw(b);
++  bot_applied_L = a / 512.0f;
++  bot_applied_R = b / 512.0f;
++}
++
++void leftCtrl(float pwmInputA){
++  bot_req_A = bot_clampPwm(pwmInputA);
++  bot_driveMotors();
++}
++
++void rightCtrl(float pwmInputB){
++  bot_req_B = bot_clampPwm(pwmInputB);
++  bot_driveMotors();
++}
++
++// T:115 coast: stock switchEmergencyStop() has just put every H-bridge input
++// low. Zero the request pair so a later re-drive cannot restart the old
++// motion, and raise stop flag 16 until the next speed command clears it.
++void bot_onCoast() {
++  bot_req_A = 0;
++  bot_req_B = 0;
++  bot_applied_L = 0;
++  bot_applied_R = 0;
++  bot_stopFlags |= BOT_ST_COAST;
++}
++
+ void setGoalSpeed(float inputLeft, float inputRight) {
++  // bot: cap the request first, in the host's units, and count it.
++  inputLeft = bot_clampPower(inputLeft);
++  inputRight = bot_clampPower(inputRight);
+   // setpoint_cmd_recv = millis();
+   if (mainType == 3) {
+     usePIDCompute = true;
+@@ -316,8 +401,10 @@
+     }
+   } else {
+     usePIDCompute = false;
+-    leftCtrl(inputLeft * 512 * spd_rate_A);
+-    rightCtrl(inputRight * 512 * spd_rate_B);
++    // bot: set both requests, then drive once, so the forward block sees the pair.
++    bot_req_A = bot_clampPwm(inputLeft * 512 * spd_rate_A);
++    bot_req_B = bot_clampPwm(inputRight * 512 * spd_rate_B);
++    bot_driveMotors();
+   }
+ }
+ 
+diff --color -ruN a/General_Driver/uart_ctrl.h b/General_Driver/uart_ctrl.h
+--- a/General_Driver/uart_ctrl.h	2026-09-07 18:58:03
++++ b/General_Driver/uart_ctrl.h	2026-09-07 18:58:03
+@@ -8,6 +8,7 @@
+ 															jsonCmdReceive["R"].is<float>()){
+ 														heartbeatStopFlag = false;
+ 														lastCmdRecvTime = millis();
++														bot_stopFlags &= ~BOT_ST_COAST;  // bot: a speed command ends a coast
+ 														setGoalSpeed(
+ 														jsonCmdReceive["L"],
+ 														jsonCmdReceive["R"]);
+@@ -16,6 +17,7 @@
+ 	case CMD_PWM_INPUT:		usePIDCompute = false;
+ 												heartbeatStopFlag = false;
+ 												lastCmdRecvTime = millis();
++												bot_stopFlags &= ~BOT_ST_COAST;  // bot
+ 												leftCtrl(jsonCmdReceive["L"]);
+ 												rightCtrl(jsonCmdReceive["R"]);
+ 												break;
+@@ -23,7 +25,8 @@
+ 												jsonCmdReceive["X"],
+ 												jsonCmdReceive["Z"]);
+ 												heartbeatStopFlag = false;
+-												lastCmdRecvTime = millis();break;
++												lastCmdRecvTime = millis();
++												bot_stopFlags &= ~BOT_ST_COAST;break;  // bot
+ 	case CMD_SET_MOTOR_PID:
+ 												setPID(
+ 												jsonCmdReceive["P"],
+@@ -211,7 +214,8 @@
+ 	// case CMD_LIGHT_CTRL:	lightCtrl(
+ 	// 											jsonCmdReceive["led"]
+ 	// 											);break;
+-	case CMD_SWITCH_OFF:  switchEmergencyStop();break;
++	case CMD_SWITCH_OFF:  switchEmergencyStop();
++												bot_onCoast();break;  // bot: stop flag 16, request pair zeroed
+ 	case CMD_SINGLE_JOINT_ANGLE:
+ 												RoArmM2_singleJointAngleCtrl(
+ 												jsonCmdReceive["joint"],

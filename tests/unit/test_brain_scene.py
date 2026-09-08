@@ -1,4 +1,8 @@
-"""The scene ring: bounded, atomic, and last-seen rather than current truth."""
+"""The scene ring: bounded, atomic, and last-seen rather than current truth.
+
+A sighting is stored at an absolute heading in the 0..359 frame ``turn_to``
+uses, so the model can turn straight to it, and a later turn does not move it.
+"""
 
 from __future__ import annotations
 
@@ -9,7 +13,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "packages"))
 
-from rover_brain.scene import CAPACITY, SceneRing, wrap180  # noqa: E402
+from rover_brain.heading import heading_left_of  # noqa: E402
+from rover_brain.scene import CAPACITY, SceneRing  # noqa: E402
 from rover_contracts.jsonl import read_jsonl  # noqa: E402
 from rover_contracts.worldstate import RecentlySeen  # noqa: E402
 
@@ -30,6 +35,35 @@ class Clock:
 def ring(**kwargs: object) -> tuple[SceneRing, Clock]:
     clock = Clock()
     return SceneRing(clock=clock, **kwargs), clock  # type: ignore[arg-type]
+
+
+# -- the frame ---------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("heading", "left", "expected"),
+    [
+        (87, 90, 357),  # turn left 90 is (heading - 90) mod 360
+        (87, -90, 177),  # and right is +90
+        (0, 40, 320),
+        (10, 30, 340),
+        (350, -20, 10),
+        (180, 180, 0),
+        (0, 0, 0),
+        (359.6, 0, 0),  # rounds to 360, which is 0
+        (100.5, 0, 101),  # half away from zero, not banker's
+        (0, -9.13, 9),
+    ],
+)
+def test_left_of_a_heading_is_the_turn_to_frame(
+    heading: float, left: float, expected: int
+) -> None:
+    result = heading_left_of(heading, left)
+    assert result == expected
+    assert isinstance(result, int) and 0 <= result <= 359
+
+
+# -- the ring ----------------------------------------------------------------
 
 
 def test_a_sighting_comes_back_newest_first() -> None:
@@ -58,7 +92,7 @@ def test_seeing_something_again_moves_it_rather_than_duplicating_it() -> None:
     scene.remember("red mug", heading_deg=0.0, bearing_deg=20.0)
     entries = scene.recently_seen()
     assert [entry.label for entry in entries] == ["red mug", "doorway"]
-    assert entries[0].where_deg == 20
+    assert entries[0].heading_deg == 340
     assert entries[0].age_s == 0
 
 
@@ -69,21 +103,23 @@ def test_age_is_measured_on_the_monotonic_clock() -> None:
     assert scene.recently_seen()[0].age_s == 94
 
 
-def test_where_deg_is_relative_to_the_heading_now() -> None:
-    """A sighting is stored absolutely, so turning does not move the object."""
+def test_a_sighting_is_an_absolute_heading_the_robot_can_turn_to() -> None:
+    """Bearing + is left, and left is a smaller heading: an object 40 degrees
+    to the left while facing 87 sits at heading 47, whatever the robot does
+    afterwards."""
     scene, _ = ring()
-    scene.remember("red mug", heading_deg=0.0, bearing_deg=40.0)
-    assert scene.recently_seen(0.0)[0].where_deg == 40
-    assert scene.recently_seen(40.0)[0].where_deg == 0
-    assert scene.recently_seen(-50.0)[0].where_deg == 90
+    scene.remember("red mug", heading_deg=87.0, bearing_deg=40.0)
+    assert scene.recently_seen()[0].heading_deg == 47
+    scene.remember("doorway", heading_deg=87.0, bearing_deg=-10.0)
+    assert scene.recently_seen()[0].heading_deg == 97
 
 
-def test_bearings_wrap_the_short_way_round() -> None:
+def test_headings_wrap_into_the_turn_to_range() -> None:
     scene, _ = ring()
-    scene.remember("doorway", heading_deg=170.0, bearing_deg=30.0)
-    assert scene.recently_seen(0.0)[0].where_deg == -160
-    assert wrap180(540) == 180
-    assert wrap180(-190) == 170
+    scene.remember("doorway", heading_deg=10.0, bearing_deg=30.0)
+    assert scene.recently_seen()[0].heading_deg == 340
+    scene.remember("window", heading_deg=350.0, bearing_deg=-20.0)
+    assert scene.recently_seen()[0].heading_deg == 10
 
 
 def test_entries_are_what_the_worldstate_carries() -> None:
@@ -91,7 +127,8 @@ def test_entries_are_what_the_worldstate_carries() -> None:
     scene.remember("red mug", heading_deg=0.0, bearing_deg=40.0)
     entry = scene.recently_seen()[0]
     assert isinstance(entry, RecentlySeen)
-    assert -180 <= entry.where_deg <= 180 and entry.age_s >= 0
+    assert 0 <= entry.heading_deg <= 359 and entry.age_s >= 0
+    assert set(entry.model_dump()) == {"label", "heading_deg", "age_s"}
 
 
 def test_a_model_supplied_label_is_trimmed_rather_than_trusted() -> None:
@@ -121,6 +158,7 @@ def test_the_file_is_rewritten_whole_every_time(tmp_path: Path) -> None:
     records = list(read_jsonl(path))
     assert records[0] == {"kind": "scene", "description": "a kitchen"}
     assert [r["label"] for r in records[1:]] == ["red mug", "doorway"]
+    assert [r["heading_deg"] for r in records[1:]] == [320, 10]
     assert not list(path.parent.glob("*.tmp"))
 
     scene.remember("red mug", heading_deg=0.0, bearing_deg=0.0)

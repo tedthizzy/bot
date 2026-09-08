@@ -19,15 +19,18 @@ from rover_brain.filler import APOLOGY, BOX_LOST  # noqa: E402
 from rover_contracts.config import BoxConfig, SttConfig  # noqa: E402
 from rover_contracts.messages import (  # noqa: E402
     DescribeSceneCall,
-    DriveArgs,
-    DriveCall,
+    DriveForArgs,
+    DriveForCall,
     FsmState,
     NoArgs,
+    ResultDetail,
     ResultReason,
     ResultStatus,
     SayArgs,
     SayCall,
     StopCall,
+    TurnToArgs,
+    TurnToCall,
 )
 
 _STALE = "01J9ZC7KZZ0000000000000000"
@@ -43,12 +46,16 @@ def make_fsm(**kwargs: object) -> F.Fsm:
     )
 
 
-def drive(speech: str = "Going forward.") -> DriveCall:
-    return DriveCall(
+def drive(speech: str = "Going forward.") -> DriveForCall:
+    return DriveForCall(
         speech=speech,
-        skill="drive",
-        args=DriveArgs(distance_cm=40, speed_cms=15),
+        skill="drive_for",
+        args=DriveForArgs(duration_ms=1000, power_pct=15),
     )
+
+
+def turn(speech: str = "Turning left.") -> TurnToCall:
+    return TurnToCall(speech=speech, skill="turn_to", args=TurnToArgs(heading_deg=357))
 
 
 def kinds(actions: tuple[F.Action, ...]) -> list[type]:
@@ -148,7 +155,7 @@ def test_the_completion_sentence_follows_the_executor() -> None:
     )
     spoken = next(a for a in actions if isinstance(a, F.Speak))
     assert spoken.kind is F.SpeechKind.RESULT
-    assert spoken.text == "Done."
+    assert spoken.text == "Done driving."
     assert fsm.state is FsmState.SPEAKING_RESULT
     assert kinds(fsm.handle(F.Spoke())) == [F.Publish]
     assert fsm.state is FsmState.IDLE
@@ -168,6 +175,47 @@ def test_a_reason_wins_over_the_status_in_the_table() -> None:
     assert next(a for a in actions if isinstance(a, F.Speak)).text == (
         "Something is in the way."
     )
+
+
+def test_a_timed_out_turn_speaks_the_measured_heading_error() -> None:
+    """The one number the completion table may carry is robotd's own
+    measurement, rounded to whole degrees."""
+    fsm = make_fsm()
+    to_planning(fsm)
+    fsm.handle(F.Planned(turn_id=fsm.turn_id or "", call=turn()))
+    fsm.handle(F.Spoke())
+    assert fsm.state is FsmState.EXECUTING
+    actions = fsm.handle(
+        F.Executed(
+            turn_id=fsm.turn_id or "",
+            status=ResultStatus.TIMEOUT,
+            detail=ResultDetail(turned_deg=78.0, heading_error_deg=-12.4),
+        )
+    )
+    spoken = next(a for a in actions if isinstance(a, F.Speak))
+    assert spoken.text == "I ran out of time turning; I'm 12 degrees off."
+
+
+def test_a_finished_turn_and_a_clamped_drive_have_their_own_sentences() -> None:
+    fsm = make_fsm()
+    to_planning(fsm)
+    fsm.handle(F.Planned(turn_id=fsm.turn_id or "", call=turn()))
+    fsm.handle(F.Spoke())
+    actions = fsm.handle(F.Executed(turn_id=fsm.turn_id or "", status=ResultStatus.DONE))
+    spoken = next(a for a in actions if isinstance(a, F.Speak))
+    assert spoken.text == "Facing that way now."
+
+    fsm = make_fsm()
+    to_executing(fsm)
+    actions = fsm.handle(
+        F.Executed(
+            turn_id=fsm.turn_id or "",
+            status=ResultStatus.DONE,
+            reason=ResultReason.POWER_CLAMPED,
+        )
+    )
+    spoken = next(a for a in actions if isinstance(a, F.Speak))
+    assert spoken.text == "Done, at my top power."
 
 
 def test_accepted_is_not_a_completion() -> None:

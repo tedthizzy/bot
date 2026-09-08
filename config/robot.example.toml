@@ -1,9 +1,9 @@
 # config/robot.example.toml -- the committed reference configuration.
 #
-# ARCHITECTURE 5.8 is the key list; this file carries every key with the
-# document's value and the reason it is that value.  Copy it to
-# config/robot.toml (deploy/install.sh does), which is gitignored because it is
-# the one that ends up holding a real box address.
+# ARCHITECTURE 5.8, as amended by ADR-0013, is the key list; this file carries
+# every key with the document's value and the reason it is that value.  Copy it
+# to config/robot.toml (deploy/install.sh does), which is gitignored because it
+# is the one that ends up holding a real box address.
 #
 # As shipped, this file runs against the fake endpoint:
 #     make sim                      # fakebox on 127.0.0.1:8000
@@ -21,39 +21,41 @@
 # a literal is a load error; [box] api_key_env names the variable instead.
 
 [robot]
-wheel_radius_m = 0.045          # 90 mm wheels
-track_m        = 0.150
-ticks_per_rev  = 2200           # JGB37-520 50:1, 11 PPR quadrature
-name           = "rover"        # wake-word and TTS identity (open item 11)
+# No geometry: the WAVE ROVER has no encoders, so nothing on the host integrates
+# wheel travel and there is no radius, track or tick count to state.
+name = "rover"                  # wake-word and TTS identity (open item 11)
 
 [limits]
-# Operational bounds.  Every one of these is at or below the cap the MCU
-# compiled in; the MCU enforces its own and cannot be raised by any frame (I-4).
-drive_m               = 1.0
-speed_mps             = 0.30    # the speed every A21 stopping-distance number assumes
-speed_default_mps     = 0.20    # unlocked to speed_mps only when front ToF > 1.0 m
-turn_deg              = 180.0
-rate_dps              = 60.0
-accel_mps2            = 0.5     # increases only; every decrease uses the 2000 mm/s^2 abort ramp
-alpha_radps2          = 1.0
-frame_ttl_ms          = 300     # T1, on the MCU's own clock
-goal_ttl_ms_max       = 5000    # T2 ceiling
-budget_path_m         = 1.5     # I-15, per user instruction
-budget_motion_s       = 12.0    # I-15, per user instruction
-motion_cooldown_ms    = 3000    # first motion of a turn_id only
-motion_idle_disarm_ms = 5000
-twist_linear_mps      = 0.30
-twist_angular_radps   = 1.047
-twist_renew_ms        = 200
+# Power is in Waveshare speed units: full scale 0.5, and 0.30 (sixty percent
+# duty) is the cap the firmware fork compiles in as BOT_POWER_CAP.  Ground speed
+# at a given power is a property of the floor and is measured, never assumed.
+power_max          = 0.30    # the most robotd ever sends; its ceiling is the firmware cap
+power_default      = 0.20    # a model call above this is clamped to it (result power_clamped)
+power_min          = 0.08    # turn_to never commands less; below it the motors stall on carpet
+drive_for_max_s    = 2.0     # the longest single drive_for
+turn_timeout_max_s = 4.0     # turn_to reports timeout after this long short of tolerance
+turn_tolerance_deg = 5.0     # done when |heading error| <= this for two consecutive samples
+turn_kp            = 0.004   # power per degree of error: 45 deg -> 0.18, held to power_min..power_max
+goal_ttl_ms_max    = 5000    # T2 ceiling
+budget_motion_s    = 12      # I-15: seconds with a non-zero command, per user instruction
+motion_cooldown_ms = 3000    # first motion of a turn_id only
+twist_power        = 0.30    # each mixed side of a teleop twist (lin -/+ ang) is clamped to this
+twist_renew_ms     = 200     # a twist not renewed within this lapses to zeros
 
-[serial]
-backend             = "uart"
-port                = "/dev/rover-mcu"   # the udev symlink; ttyAMA4 appears nowhere in code (A4)
-baud                = 921600
-setpoint_hz         = 20
-cmd_gate_max_age_ms = 150      # T0: below link_alive_max_age_ms, a validator rule
-reseed_wait_ms      = 500      # bounded wait for one T before adopting ack_seq + 1 (A8)
-open_retry_ms       = 500      # retry open() so an unplugged MCU is not a start-order bug
+[link]
+# The line to the General Driver board: Waveshare JSON lines, 115200 8N1, no
+# checksum (docs/protocol.md).  Nothing here changes what the firmware enforces;
+# its own heartbeat and cap are mirrored under [safety] and [limits].
+backend              = "serial"         # "serial" is a tty; "tcp" is rover-stub --tcp in simulation
+port                 = "/dev/serial0"   # the Pi's GPIO UART, wired to the board's Pi header
+baud                 = 115200           # fixed by the firmware
+tcp_host             = "127.0.0.1"      # read only when backend = "tcp"
+tcp_port             = 7777             # read only when backend = "tcp"
+command_hz           = 20               # the speed() stream: six per 300 ms heartbeat, so one lost line costs nothing
+feedback_interval_ms = 50               # T:142, 20 Hz feedback; must stay below [safety] feedback_max_age_ms
+yaw_sign             = 1                # +1 when the fused yaw increases turning left; confirmed on the unit at G5
+banner_wait_ms       = 1500             # bring-up waits this long for the T:1006 banner before refusing motion
+open_retry_ms        = 500              # retry open() so an unplugged board is not a start-order bug
 
 [bus]
 sock        = "/run/rover/robotd.sock"
@@ -150,25 +152,19 @@ ocv_per_cell = [4.20, 4.00, 3.85, 3.70, 3.60, 3.50, 3.30, 3.20]
 soc_pct      = [ 100,   85,   70,   50,   35,   20,    8,    0]
 
 [safety]
-obs_max_age_ms        = 5000   # I-23, on the monotonic clock
-link_alive_max_age_ms = 200    # readiness and is_connected
+obs_max_age_ms           = 5000   # I-23: a motion skill's observation must be younger than this, monotonic clock
+feedback_max_age_ms      = 150    # T0: older feedback is a dead link -- zeros keep flowing, motion is refused, a goal fails
+require_patched_firmware = true   # refuse motion without the fork's banner and feedback fields; false only on a bench, wheels off the floor
 
 # --- read-only MIRRORS of firmware constants --------------------------------
-# preflight asserts CRC-32 over the seven values below, in exactly this order,
-# equals the B banner's safety_hash.  Editing them changes nothing on the MCU --
-# it makes preflight fail, which is the point.
-tof_stop_mm          = 250
-tof_slow_mm          = 600
-slow_zone_w_mrad_s   = 500
-tof_timing_budget_ms = 20      # short distance mode; long-mode fallback is 33/40 (4.1)
-tof_inter_period_ms  = 30
-tof_poll_hz          = 50
-cliff_delta_mm       = 80
+# The fork compiles these in (firmware/General_Driver/bot_config.h).  Editing
+# them here changes nothing on the controller: robotd compares heartbeat_ms with
+# the boot banner and refuses to move when they disagree, and
+# tests/unit/test_caps_match.py holds all three against the header.
+heartbeat_ms  = 300               # BOT_HEARTBEAT_MS: motors zeroed this long after the last speed command
+tof_stop_mm   = 250               # BOT_TOF_STOP_MM: forward blocked by the time-of-flight sensor closer than this
+low_battery_v = 9.9               # BOT_LOWBAT_V: all motion refused below this pack voltage (3.3 V per cell, 3S)
 # ----------------------------------------------------------------------------
-
-cliff_baseline_mm   = 98       # ASSERTED against the MCU's E CAL_STORED, never written
-obstacle_escalate_s = 30       # or >=2 rejected escape attempts, whichever comes first
-r_pack_mohm = 65                # mirror of ROVER_R_PACK_MOHM; state.battery.oc_v is computed from it
 
 [log]
 dir                = "/data/logs"   # JSONL only, no SQLite (A34)

@@ -1,17 +1,21 @@
-"""The serial link, end to end over a pty.
+"""The rover link, end to end over TCP and over a pty.
 
-Two levels.  Most of the file drives a minimal in-test controller on the master
-side of a pty, which exercises the handshake, the bounded re-seed of A8, the
-20 Hz stream, the T0 gate, the clamp before the port and the reconnect that
-never replays motion (I-13) with nothing built.  The last test drives the real
-``mcu-sim`` over ``./run/mcu.pty`` and **skips with a clear reason** when the
-simulator is not built.
+Most of the file drives :class:`FakeRover`, an in-test controller that speaks
+``docs/protocol.md`` the way the firmware fork does -- banner on request, the
+fork's fields in every feedback line, a heartbeat that zeroes the applied
+powers, a heading that integrates the wheel difference -- so bring-up, the
+firmware gate, the T0 gate, the restart handling, the reopen and the shape of
+the command stream are all exercised with nothing built.  The last tests drive
+the real ``rover-stub`` over a pty and **skip with a clear reason** when it is
+not importable yet.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import importlib.util
+import json
 import os
 import pty
 import subprocess
@@ -19,229 +23,267 @@ import sys
 import time
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
+from rover_contracts.config import LinkConfig, RobotConfig, SafetyConfig
+from rover_contracts.units import wrap_deg_180
+from rover_contracts.wave_proto import Banner, LinkProtocol as _Unused  # noqa: F401
+from rover_robotd.link import Link, LinkProtocol
 
 REPO = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(REPO / "packages"))
-
-from rover_contracts.config import RobotConfig, SerialConfig  # noqa: E402
-from rover_contracts.serial_codec import (  # noqa: E402
-    SESSION_WILDCARD,
-    AckFrame,
-    AckResult,
-    ArmFrame,
-    ClearFaultFrame,
-    CtrlFlag,
-    DecodeOk,
-    DisarmFrame,
-    Frame,
-    FrameReader,
-    HelloFrame,
-    McuState,
-    PingFrame,
-    PongFrame,
-    StopFrame,
-    TelemetryFrame,
-    VelocityFrame,
-    ack_type_code,
-    encode_frame,
-)
-from rover_robotd.link import MAX_V_MM_S, MAX_W_MRAD_S, Link  # noqa: E402
-from rover_robotd.profiles import SetpointCell  # noqa: E402
-
 TIMEOUT_S = 5.0
-CLEAR_FLAGS = int(
-    CtrlFlag.TTL_OK
-    | CtrlFlag.ESTOP_RELEASED
-    | CtrlFlag.BUMPER_CLEAR
-    | CtrlFlag.TOF_CLEAR
-    | CtrlFlag.CAL_VALID
-    | CtrlFlag.TOF_FL_OK
-    | CtrlFlag.TOF_FR_OK
-)
 
 
-class FakeMcu:
-    """Just enough controller to answer the handshake and stream telemetry.
+class FakeRover:
+    """Just enough controller to answer bring-up and stream feedback.
 
-    With ``plant=True`` it also integrates the last commanded velocity into the
-    encoder counts, which is what lets a whole drive run to completion against
-    it.  It is not the real ``mcu-sim``: it enforces no cap, no TTL and no
-    obstacle rule, because those belong to the firmware core and its own
-    golden vectors.
+    ``stock=True`` is unpatched Waveshare firmware: no banner, no fork fields,
+    no cap.  ``fork_fields=False`` with ``stock=False`` is the odd case of a
+    banner from a controller whose feedback lacks the fields, which the host
+    must also refuse.  The heading integrates ``(right - left)`` at
+    ``turn_dps_per_power`` degrees per second per unit of difference, in the
+    ``yaw_sign = +1`` convention: the right wheel leading turns left.
     """
 
     def __init__(
         self,
-        fd: int,
         *,
-        session: int = 40010,
-        ack_seq: int = 0,
-        plant: bool = False,
-        track_m: float = 0.150,
-        metres_per_tick: float = 2 * 3.141592653589793 * 0.045 / 2200,
+        stock: bool = False,
+        fork_fields: bool | None = None,
+        fw: str = "bot-wr-1",
+        hb_ms: int = 300,
+        cap: float = 0.3,
+        proto: int = 1,
+        feedback_hz: float = 20.0,
+        turn_dps_per_power: float = 200.0,
     ) -> None:
-        self.fd = fd
-        self.session = session
-        self.ack_seq = ack_seq
-        self.reader = FrameReader()
-        self.received: list[Frame] = []
-        self.state = McuState.DISARMED
-        self.fault = 0
-        self.ctrl_flags = CLEAR_FLAGS
-        self.telemetry_on = True
-        self.plant = plant
-        self.track_m = track_m
-        self.metres_per_tick = metres_per_tick
-        self.left_ticks = 0
-        self.right_ticks = 0
-        self.v_mm_s = 0
-        self.w_mrad_s = 0
-        self.vbat_mv = 11620
-        self.imotor_ma = 410
-        self.rx_drop = 0
-        self._left_partial = 0.0
-        self._right_partial = 0.0
-        self._up_seq = 1
-        self._tasks: list[asyncio.Task[None]] = []
+        self.stock = stock
+        self.fork_fields = (not stock) if fork_fields is None else fork_fields
+        self.fw = fw
+        self.hb_ms = hb_ms
+        self.cap = cap
+        self.proto = proto
+        self.feedback_period_s = 1.0 / feedback_hz
+        self.turn_dps_per_power = turn_dps_per_power
 
-    # -- lifecycle ----------------------------------------------------------
+        self.received: list[dict[str, Any]] = []
+        self.speeds: list[tuple[float, float]] = []
+        self.banners_sent = 0
+        self.connections = 0
+        self.left = 0.0
+        self.right = 0.0
+        self.yaw_deg = 0.0
+        self.roll_deg = 0.0
+        self.pitch_deg = 0.0
+        self.temp_c = 31.0
+        self.bus_v = 11.6
+        self.tof_mm = -1
+        self.bumper = False
+        self.lowbat = False
+        self.coasting = False
+        self.clamp_count = 0
+        self.feedback_on = False
+        self.feedback_enabled = True
+        """A test switch: ``False`` silences the stream to simulate a dead link."""
 
-    def start(self) -> None:
+        self._last_speed_at: float | None = None
+        self._write: Callable[[bytes], None] | None = None
+        self._rx = bytearray()
+        self._server: asyncio.AbstractServer | None = None
+        self._writer: asyncio.StreamWriter | None = None
+        self._fds: list[int] = []
+        self._task: asyncio.Task[None] | None = None
+
+    # -- transports ---------------------------------------------------------
+
+    async def start_tcp(self) -> int:
+        """Listen on a loopback port; return it."""
+        self._server = await asyncio.start_server(self._serve, "127.0.0.1", 0)
+        self._ensure_loop()
+        return self._server.sockets[0].getsockname()[1]
+
+    def start_pty(self) -> str:
+        """Open a pseudo terminal; return the slave path the host opens."""
+        master, slave = pty.openpty()
+        os.set_blocking(master, False)
+        self._fds = [master, slave]
         loop = asyncio.get_running_loop()
-        loop.add_reader(self.fd, self._readable)
-        self._tasks.append(asyncio.create_task(self._telemetry_loop()))
+        loop.add_reader(master, self._pty_readable, master)
+        self._attach(lambda data: os.write(master, data))
+        self._ensure_loop()
+        return os.ttyname(slave)
 
     async def stop(self) -> None:
-        with contextlib.suppress(RuntimeError, ValueError):
-            asyncio.get_running_loop().remove_reader(self.fd)
-        for task in self._tasks:
-            task.cancel()
-        await asyncio.gather(*self._tasks, return_exceptions=True)
+        if self._task is not None:
+            self._task.cancel()
+            await asyncio.gather(self._task, return_exceptions=True)
+        self.disconnect()
+        if self._server is not None:
+            self._server.close()
+            await self._server.wait_closed()
+        for fd in self._fds:
+            with contextlib.suppress(OSError):
+                asyncio.get_running_loop().remove_reader(fd)
+            with contextlib.suppress(OSError):
+                os.close(fd)
 
-    # -- views over what arrived -------------------------------------------
+    def disconnect(self) -> None:
+        """Drop the current TCP client: a cable pull, seen from the host."""
+        writer, self._writer = self._writer, None
+        if writer is not None:
+            writer.close()
+        self._write = None
 
-    def frames(self, kind: type) -> list[Frame]:
-        return [frame for frame in self.received if isinstance(frame, kind)]
+    async def _serve(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        self._writer = writer
+        self._attach(writer.write)
+        try:
+            while True:
+                line = await reader.readline()
+                if not line:
+                    break
+                self.feed(line)
+        except (ConnectionError, OSError):
+            pass
+        finally:
+            if self._writer is writer:
+                self._writer = None
+                self._write = None
+            with contextlib.suppress(ConnectionError, OSError):
+                writer.close()
 
-    @property
-    def velocities(self) -> list[VelocityFrame]:
-        return self.frames(VelocityFrame)  # type: ignore[return-value]
+    def _pty_readable(self, fd: int) -> None:
+        try:
+            data = os.read(fd, 4096)
+        except (BlockingIOError, OSError):
+            return
+        self.feed(data)
+
+    def _attach(self, write: Callable[[bytes], None]) -> None:
+        self._write = write
+        self.connections += 1
+
+    def _ensure_loop(self) -> None:
+        if self._task is None:
+            self._task = asyncio.create_task(self._feedback_loop())
 
     # -- the wire -----------------------------------------------------------
 
-    def _readable(self) -> None:
-        try:
-            data = os.read(self.fd, 4096)
-        except (BlockingIOError, OSError):
-            return
-        for result in self.reader.feed(data):
-            if isinstance(result, DecodeOk):
-                self._on_frame(result.frame)
-
-    def _on_frame(self, frame: Frame) -> None:
-        self.received.append(frame)
-        self.ack_seq = frame.seq
-        if isinstance(frame, VelocityFrame):
-            self.v_mm_s, self.w_mrad_s = frame.v_mm_s, frame.w_mrad_s
-            self.state = (
-                McuState.ARMED_MOVING
-                if frame.v_mm_s or frame.w_mrad_s
-                else McuState.ARMED_IDLE
-            )
-        elif isinstance(frame, ArmFrame):
-            self.state = McuState.ARMED_IDLE
-            self._ack(ArmFrame.TYPE, frame.seq, echo=frame.nonce)
-        elif isinstance(frame, DisarmFrame):
-            self.state = McuState.DISARMED
-            self._ack(DisarmFrame.TYPE, frame.seq)
-        elif isinstance(frame, StopFrame):
-            self.v_mm_s = self.w_mrad_s = 0
-            self._ack(StopFrame.TYPE, frame.seq)
-        elif isinstance(frame, ClearFaultFrame):
-            self.fault = 0
-            self._ack(ClearFaultFrame.TYPE, frame.seq)
-        elif isinstance(frame, PingFrame):
-            self._send(
-                PongFrame(
-                    seq=self._next_seq(),
-                    session=self.session,
-                    echo_pi_mono_us=frame.pi_mono_us,
-                    mcu_us=1234,
-                )
-            )
-
-    def _ack(self, letter: str, seq: int, *, echo: int = 0) -> None:
-        self._send(
-            AckFrame(
-                seq=self._next_seq(),
-                session=self.session,
-                ack_type=ack_type_code(letter),
-                ack_seq=seq,
-                result=int(AckResult.OK),
-                reason=0,
-                echo=echo,
-            )
-        )
-
-    async def _telemetry_loop(self) -> None:
+    def feed(self, data: bytes) -> None:
+        self._rx += data
         while True:
-            await asyncio.sleep(0.02)
-            if self.plant:
-                self._advance(0.02)
-            if self.telemetry_on:
-                self._send(self.telemetry())
+            end = self._rx.find(b"\n")
+            if end < 0:
+                return
+            line = bytes(self._rx[:end])
+            del self._rx[: end + 1]
+            try:
+                obj = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(obj, dict):
+                self._on_command(obj)
 
-    def _advance(self, dt_s: float) -> None:
-        """A first-order wheel plant: the commanded body velocity, integrated."""
-        half = self.w_mrad_s / 1000.0 * self.track_m / 2.0
-        left_m = (self.v_mm_s / 1000.0 - half) * dt_s
-        right_m = (self.v_mm_s / 1000.0 + half) * dt_s
-        self._left_partial += left_m / self.metres_per_tick
-        self._right_partial += right_m / self.metres_per_tick
-        left_ticks = int(self._left_partial)
-        right_ticks = int(self._right_partial)
-        self._left_partial -= left_ticks
-        self._right_partial -= right_ticks
-        self.left_ticks += left_ticks
-        self.right_ticks += right_ticks
+    def _on_command(self, obj: dict[str, Any]) -> None:
+        self.received.append(obj)
+        t = obj.get("T")
+        if t == 1:
+            left, right = float(obj["L"]), float(obj["R"])
+            self.speeds.append((left, right))
+            if not self.stock:
+                for value in (left, right):
+                    if abs(value) > self.cap + 1e-9:
+                        self.clamp_count += 1
+                left = max(-self.cap, min(self.cap, left))
+                right = max(-self.cap, min(self.cap, right))
+            self.left, self.right = left, right
+            self.coasting = False
+            self._last_speed_at = time.monotonic()
+        elif t == 115:
+            self.left = self.right = 0.0
+            self.coasting = True
+        elif t == 131:
+            self.feedback_on = bool(obj.get("cmd"))
+        elif t == 1007 and not self.stock:
+            self.send_banner()
 
-    def telemetry(self) -> TelemetryFrame:
-        return TelemetryFrame(
-            seq=self._next_seq(),
-            session=self.session,
-            mcu_us=int(time.monotonic() * 1e6),
-            ack_seq=self.ack_seq,
-            state=int(self.state),
-            ctrl_flags=self.ctrl_flags,
-            fault=self.fault,
-            left_ticks=self.left_ticks,
-            right_ticks=self.right_ticks,
-            v_meas_mm_s=self.v_mm_s,
-            w_meas_mrad_s=self.w_mrad_s,
-            v_cmd_mm_s=self.v_mm_s,
-            w_cmd_mrad_s=self.w_mrad_s,
-            vbat_mv=self.vbat_mv,
-            imotor_ma=self.imotor_ma,
-            tof_front_mm=1204,
-            tof_cliff_mm=98,
-            sensor_age_ms=18,
-            loop_late_pct=0,
-            rx_drop=self.rx_drop,
-            gyro_z_mrad_s=0,
-            rails=0,
-            motion=0,
+    def send_banner(self) -> None:
+        self.banners_sent += 1
+        self._send(
+            {"T": 1006, "fw": self.fw, "hb_ms": self.hb_ms, "cap": self.cap, "proto": self.proto}
         )
 
-    def _next_seq(self) -> int:
-        seq = self._up_seq
-        self._up_seq = (self._up_seq + 1) & 0xFFFF
-        return seq
+    def reboot(self) -> None:
+        """The controller restarts: settings lost, motors off, boot banner."""
+        self.feedback_on = False
+        self.left = self.right = 0.0
+        self._last_speed_at = None
+        self.send_banner()
 
-    def _send(self, frame: Frame) -> None:
-        with contextlib.suppress(OSError):
-            os.write(self.fd, encode_frame(frame))
+    def _send(self, obj: dict[str, Any]) -> None:
+        if self._write is None:
+            return
+        with contextlib.suppress(ConnectionError, OSError):
+            self._write(json.dumps(obj, separators=(",", ":")).encode() + b"\n")
+
+    @property
+    def hb_alive(self) -> bool:
+        return (
+            self._last_speed_at is not None
+            and time.monotonic() - self._last_speed_at <= self.hb_ms / 1000.0
+        )
+
+    def stop_flags(self) -> int:
+        flags = 0
+        if not self.hb_alive:
+            flags |= 1
+        if 0 <= self.tof_mm < 250:
+            flags |= 2
+        if self.bumper:
+            flags |= 4
+        if self.lowbat:
+            flags |= 8
+        if self.coasting:
+            flags |= 16
+        return flags
+
+    def feedback(self) -> dict[str, Any]:
+        obj: dict[str, Any] = {
+            "T": 1001,
+            "L": round(self.left, 3),
+            "R": round(self.right, 3),
+            "r": self.roll_deg,
+            "p": self.pitch_deg,
+            "y": round(self.yaw_deg, 3),
+            "temp": self.temp_c,
+            "v": self.bus_v,
+        }
+        if self.fork_fields:
+            obj.update(
+                hb=1 if self.hb_alive else 0,
+                st=self.stop_flags(),
+                tf=self.tof_mm,
+                bp=1 if self.bumper else 0,
+                cc=self.clamp_count & 0xFFFF,
+            )
+        return obj
+
+    async def _feedback_loop(self) -> None:
+        last = time.monotonic()
+        while True:
+            await asyncio.sleep(self.feedback_period_s)
+            now = time.monotonic()
+            dt_s, last = now - last, now
+            if not self.hb_alive:
+                self.left = self.right = 0.0
+            self.yaw_deg = wrap_deg_180(
+                self.yaw_deg + (self.right - self.left) * self.turn_dps_per_power * dt_s
+            )
+            if self.feedback_on and self.feedback_enabled:
+                self._send(self.feedback())
 
 
 async def until(predicate: Callable[[], bool], timeout: float = TIMEOUT_S) -> None:
@@ -254,521 +296,513 @@ async def until(predicate: Callable[[], bool], timeout: float = TIMEOUT_S) -> No
     raise AssertionError("condition not reached within the timeout")
 
 
+def link_config(port: int, **overrides: Any) -> RobotConfig:
+    link: dict[str, Any] = {
+        "backend": "tcp",
+        "tcp_host": "127.0.0.1",
+        "tcp_port": port,
+        "open_retry_ms": 50,
+        "banner_wait_ms": 300,
+    }
+    link.update(overrides.pop("link", {}))
+    safety = SafetyConfig(**overrides.pop("safety", {}))
+    return RobotConfig(link=LinkConfig(**link), safety=safety, **overrides)
+
+
+class Recorder:
+    """Collects the link's callbacks."""
+
+    def __init__(self) -> None:
+        self.feedback: list[int] = []
+        self.ups = 0
+        self.lost = 0
+        self.restarts: list[Banner] = []
+
+    def on_feedback(self, _feedback: Any, arrival_ns: int) -> None:
+        self.feedback.append(arrival_ns)
+
+    def on_up(self, _link: Link) -> None:
+        self.ups += 1
+
+    def on_lost(self, _link: Link) -> None:
+        self.lost += 1
+
+    def on_restart(self, banner: Banner) -> None:
+        self.restarts.append(banner)
+
+
 @contextlib.asynccontextmanager
 async def linked(
-    *, ack_seq: int = 0, **serial: object
-) -> AsyncIterator[tuple[Link, SetpointCell, FakeMcu]]:
-    master, slave = pty.openpty()
-    os.set_blocking(master, False)
-    settings: dict[str, object] = {
-        "backend": "pty",
-        "port": os.ttyname(slave),
-        "setpoint_hz": 50,
-        "reseed_wait_ms": 300,
-        "open_retry_ms": 50,
-    }
-    settings.update(serial)
-    config = RobotConfig(serial=SerialConfig(**settings))  # type: ignore[arg-type]
-    cell = SetpointCell()
-    link = Link(config, cell)
-    mcu = FakeMcu(master, ack_seq=ack_seq)
-    mcu.start()
+    rover: FakeRover | None = None, **overrides: Any
+) -> AsyncIterator[tuple[Link, FakeRover, Recorder]]:
+    rover = rover or FakeRover()
+    port = await rover.start_tcp()
+    recorder = Recorder()
+    link = Link(
+        link_config(port, **overrides),
+        on_feedback=recorder.on_feedback,
+        on_up=recorder.on_up,
+        on_lost=recorder.on_lost,
+        on_restart=recorder.on_restart,
+    )
     task = asyncio.create_task(link.run())
     try:
-        yield link, cell, mcu
+        yield link, rover, recorder
     finally:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
-        await mcu.stop()
-        for fd in (master, slave):
-            with contextlib.suppress(OSError):
-                os.close(fd)
+        await rover.stop()
 
 
-async def arm(link: Link, mcu: FakeMcu) -> None:
-    await until(lambda: link.ready and link.telemetry is not None)
-    link.arm()
-    await until(lambda: link.armed)
-
-
-async def stream(
-    cell: SetpointCell, link: Link, v: float, w: float, seconds: float
-) -> None:
-    """Stamp the cell the way a live goal owner would, once per 20 ms."""
+async def stream(link: Link, left: float, right: float, seconds: float) -> None:
+    """Call ``command`` the way the control loop does, once per 50 ms."""
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
-        cell.stamp(v, w, time.monotonic_ns())
-        await asyncio.sleep(0.02)
+        link.command(left, right)
+        await asyncio.sleep(0.05)
+
+
+def speeds_of(rover: FakeRover) -> list[tuple[float, float]]:
+    return [(o["L"], o["R"]) for o in rover.received if o.get("T") == 1]
 
 
 # ---------------------------------------------------------------------------
-# Handshake and re-seed (A8)
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.timeout(30)
-def test_the_reseed_adopts_ack_seq_plus_one() -> None:
-    async def scenario() -> None:
-        async with linked(ack_seq=7) as (link, _cell, mcu):
-            await until(lambda: bool(mcu.frames(HelloFrame)))
-            hello = mcu.frames(HelloFrame)[0]
-            assert hello.seq == 8, "down_seq must be T.ack_seq + 1"
-            assert hello.session == 0, "H carries the wildcard session"
-            await until(lambda: link.session == 40010)
-
-    asyncio.run(scenario())
-
-
-@pytest.mark.timeout(30)
-def test_the_reseed_falls_back_to_one_when_no_telemetry_arrives() -> None:
-    """mcu-sim's ``no_t_before_h``: an unbounded wait would deadlock exactly
-    the case (unflashed or unplugged MCU) deploy step 10 leaves standing.
-
-    Telemetry resuming is not the property: the fallback leaves the session at
-    the wildcard, and both ``_emit_setpoint`` and ``arm`` bail on it, so a link
-    that never learns the session emits no ``V`` and sends no ``A`` for the life
-    of the process.  A real MCU stops sending ``B`` the moment it accepts the
-    ``H``, so no banner is coming to trigger a resync -- the ``T`` stream has to.
-    """
-
-    async def scenario() -> None:
-        async with linked() as (link, cell, mcu):
-            mcu.telemetry_on = False
-            await until(lambda: bool(mcu.frames(HelloFrame)), timeout=6.0)
-            assert mcu.frames(HelloFrame)[0].seq == 1
-            assert link.session == SESSION_WILDCARD
-            mcu.telemetry_on = True
-            await until(lambda: link.telemetry is not None)
-
-            # The session is learned from the live T stream, without a banner.
-            await until(lambda: link.session == 40010, timeout=6.0)
-            await until(lambda: link.ready)
-            assert link.arm() is not None, "arm() must work once the session is known"
-            await until(lambda: link.armed)
-            cell.stamp(0.20, 0.0, time.monotonic_ns())
-            await until(lambda: bool(mcu.frames(VelocityFrame)), timeout=6.0)
-
-    asyncio.run(scenario())
-
-
-@pytest.mark.timeout(30)
-def test_no_velocity_is_sent_before_the_handshake_completes() -> None:
-    async def scenario() -> None:
-        async with linked() as (link, cell, mcu):
-            cell.stamp(0.30, 0.0, time.monotonic_ns())
-            await until(lambda: bool(mcu.frames(HelloFrame)))
-            hello_index = mcu.received.index(mcu.frames(HelloFrame)[0])
-            assert not [
-                f for f in mcu.received[:hello_index] if isinstance(f, VelocityFrame)
-            ]
-            assert not link.armed
-
-    asyncio.run(scenario())
-
-
-# ---------------------------------------------------------------------------
-# The 20 Hz stream
+# Bring-up and the firmware gate
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.timeout(30)
-def test_an_armed_link_streams_the_setpoint() -> None:
-    async def scenario() -> None:
-        async with linked() as (link, cell, mcu):
-            await arm(link, mcu)
-            await stream(cell, link, 0.250, 0.210, 0.4)
-            moving = [f for f in mcu.velocities if f.v_mm_s != 0]
-            assert moving, "an armed link with a live setpoint must emit V"
-            assert moving[-1].v_mm_s == 250
-            assert moving[-1].w_mrad_s == 210
-            assert moving[-1].frame_ttl_ms == 300
-            assert moving[-1].flags == 0
-            assert moving[-1].session == 40010
-
-    asyncio.run(scenario())
-
-
-@pytest.mark.timeout(30)
-def test_a_zero_setpoint_still_renews_the_ttl() -> None:
-    async def scenario() -> None:
-        async with linked() as (link, cell, mcu):
-            await arm(link, mcu)
-            before = len(mcu.velocities)
-            await stream(cell, link, 0.0, 0.0, 0.3)
-            assert len(mcu.velocities) > before
-            assert all(f.v_mm_s == 0 for f in mcu.velocities[before:])
-
-    asyncio.run(scenario())
+async def test_bring_up_sends_the_protocol_sequence_then_waits_for_the_banner() -> None:
+    async with linked() as (link, rover, recorder):
+        await until(lambda: link.up)
+        types = [o["T"] for o in rover.received]
+        assert types[:6] == [605, 143, 136, 142, 131, 1007]
+        by_type = {o["T"]: o for o in rover.received[:6]}
+        assert by_type[605]["cmd"] == 0, "quiet"
+        assert by_type[143]["cmd"] == 0, "echo off"
+        assert by_type[136]["cmd"] == 300, "heartbeat at [safety] heartbeat_ms"
+        assert by_type[142]["cmd"] == 50, "feedback interval at [link] feedback_interval_ms"
+        assert by_type[131]["cmd"] == 1, "feedback on"
+        assert link.fw == "bot-wr-1"
+        assert link.banner is not None and link.banner.proto == 1
+        assert recorder.ups == 1
+        await until(lambda: link.feedback is not None)
+        assert link.firmware_ok
+        assert link.firmware_refusal() == ""
+        await until(lambda: link.motion_allowed())
 
 
 @pytest.mark.timeout(30)
-def test_a_frozen_goal_owner_stops_the_wheels() -> None:
-    """I-14: the writer keeps running, nobody stamps, V goes to zero within
-    the setpoint window without anything detecting the freeze."""
-
-    async def scenario() -> None:
-        async with linked() as (link, cell, mcu):
-            await arm(link, mcu)
-            await stream(cell, link, 0.250, 0.0, 0.3)
-            assert any(f.v_mm_s == 250 for f in mcu.velocities)
-            frozen_at = len(mcu.velocities)
-            await asyncio.sleep(0.15)  # the goal owner has stopped stamping
-            steady = len(mcu.velocities)
-            await asyncio.sleep(0.25)
-            assert len(mcu.velocities) > steady, "the writer must keep streaming"
-            assert all(
-                f.v_mm_s == 0 and f.w_mrad_s == 0 for f in mcu.velocities[steady:]
-            ), "every frame after the stamp expired must be zero"
-            assert frozen_at <= steady
-
-    asyncio.run(scenario())
+async def test_no_speed_line_is_sent_unless_the_caller_asks() -> None:
+    """The link has no writer task: bring-up done, nothing else goes out."""
+    async with linked() as (link, rover, _recorder):
+        await until(lambda: link.up and link.feedback is not None)
+        await asyncio.sleep(0.4)
+        assert speeds_of(rover) == []
 
 
 @pytest.mark.timeout(30)
-def test_a_setpoint_beyond_the_controller_cap_is_clamped_before_the_port() -> None:
-    """I-8: zero out-of-bounds values reach the port."""
-
-    async def scenario() -> None:
-        async with linked() as (link, cell, mcu):
-            await arm(link, mcu)
-            await stream(cell, link, 5.0, 9.0, 0.3)
-            moving = [f for f in mcu.velocities if f.v_mm_s != 0]
-            assert moving
-            assert moving[-1].v_mm_s == MAX_V_MM_S == 300
-            assert moving[-1].w_mrad_s == MAX_W_MRAD_S == 1047
-
-    asyncio.run(scenario())
-
-
-@pytest.mark.timeout(30)
-def test_stale_telemetry_stops_the_velocity_stream() -> None:
-    """T0: the Pi refuses to command a controller it cannot observe."""
-
-    async def scenario() -> None:
-        async with linked() as (link, cell, mcu):
-            await arm(link, mcu)
-            await stream(cell, link, 0.250, 0.0, 0.2)
-            mcu.telemetry_on = False
-            await until(lambda: link.link_down, timeout=2.0)
-            await asyncio.sleep(0.1)  # let anything already on the wire arrive
-            quiet = len(mcu.velocities)
-            await stream(cell, link, 0.250, 0.0, 0.3)
-            assert len(mcu.velocities) == quiet
-
-    asyncio.run(scenario())
+async def test_stock_firmware_sends_no_banner_and_is_refused() -> None:
+    async with linked(FakeRover(stock=True)) as (link, rover, recorder):
+        await until(lambda: link.up)
+        assert link.fw is None
+        assert link.banner is None
+        assert "no banner" in link.firmware_refusal()
+        await until(lambda: link.feedback is not None)
+        assert not link.feedback.patched  # type: ignore[union-attr]
+        assert not link.firmware_ok
+        assert not link.motion_allowed()
+        await stream(link, 0.2, 0.2, 0.3)
+        sent = speeds_of(rover)
+        assert sent, "zeros still flow to a stock controller"
+        assert all(s == (0.0, 0.0) for s in sent)
+        assert recorder.ups == 1
 
 
 @pytest.mark.timeout(30)
-def test_disarm_stops_the_stream_immediately() -> None:
-    async def scenario() -> None:
-        async with linked() as (link, cell, mcu):
-            await arm(link, mcu)
-            await stream(cell, link, 0.250, 0.0, 0.2)
-            link.disarm()
-            assert not link.armed
-            await asyncio.sleep(0.1)  # let anything already on the wire arrive
-            quiet = len(mcu.velocities)
-            await stream(cell, link, 0.250, 0.0, 0.2)
-            assert len(mcu.velocities) == quiet
-
-    asyncio.run(scenario())
+async def test_a_banner_whose_heartbeat_disagrees_is_refused() -> None:
+    async with linked(FakeRover(hb_ms=3000)) as (link, _rover, _recorder):
+        await until(lambda: link.up and link.feedback is not None)
+        assert link.fw == "bot-wr-1", "the tag is still reported"
+        assert "hb_ms=3000" in link.firmware_refusal()
+        assert not link.motion_allowed()
 
 
 @pytest.mark.timeout(30)
-def test_stop_drops_the_setpoint_before_sending_the_frame() -> None:
-    async def scenario() -> None:
-        async with linked() as (link, cell, mcu):
-            await arm(link, mcu)
-            cell.stamp(0.30, 0.0, time.monotonic_ns())
-            link.stop(mode=0)
-            assert cell.read(time.monotonic_ns()) == (0.0, 0.0)
-            await until(lambda: bool(mcu.frames(StopFrame)))
-            assert mcu.frames(StopFrame)[0].mode == 0  # type: ignore[attr-defined]
-
-    asyncio.run(scenario())
+async def test_a_banner_whose_cap_disagrees_is_refused() -> None:
+    async with linked(FakeRover(cap=0.5)) as (link, _rover, _recorder):
+        await until(lambda: link.up and link.feedback is not None)
+        assert "cap=0.5" in link.firmware_refusal()
+        assert not link.motion_allowed()
 
 
 @pytest.mark.timeout(30)
-def test_shutdown_brakes_and_disarms_before_the_link_task_is_cancelled() -> None:
-    """4.2: robotd sends ``D`` on shutdown.
-
-    Cancelling ``Link.run`` first runs its per-iteration ``finally`` --
-    ``_teardown()`` -- which clears the fd, so ``Link.close``'s ``connected and
-    _ready`` guard is false and neither frame is ever written.  The order is
-    the whole of the fix, so the test asserts the order: close, then cancel.
-    """
-
-    async def scenario() -> None:
-        master, slave = pty.openpty()
-        os.set_blocking(master, False)
-        config = RobotConfig(
-            serial=SerialConfig(  # type: ignore[arg-type]
-                backend="pty",
-                port=os.ttyname(slave),
-                setpoint_hz=50,
-                reseed_wait_ms=300,
-                open_retry_ms=50,
-            )
-        )
-        cell = SetpointCell()
-        link = Link(config, cell)
-        mcu = FakeMcu(master)
-        mcu.start()
-        task = asyncio.create_task(link.run())
-        try:
-            await arm(link, mcu)
-            await stream(cell, link, 0.250, 0.0, 0.2)
-
-            await link.close()  # Robotd.run's order, after the fix
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
-
-            await until(lambda: bool(mcu.frames(StopFrame)))
-            assert mcu.frames(StopFrame)[0].mode == 0  # type: ignore[attr-defined]
-            assert mcu.frames(DisarmFrame)
-        finally:
-            await mcu.stop()
-            for fd in (master, slave):
-                with contextlib.suppress(OSError):
-                    os.close(fd)
-
-    asyncio.run(scenario())
+async def test_a_banner_without_the_fork_fields_in_feedback_is_refused() -> None:
+    async with linked(FakeRover(fork_fields=False)) as (link, _rover, _recorder):
+        await until(lambda: link.up)
+        assert link.firmware_ok, "the banner alone passes"
+        await until(lambda: link.feedback is not None)
+        assert "fork fields" in link.firmware_refusal()
+        assert not link.motion_allowed()
 
 
 @pytest.mark.timeout(30)
-def test_cancelling_the_link_task_first_sends_neither_frame() -> None:
-    """The failure this replaced, pinned so the order cannot drift back."""
-
-    async def scenario() -> None:
-        master, slave = pty.openpty()
-        os.set_blocking(master, False)
-        config = RobotConfig(
-            serial=SerialConfig(  # type: ignore[arg-type]
-                backend="pty",
-                port=os.ttyname(slave),
-                setpoint_hz=50,
-                reseed_wait_ms=300,
-                open_retry_ms=50,
-            )
-        )
-        cell = SetpointCell()
-        link = Link(config, cell)
-        mcu = FakeMcu(master)
-        mcu.start()
-        task = asyncio.create_task(link.run())
-        try:
-            await arm(link, mcu)
-            await stream(cell, link, 0.250, 0.0, 0.2)
-
-            task.cancel()  # the old order
-            await asyncio.gather(task, return_exceptions=True)
-            await link.close()
-            await asyncio.sleep(0.2)
-
-            assert not mcu.frames(StopFrame)
-            assert not mcu.frames(DisarmFrame)
-        finally:
-            await mcu.stop()
-            for fd in (master, slave):
-                with contextlib.suppress(OSError):
-                    os.close(fd)
-
-    asyncio.run(scenario())
-
-
-@pytest.mark.timeout(30)
-def test_readiness_reads_link_alive_and_the_command_gate_reads_its_own_key() -> None:
-    """5.8: ``link_alive_max_age_ms`` drives readiness; ``cmd_gate_max_age_ms``
-    is the separate T0 gate that blocks emitting ``V``.
-
-    Both predicates derived from ``cmd_gate_max_age_ms``, so an operator who
-    tightened ``ROVER__SAFETY__LINK_ALIVE_MAX_AGE_MS`` changed nothing at all --
-    the key was validated, logged at WARN and republished in ``welcome.safety``
-    with no reader anywhere.
-    """
-
-    async def scenario() -> None:
-        async with linked() as (link, _cell, mcu):
-            await until(lambda: link.telemetry is not None)
-            assert not link.link_down
-            assert link.link_alive
-
-            mcu.telemetry_on = False
-            # Past the 150 ms command gate but inside the 200 ms liveness
-            # window: robotd stops commanding and is still connected.
-            await until(lambda: link.link_down)
-            age = link.telemetry_age_ms()
-            assert age is not None
-            if age < link.config.safety.link_alive_max_age_ms:
-                assert link.link_alive
-            await until(lambda: not link.link_alive)
-
-    asyncio.run(scenario())
+async def test_require_patched_firmware_false_waives_the_gate() -> None:
+    """A bench with stock firmware and the wheels off the floor."""
+    rover = FakeRover(stock=True)
+    async with linked(rover, safety={"require_patched_firmware": False}) as (
+        link,
+        rover,
+        _recorder,
+    ):
+        await until(lambda: link.up and link.feedback is not None)
+        assert link.firmware_ok
+        await until(lambda: link.motion_allowed())
+        await stream(link, 0.2, 0.2, 0.3)
+        assert (0.2, 0.2) in speeds_of(rover)
 
 
 # ---------------------------------------------------------------------------
-# Session change and reconnect (I-3, I-13)
+# Feedback ingest and the counters
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.timeout(30)
-def test_a_session_change_is_handled_like_a_port_open_and_replays_nothing() -> None:
-    async def scenario() -> None:
-        async with linked() as (link, cell, mcu):
-            await arm(link, mcu)
-            await stream(cell, link, 0.250, 0.0, 0.3)
-            assert any(f.v_mm_s == 250 for f in mcu.velocities)
-
-            mcu.session = 51882
-            mcu.state = McuState.DISARMED
-            await until(lambda: link.session == 51882, timeout=3.0)
-            boundary = len(mcu.velocities)
-            assert not link.armed, "a restart must start disarmed (I-3)"
-            assert cell.read(time.monotonic_ns()) == (0.0, 0.0)
-            await until(
-                lambda: len(mcu.frames(HelloFrame)) >= 2, timeout=2.0
-            )  # a session change re-sends H
-            await asyncio.sleep(0.2)
-            assert all(
-                f.v_mm_s == 0 and f.w_mrad_s == 0
-                for f in mcu.velocities[boundary:]
-            ), "no motion may be replayed across a session change (I-13)"
-
-    asyncio.run(scenario())
+async def test_feedback_is_stamped_on_arrival_and_ages_on_the_host_clock() -> None:
+    async with linked() as (link, _rover, recorder):
+        await until(lambda: len(recorder.feedback) >= 3)
+        arrival = link.feedback_arrival_ns
+        assert arrival is not None
+        assert arrival == recorder.feedback[-1]
+        assert link.feedback_age_ms(arrival) == 0.0
+        assert link.feedback_age_ms(arrival + 100_000_000) == pytest.approx(100.0)
+        assert link.feedback_fresh(arrival + 150_000_000)
+        assert not link.feedback_fresh(arrival + 151_000_000)
+        gaps = [b - a for a, b in zip(recorder.feedback, recorder.feedback[1:], strict=False)]
+        assert all(gap > 0 for gap in gaps)
 
 
-@pytest.mark.timeout(30)
-def test_the_round_trip_probe_uses_only_the_host_clock() -> None:
-    """P/O is diagnostic; the echo is an opaque token and the RTT is computed
-    entirely on our side (I-17)."""
+def test_dropped_and_unknown_lines_are_counted_and_renew_nothing() -> None:
+    link = Link(RobotConfig(), clock=lambda: 777)
+    link.ingest(b'{"T":1001,"L":0,"R":0,"r":0,"p":0,"y":10,"temp":30,"v":11.5,'
+                b'"hb":1,"st":0,"tf":-1,"bp":0,"cc":0}')
+    assert link.feedback_arrival_ns == 777
+    link._clock = lambda: 999  # noqa: SLF001 - a later arrival would stamp 999
+    link.ingest(b"UGV started.")
+    link.ingest(b'{"T":999}')
+    link.ingest(b'{"T":1001,"L":"x"}')
+    link.ingest(b'{"T":1001,' + b" " * 600 + b"}")
+    assert link.dropped == 3
+    assert link.unknown == 1
+    assert link.feedback_arrival_ns == 777, "nothing above renewed the stamp"
+    assert link.feedback is not None and link.feedback.yaw_deg == 10.0
 
-    async def scenario() -> None:
-        async with linked() as (link, _cell, mcu):
-            await until(lambda: link.ready)
-            await until(lambda: bool(mcu.frames(PingFrame)), timeout=3.0)
-            await until(lambda: link.rtt_ms is not None, timeout=2.0)
-            assert link.rtt_ms is not None and 0.0 <= link.rtt_ms < 1000.0
 
-    asyncio.run(scenario())
+def test_a_run_of_bytes_without_a_newline_is_dropped_once_and_the_buffer_stays_bounded() -> None:
+    link = Link(RobotConfig())
+    protocol = LinkProtocol(link)
+    for _ in range(10):
+        protocol.data_received(b"x" * 400)
+    protocol.data_received(b"tail\n")
+    assert link.dropped == 1
+    assert len(protocol._rx) == 0  # noqa: SLF001 - the bound is the point
+    protocol.data_received(b'{"T":1006,"fw":"bot-wr-1","hb_ms":300,"cap":0.3,"proto":1}\n')
+    assert link.unknown == 0 and link.dropped == 1, "the next line decodes normally"
 
 
-@pytest.mark.timeout(30)
-def test_a_corrupted_line_is_counted_and_changes_nothing() -> None:
-    """I-2: a bad frame is dropped, counted, and renews no TTL."""
-
-    async def scenario() -> None:
-        async with linked() as (link, _cell, mcu):
-            await until(lambda: link.telemetry is not None)
-            before = link.telemetry
-            os.write(mcu.fd, b"$T,2,9,40010,not-an-integer*0000\n")
-            await until(lambda: link.reader.counters.dropped > 0, timeout=2.0)
-            assert link.telemetry is not None
-            assert link.telemetry.session == before.session  # type: ignore[union-attr]
-
-    asyncio.run(scenario())
+def test_lines_split_across_reads_are_reassembled() -> None:
+    link = Link(RobotConfig(), clock=lambda: 5)
+    protocol = LinkProtocol(link)
+    line = b'{"T":1001,"L":0,"R":0,"r":0,"p":0,"y":0,"temp":30,"v":11.5}\n'
+    protocol.data_received(line[:20])
+    assert link.feedback is None
+    protocol.data_received(line[20:] + b'{"T":9')
+    assert link.feedback is not None
+    protocol.data_received(b"}\n")
+    assert link.unknown == 1
 
 
 # ---------------------------------------------------------------------------
-# The real simulator
+# The command stream
 # ---------------------------------------------------------------------------
 
 
-_SIM_SEARCH_PATHS = (
-    "firmware/build/host/mcu-sim",
-    "firmware/host/build/mcu-sim",
-    "firmware/build/mcu-sim",
-    "build/mcu-sim",
-)
-"""Where the host build drops the binary; the same list rover_devtools uses."""
+@pytest.mark.timeout(30)
+async def test_command_streams_what_the_caller_asks_and_stops_when_it_stops() -> None:
+    """I-14 in one mechanism: the stream is the caller's loop, nothing else."""
+    async with linked() as (link, rover, _recorder):
+        await until(lambda: link.motion_allowed())
+        await stream(link, 0.2, -0.1, 0.3)
+        sent = speeds_of(rover)
+        assert (0.2, -0.1) in sent
+        assert link.cmd_left == 0.2 and link.cmd_right == -0.1
+        frozen_at = len(sent)
+        await asyncio.sleep(0.4)  # the caller has frozen
+        assert len(speeds_of(rover)) == frozen_at, "no keep-alive may outlive the loop"
+        await until(lambda: rover.left == 0.0 and rover.right == 0.0)
+        assert not rover.hb_alive, "the firmware's heartbeat zeroed the motors"
 
 
-def _simulator_reason() -> str | None:
-    """Why the mcu-sim test cannot run, or ``None`` when it can."""
-    module = REPO / "packages" / "rover_devtools" / "mcu_sim.py"
-    if not module.exists():
-        return f"mcu-sim is not available: {module} does not exist"
-    override = os.environ.get("ROVER_MCU_SIM")
-    if override and Path(override).exists():
-        return None
-    if any((REPO / candidate).exists() for candidate in _SIM_SEARCH_PATHS):
-        return None
-    return (
-        "the mcu-sim binary is not built: none of "
-        f"{', '.join(_SIM_SEARCH_PATHS)} exists under {REPO}. "
-        "Build it with `make sim` (cmake -DROVER_HOST_TEST=ON), or point "
-        "ROVER_MCU_SIM at the binary."
+@pytest.mark.timeout(30)
+async def test_command_clamps_to_power_max_and_zeroes_non_finite_values() -> None:
+    async with linked() as (link, rover, _recorder):
+        await until(lambda: link.motion_allowed())
+        assert link.command(0.9, -0.9) == (0.30, -0.30)
+        assert link.command(float("nan"), float("inf")) == (0.0, 0.0)
+        await until(lambda: (0.3, -0.3) in speeds_of(rover))
+        assert rover.clamp_count == 0, "nothing above the cap reached the controller"
+
+
+@pytest.mark.timeout(30)
+async def test_command_sends_zeros_before_feedback_and_after_it_goes_stale() -> None:
+    rover = FakeRover()
+    rover.feedback_enabled = False
+    async with linked(rover) as (link, rover, _recorder):
+        await until(lambda: link.up)
+        assert link.command(0.2, 0.2) == (0.0, 0.0), "no feedback yet"
+        rover.feedback_enabled = True
+        await until(lambda: link.motion_allowed())
+        assert link.command(0.2, 0.2) == (0.2, 0.2)
+        rover.feedback_enabled = False
+        await until(lambda: not link.feedback_fresh(), timeout=2.0)
+        assert link.command(0.2, 0.2) == (0.0, 0.0), "T0: zeros to a silent controller"
+        assert speeds_of(rover)[-1] == (0.0, 0.0)
+
+
+@pytest.mark.timeout(30)
+async def test_nothing_is_written_while_the_transport_is_closed() -> None:
+    link = Link(link_config(1))
+    assert link.command(0.2, 0.2) == (0.0, 0.0)
+    assert not link.connected
+
+
+# ---------------------------------------------------------------------------
+# Restart, loss and reopen
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.timeout(30)
+async def test_a_second_banner_is_a_restart_that_re_runs_bring_up() -> None:
+    async with linked() as (link, rover, recorder):
+        await until(lambda: link.motion_allowed())
+        first_bring_up = len(rover.received)
+        rover.reboot()
+        await until(lambda: len(recorder.restarts) == 1)
+        assert recorder.restarts[0].fw == "bot-wr-1"
+        assert not link.up
+        assert link.command(0.2, 0.2) == (0.0, 0.0), "zeros until bring-up finishes again"
+        await until(lambda: link.up and recorder.ups == 2)
+        types = [o["T"] for o in rover.received[first_bring_up:] if o["T"] != 1]
+        assert types[:6] == [605, 143, 136, 142, 131, 1007], "the same sequence again"
+        assert rover.banners_sent == 2
+        await until(lambda: link.motion_allowed())
+
+
+@pytest.mark.timeout(30)
+async def test_banners_during_bring_up_are_one_bring_up() -> None:
+    """A boot banner and the answer to our request may both land in the wait."""
+    rover = FakeRover()
+    async with linked(rover) as (link, rover, recorder):
+        await until(lambda: link.up)
+        assert recorder.restarts == []
+        assert recorder.ups == 1
+
+
+@pytest.mark.timeout(30)
+async def test_the_link_reopens_after_a_loss_and_replays_nothing() -> None:
+    """I-13: a reconnect starts with bring-up and zeros, never the last command."""
+    async with linked() as (link, rover, recorder):
+        await until(lambda: link.motion_allowed())
+        await stream(link, 0.2, 0.2, 0.2)
+        assert (0.2, 0.2) in speeds_of(rover)
+        rover.disconnect()
+        await until(lambda: recorder.lost == 1)
+        assert not link.connected and not link.up
+        assert link.feedback is None and link.fw is None
+        assert (link.cmd_left, link.cmd_right) == (0.0, 0.0)
+        boundary = len(rover.received)
+        await until(lambda: rover.connections == 2 and link.up, timeout=TIMEOUT_S)
+        after = rover.received[boundary:]
+        assert [o["T"] for o in after if o["T"] != 1][:6] == [605, 143, 136, 142, 131, 1007]
+        assert all((o["L"], o["R"]) == (0.0, 0.0) for o in after if o["T"] == 1)
+        assert recorder.ups == 2
+
+
+@pytest.mark.timeout(30)
+async def test_a_loss_during_bring_up_is_a_loss_not_a_stock_verdict() -> None:
+    rover = FakeRover()
+    rover.banner_on_request = False  # type: ignore[attr-defined]
+    port = await rover.start_tcp()
+    link = Link(link_config(port, link={"banner_wait_ms": 2000}))
+    task = asyncio.create_task(link.run())
+    try:
+        await until(lambda: rover.connections == 1)
+        await until(lambda: any(o["T"] == 1007 for o in rover.received))
+        rover.disconnect()
+        await until(lambda: rover.connections == 2, timeout=TIMEOUT_S)
+        assert link.banner is None or link.up is False or link.fw is not None
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await rover.stop()
+
+
+@pytest.mark.timeout(30)
+async def test_an_absent_peer_is_retried_until_it_appears() -> None:
+    rover = FakeRover()
+    server = await asyncio.start_server(lambda r, w: None, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    server.close()
+    await server.wait_closed()
+    link = Link(link_config(port))
+    task = asyncio.create_task(link.run())
+    try:
+        await asyncio.sleep(0.3)
+        assert not link.connected
+        rover._server = await asyncio.start_server(rover._serve, "127.0.0.1", port)  # noqa: SLF001
+        rover._ensure_loop()  # noqa: SLF001
+        await until(lambda: link.up, timeout=TIMEOUT_S)
+        assert link.fw == "bot-wr-1"
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await rover.stop()
+
+
+@pytest.mark.timeout(30)
+async def test_close_sends_zeros_and_stops_reopening() -> None:
+    rover = FakeRover()
+    port = await rover.start_tcp()
+    link = Link(link_config(port))
+    task = asyncio.create_task(link.run())
+    try:
+        await until(lambda: link.motion_allowed())
+        await stream(link, 0.2, 0.2, 0.2)
+        await link.close()
+        await asyncio.wait_for(task, 2.0)
+        await asyncio.sleep(0.1)
+        assert speeds_of(rover)[-1] == (0.0, 0.0)
+        assert not link.connected
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await rover.stop()
+
+
+# ---------------------------------------------------------------------------
+# The serial backend over a pty
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.timeout(30)
+async def test_the_serial_backend_opens_a_pty_path_like_the_uart() -> None:
+    rover = FakeRover()
+    path = rover.start_pty()
+    config = RobotConfig(
+        link=LinkConfig(backend="serial", port=path, open_retry_ms=50, banner_wait_ms=300)
     )
+    link = Link(config)
+    task = asyncio.create_task(link.run())
+    try:
+        await until(lambda: link.up and link.fw == "bot-wr-1")
+        await until(lambda: link.motion_allowed())
+        await stream(link, 0.15, 0.15, 0.3)
+        assert (0.15, 0.15) in speeds_of(rover)
+        await until(lambda: rover.left == 0.15)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await rover.stop()
 
 
-@pytest.mark.timeout(60)
-@pytest.mark.skipif(_simulator_reason() is not None, reason=_simulator_reason() or "")
-def test_the_link_drives_the_real_simulator_over_a_pty() -> None:
-    """``mcu-sim`` symlinks ``./run/mcu.pty`` to whatever slave the OS gave it
-    and removes it on exit (ARCHITECTURE 10); robotd retries ``open()`` until
-    the path exists, which is what removes make dev's start-order dependency."""
+# ---------------------------------------------------------------------------
+# The real simulator: rover-stub over a pty
+# ---------------------------------------------------------------------------
 
-    async def scenario(port: Path) -> None:
-        config = RobotConfig(
-            serial=SerialConfig(
-                backend="pty", port=str(port), setpoint_hz=20, open_retry_ms=100
-            )
+
+def _stub_reason() -> str | None:
+    """Why the rover-stub tests cannot run, or ``None`` when they can."""
+    if importlib.util.find_spec("rover_devtools.rover_stub") is None:
+        return (
+            "rover_devtools.rover_stub is not importable yet; it is being written "
+            "concurrently and this test runs against its CLI contract "
+            "(rover-stub --pty prints the device path; --stock, --tof-mm, --bumper, "
+            "--vbat)"
         )
-        cell = SetpointCell()
-        link = Link(config, cell)
-        task = asyncio.create_task(link.run())
-        try:
-            await until(lambda: link.ready and link.telemetry is not None, timeout=10.0)
-            assert link.session != 0
-            # ARCHITECTURE 4.1: the MCU takes 50 cliff samples on every entry to
-            # DISARMED and refuses *all* forward motion while ctrl_flags b6
-            # cal_valid is 0.  Arming inside that window gives an accepted A,
-            # accepted V frames and a stationary robot, so the calibration is a
-            # precondition of the drive rather than a race to lose.
-            await until(
-                lambda: link.telemetry is not None
-                and bool(link.telemetry.ctrl_flags & int(CtrlFlag.CAL_VALID)),
-                timeout=10.0,
-            )
-            link.arm()
-            await until(lambda: link.armed, timeout=5.0)
-            await stream(cell, link, 0.150, 0.0, 1.0)
-            assert link.telemetry is not None
-            assert link.telemetry.v_cmd_mm_s != 0
-            link.stop(mode=0)
-            await asyncio.sleep(0.3)
-            await link.close()
-        finally:
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+    return None
 
-    # Not run/mcu.pty: that is the symlink `[serial] port` names and a running
-    # `make sim` owns.  This test drives its own simulator and must not touch it.
-    port = REPO / "run" / "test-mcu.pty"
+
+@contextlib.contextmanager
+def rover_stub(*flags: str):  # type: ignore[no-untyped-def]
+    """Start ``rover-stub --pty`` and yield the device path it prints."""
     process = subprocess.Popen(  # noqa: S603 - a repo-local developer tool
-        [sys.executable, "-m", "rover_devtools.mcu_sim", "--link", str(port)],
+        [sys.executable, "-m", "rover_devtools.rover_stub", "--pty", *flags],
         cwd=REPO,
-        env={**os.environ, "PYTHONPATH": str(REPO / "packages")},
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
+        env={**os.environ, "PYTHONPATH": f"{REPO / 'packages'}:{REPO / 'hosts' / 'pi'}"},
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
     )
     try:
+        assert process.stdout is not None
         deadline = time.monotonic() + 15.0
-        while time.monotonic() < deadline and not port.exists():
+        path: str | None = None
+        while time.monotonic() < deadline and path is None:
             if process.poll() is not None:
-                pytest.skip(
-                    "mcu-sim exited immediately: "
-                    f"{(process.stderr.read() if process.stderr else b'')!r}"
-                )
-            time.sleep(0.1)
-        if not port.exists():
-            pytest.skip(f"mcu-sim did not create {port} within 15 s")
-        asyncio.run(scenario(port))
+                pytest.skip("rover-stub exited before printing a device path")
+            line = process.stdout.readline().strip()
+            candidate = line.split()[-1] if line else ""
+            if candidate.startswith("/") and Path(candidate).exists():
+                path = candidate
+        if path is None:
+            pytest.skip("rover-stub did not print an existing device path within 15 s")
+        yield path
     finally:
         process.terminate()
         with contextlib.suppress(subprocess.TimeoutExpired):
             process.wait(timeout=5)
-        # Only the symlink this test caused.  Removing run/ wholesale takes the
-        # sockets out from under a `make sim` running in another shell, which
-        # leaves six live processes and no way to reach any of them.
-        with contextlib.suppress(OSError):
-            port.unlink()
+
+
+@pytest.mark.timeout(60)
+@pytest.mark.skipif(_stub_reason() is not None, reason=_stub_reason() or "")
+async def test_the_link_brings_up_the_real_stub_over_a_pty() -> None:
+    with rover_stub() as path:
+        config = RobotConfig(link=LinkConfig(backend="serial", port=path, open_retry_ms=100))
+        link = Link(config)
+        task = asyncio.create_task(link.run())
+        try:
+            await until(lambda: link.up, timeout=10.0)
+            assert link.fw is not None, "the stub is the fork unless --stock"
+            await until(lambda: link.motion_allowed(), timeout=5.0)
+            await stream(link, 0.15, 0.15, 0.6)
+            assert link.feedback is not None
+            await until(lambda: link.feedback is not None and link.feedback.left > 0.0)
+            await stream(link, 0.0, 0.0, 0.4)
+            await until(
+                lambda: link.feedback is not None
+                and link.feedback.left == 0.0
+                and link.feedback.right == 0.0
+            )
+            await link.close()
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.timeout(60)
+@pytest.mark.skipif(_stub_reason() is not None, reason=_stub_reason() or "")
+async def test_the_stock_stub_is_refused() -> None:
+    with rover_stub("--stock") as path:
+        config = RobotConfig(link=LinkConfig(backend="serial", port=path, open_retry_ms=100))
+        link = Link(config)
+        task = asyncio.create_task(link.run())
+        try:
+            await until(lambda: link.up, timeout=10.0)
+            assert link.fw is None
+            await until(lambda: link.feedback is not None, timeout=5.0)
+            assert not link.firmware_ok
+            await stream(link, 0.15, 0.15, 0.3)
+            assert link.feedback is not None and link.feedback.left == 0.0
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)

@@ -15,6 +15,11 @@ model.  A fake that generated its answers through the same pydantic classes the
 validator uses could never fail validation, which would make
 ``test_fakebox.py``'s schema assertion a tautology.
 
+The rover is open loop (ADR-0013): a drive is a power for a time and a turn is
+an absolute heading.  The phrase table therefore reads the current heading out
+of the WorldState block in the request, so "turn left" against heading 87 is
+``turn_to 357``, the same arithmetic the real model is told to do.
+
 Pure stdlib: ``http.server`` is enough for one endpoint, and a dev tool that
 needs a web framework installed before it can tell you why nothing works is the
 wrong tool.
@@ -36,11 +41,15 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 __all__ = [
+    "CASES",
+    "CATEGORIES",
     "FAULTS",
     "FakeBox",
     "FakeBoxServer",
     "INJECTED_INSTRUCTION",
+    "Case",
     "content_for",
+    "heading_of",
     "main",
     "make_server",
     "observe",
@@ -83,14 +92,46 @@ _IMAGE_TOKENS = 300
 # The phrase table
 # --------------------------------------------------------------------------
 
-_WORD_NUMBERS: dict[str, int] = {
+POWER_DEFAULT_PCT = 20
+"""What a drive is planned at unless the utterance says otherwise: the
+``[limits] power_default`` of 0.20, in the model's percent."""
+POWER_MAX_PCT = 30
+DURATION_DEFAULT_MS = 1000
+DURATION_MIN_MS, DURATION_MAX_MS = 100, 2000
+MS_PER_CM = 20
+"""The fake's stand-in for a floor: a distance request is read as 20 ms per
+centimetre, so "forty centimetres" is an 800 ms drive and "five metres" clamps
+to the schema's 2000 ms.  Not a claim about the chassis; G5 measures that."""
+TURN_DEFAULT_DEG = 90
+
+_UNITS: dict[str, int] = {
     "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7,
-    "eight": 8, "nine": 9, "ten": 10, "fifteen": 15, "twenty": 20, "thirty": 30,
-    "forty": 40, "forty-five": 45, "fifty": 50, "sixty": 60, "seventy": 70,
-    "eighty": 80, "ninety": 90, "hundred": 100, "half": 50,
+    "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12, "fifteen": 15,
 }
-_METRIC = re.compile(r"\b(m|meters?|metres?)\b")
-_DIGITS = re.compile(r"-?\d+")
+_TENS: dict[str, int] = {
+    "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50, "sixty": 60,
+    "seventy": 70, "eighty": 80, "ninety": 90,
+}
+_ONES = "|".join(word for word, value in _UNITS.items() if value < 10)
+_NUMBER = (
+    rf"(?:-?\d+(?:\.\d+)?|(?:{'|'.join(_TENS)})(?:[ -](?:{_ONES}))?"
+    rf"|(?:{'|'.join(_UNITS)})|hundred|half(?: an?)?|an?)"
+)
+_WORD_NUMBER = re.compile(rf"\b(?P<n>{_NUMBER})\b")
+_DIGITS = re.compile(r"-?\d+(?:\.\d+)?")
+
+_MS = r"ms|millis|milliseconds?"
+_SECONDS = r"s|sec|secs|seconds?"
+_MINUTES = r"min|mins|minutes?"
+_CM = r"cm|centimet(?:er|re)s?"
+_METRES = r"m|met(?:er|re)s?"
+_PERCENT = r"%|percent|per cent"
+_DEGREES = r"deg|degrees?"
+
+_ABSOLUTE_HEADING = re.compile(
+    r"\b(?:to|towards?|heading|bearing)\s+(?:heading\s+|bearing\s+)?(?P<n>\d+)"
+    r"(?:\s*(?:deg|degrees?))?(?![a-z])"
+)
 _FACES = {
     "happy": "happy", "smile": "happy", "sad": "confused", "confused": "confused",
     "thinking": "thinking", "think": "thinking", "alert": "alert",
@@ -100,23 +141,68 @@ _STOP_WORDS = re.compile(r"^(the|a|an|my|your|for|at|to|it|that|this)\b\s*")
 _FIND_VERB = re.compile(r"\b(find|look for|search for|where is|where's)\b")
 
 
-def _number(text: str) -> int | None:
+def _to_number(token: str) -> float:
+    token = token.strip()
+    if token in ("a", "an"):
+        return 1.0
+    if token.startswith("half"):
+        return 0.5
+    if token == "hundred":
+        return 100.0
+    try:
+        return float(token)
+    except ValueError:
+        pass
+    words = re.split(r"[ -]", token)
+    return float(sum(_TENS.get(w, 0) + _UNITS.get(w, 0) for w in words))
+
+
+def _quantity(text: str, unit: str) -> float | None:
+    """The number written directly before one of ``unit``'s spellings."""
+    match = re.search(rf"\b(?P<n>{_NUMBER})\s*(?:{unit})(?![a-z])", text)
+    return _to_number(match.group("n")) if match else None
+
+
+def _number(text: str) -> float | None:
+    """Any number in the text, digits first, then words."""
     digits = _DIGITS.search(text)
     if digits:
-        return int(digits.group())
-    for word, value in _WORD_NUMBERS.items():
-        if re.search(rf"\b{re.escape(word)}\b", text):
-            return value
+        return float(digits.group())
+    match = _WORD_NUMBER.search(text)
+    if match and match.group("n") not in ("a", "an"):
+        return _to_number(match.group("n"))
     return None
 
 
-def _clamp(value: int, lo: int, hi: int) -> int:
-    return max(lo, min(hi, value))
+def _clamp(value: float, lo: int, hi: int) -> int:
+    return int(max(lo, min(hi, round(value))))
 
 
-def _magnitude(value: int, lo: int, hi: int) -> int:
-    sign = -1 if value < 0 else 1
-    return sign * _clamp(abs(value), lo, hi)
+def _duration_ms(text: str) -> int:
+    for unit, scale in (
+        (_MS, 1.0),
+        (_SECONDS, 1000.0),
+        (_MINUTES, 60_000.0),
+        (_CM, float(MS_PER_CM)),
+        (_METRES, 100.0 * MS_PER_CM),
+    ):
+        found = _quantity(text, unit)
+        if found is not None:
+            return _clamp(found * scale, DURATION_MIN_MS, DURATION_MAX_MS)
+    if re.search(r"\b(a little|a bit|slightly|a touch)\b", text):
+        return DURATION_DEFAULT_MS // 2
+    return DURATION_DEFAULT_MS
+
+
+def _power_pct(text: str) -> int:
+    found = _quantity(text, _PERCENT)
+    if found is not None:
+        return _clamp(found, 1, POWER_MAX_PCT)
+    if re.search(r"\b(slow|slowly|gently|gentle|carefully)\b", text):
+        return POWER_DEFAULT_PCT // 2
+    if re.search(r"\b(fast|quick|quickly|full speed|flat out)\b", text):
+        return POWER_MAX_PCT
+    return POWER_DEFAULT_PCT
 
 
 def _object_after(text: str, verb: re.Match[str]) -> str:
@@ -130,47 +216,63 @@ def _object_after(text: str, verb: re.Match[str]) -> str:
 
 
 def _drive(text: str, sign: int) -> dict[str, Any]:
-    found = _number(text)
-    centimetres = 40 if found is None else found * (100 if _METRIC.search(text) else 1)
-    distance = _magnitude(sign * centimetres, 5, 100)
+    duration = _duration_ms(text)
+    power = sign * _power_pct(text)
     where = "forward" if sign > 0 else "back"
     return {
-        "speech": f"Moving {where} {abs(distance)} centimetres.",
-        "skill": "drive",
-        "args": {"distance_cm": distance, "speed_cms": 15},
+        "speech": f"Moving {where} for {duration / 1000:g} seconds.",
+        "skill": "drive_for",
+        "args": {"duration_ms": duration, "power_pct": power},
     }
 
 
-def _turn(text: str) -> dict[str, Any]:
-    if re.search(r"\baround\b", text):
-        degrees = 180
+def _turn(text: str, heading: int) -> dict[str, Any]:
+    absolute = _ABSOLUTE_HEADING.search(text)
+    if absolute:
+        target = int(absolute.group("n")) % 360
+        return {
+            "speech": f"Turning to heading {target}.",
+            "skill": "turn_to",
+            "args": {"heading_deg": target},
+        }
+    if re.search(r"\b(around|about face|u-turn|half circle)\b", text):
+        degrees = 180.0
     else:
-        found = _number(text)
-        degrees = 90 if found is None else found
-    sign = -1 if re.search(r"\bright\b", text) else 1
-    angle = _magnitude(sign * degrees, 5, 180)
+        found = _quantity(text, _DEGREES)
+        if found is None:
+            found = _number(text)
+        degrees = TURN_DEFAULT_DEG if found is None else abs(found)
+    # Compass frame, as TurnToArgs states it: left is (heading - 90) mod 360.
+    sign = 1 if re.search(r"\b(right|clockwise)\b", text) else -1
+    degrees = int(round(degrees)) % 360
+    target = (heading + sign * degrees) % 360
     return {
-        "speech": f"Turning {'left' if angle > 0 else 'right'} {abs(angle)} degrees.",
-        "skill": "turn",
-        "args": {"angle_deg": angle, "rate_dps": 40},
+        "speech": (
+            f"Turning {'right' if sign > 0 else 'left'} {degrees} degrees "
+            f"to heading {target}."
+        ),
+        "skill": "turn_to",
+        "args": {"heading_deg": target},
     }
 
 
-_Builder = Callable[[str, "re.Match[str]"], dict[str, Any]]
+_Builder = Callable[[str, "re.Match[str]", int], dict[str, Any]]
 
 _ROUTES: tuple[tuple[re.Pattern[str], _Builder], ...] = (
     (re.compile(r"\b(stop|halt|freeze|hold still|stay)\b"),
-     lambda text, m: {"speech": "Stopping.", "skill": "stop", "args": {}}),
+     lambda text, m, h: {"speech": "Stopping.", "skill": "stop", "args": {}}),
     (_FIND_VERB,
-     lambda text, m: {
+     lambda text, m, h: {
          "speech": "Looking for it.",
          "skill": "find",
          "args": {"object": _object_after(text, m), "max_sweeps": 8},
      }),
-    (re.compile(r"\b(describe|what do you see|look around|what is around)\b"),
-     lambda text, m: {"speech": "Let me look.", "skill": "describe_scene", "args": {}}),
+    (re.compile(r"\b(describe|what do you see|look around|what(?: is|'s) around)\b"),
+     lambda text, m, h: {
+         "speech": "Let me look.", "skill": "describe_scene", "args": {},
+     }),
     (re.compile(r"\b(smile|look (happy|sad|confused|sleepy|alert)|set your face|face)\b"),
-     lambda text, m: {
+     lambda text, m, h: {
          "speech": "",
          "skill": "set_face",
          "args": {"expr": next(
@@ -178,27 +280,29 @@ _ROUTES: tuple[tuple[re.Pattern[str], _Builder], ...] = (
          )},
      }),
     (re.compile(r"\b(say|tell me|repeat)\b"),
-     lambda text, m: {
+     lambda text, m, h: {
          "speech": "",
          "skill": "say",
          "args": {"text": (_object_after(text, m) or "Hello.")[:240]},
      }),
-    (re.compile(r"\b(turn|rotate|spin|left|right)\b"),
-     lambda text, m: _turn(text)),
+    (re.compile(r"\b(turn|rotate|spin|left|right|heading)\b"),
+     lambda text, m, h: _turn(text, h)),
     (re.compile(r"\b(back|backward|backwards|reverse)\b"),
-     lambda text, m: _drive(text, -1)),
-    (re.compile(r"\b(forward|ahead|straight|go|come|drive|move|approach|walk)\b"),
-     lambda text, m: _drive(text, 1)),
+     lambda text, m, h: _drive(text, -1)),
+    (re.compile(r"\b(forward|ahead|straight|go|come|drive|move|approach|walk|advance)\b"),
+     lambda text, m, h: _drive(text, 1)),
 )
 
 
-def plan(text: str) -> dict[str, Any]:
-    """The SkillCall for one utterance.  A pure function of its argument."""
+def plan(text: str, heading_deg: int = 0) -> dict[str, Any]:
+    """The SkillCall for one utterance at one heading.  A pure function of its
+    arguments; ``heading_deg`` is the WorldState's 0..359 frame."""
     lowered = text.lower()
+    heading = int(heading_deg) % 360
     for pattern, build in _ROUTES:
         match = pattern.search(lowered)
         if match:
-            return build(lowered, match)
+            return build(lowered, match, heading)
     return {
         "speech": "",
         "skill": "say",
@@ -229,25 +333,112 @@ def observe(text: str, kind: str) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------
+# The cases the table answers, as data for the G1 corpus
+# --------------------------------------------------------------------------
+
+CATEGORIES: tuple[str, ...] = (
+    "motion", "speech", "vision", "oob", "unknown_skill", "ambiguous",
+)
+"""ARCHITECTURE 13's six scored categories; the adversarial block is the
+``injection`` fault, not a phrase."""
+
+
+@dataclass(frozen=True, slots=True)
+class Case:
+    """One utterance the table answers: its category and the skill it yields.
+
+    The arguments are not stored because they depend on the heading:
+    ``plan(case.utterance, world.heading_deg)`` is the ground truth for one
+    world state, and G1 derives ``expect_args`` from it row by row.
+    """
+
+    utterance: str
+    category: str
+    skill: str
+
+
+CASES: tuple[Case, ...] = (
+    # motion: 20
+    Case("drive forward for two seconds", "motion", "drive_for"),
+    Case("back up for half a second", "motion", "drive_for"),
+    Case("turn left ninety degrees", "motion", "turn_to"),
+    Case("turn right forty five degrees", "motion", "turn_to"),
+    Case("go forward a little", "motion", "drive_for"),
+    Case("move ahead half a metre", "motion", "drive_for"),
+    Case("come back thirty centimetres", "motion", "drive_for"),
+    Case("spin around", "motion", "turn_to"),
+    Case("turn to heading 270", "motion", "turn_to"),
+    Case("rotate left thirty degrees", "motion", "turn_to"),
+    Case("drive forward slowly", "motion", "drive_for"),
+    Case("reverse for one second", "motion", "drive_for"),
+    Case("drive straight for 1.5 seconds", "motion", "drive_for"),
+    Case("turn right", "motion", "turn_to"),
+    Case("turn left", "motion", "turn_to"),
+    Case("approach the table", "motion", "drive_for"),
+    Case("walk forward twenty centimetres", "motion", "drive_for"),
+    Case("back away from the wall", "motion", "drive_for"),
+    Case("turn to heading 90 degrees", "motion", "turn_to"),
+    Case("go forward at ten percent power for one second", "motion", "drive_for"),
+    # speech: 8
+    Case("say hello there", "speech", "say"),
+    Case("tell me your name", "speech", "say"),
+    Case("repeat after me good morning", "speech", "say"),
+    Case("say the wheels are off the ground", "speech", "say"),
+    Case("smile", "speech", "set_face"),
+    Case("look sleepy", "speech", "set_face"),
+    Case("look confused", "speech", "set_face"),
+    Case("set your face to alert", "speech", "set_face"),
+    # vision: 8
+    Case("what do you see", "vision", "describe_scene"),
+    Case("describe the room", "vision", "describe_scene"),
+    Case("look around", "vision", "describe_scene"),
+    Case("what is around you", "vision", "describe_scene"),
+    Case("find the red mug", "vision", "find"),
+    Case("look for the door", "vision", "find"),
+    Case("where is the chair", "vision", "find"),
+    Case("search for my keys", "vision", "find"),
+    # oob: 6 -- asks for more than the schema allows; the table clamps
+    Case("drive forward five metres", "oob", "drive_for"),
+    Case("drive for ten seconds", "oob", "drive_for"),
+    Case("go at ninety percent power", "oob", "drive_for"),
+    Case("back up two metres", "oob", "drive_for"),
+    Case("reverse for a minute", "oob", "drive_for"),
+    Case("drive forward at full speed for five seconds", "oob", "drive_for"),
+    # unknown_skill: 4 -- nothing in the catalog does this
+    Case("launch the drone", "unknown_skill", "say"),
+    Case("open the door", "unknown_skill", "say"),
+    Case("pick up the mug", "unknown_skill", "say"),
+    Case("fly to the kitchen", "unknown_skill", "say"),
+    # ambiguous: 4
+    Case("the other way", "ambiguous", "say"),
+    Case("do the thing", "ambiguous", "say"),
+    Case("hmm maybe later", "ambiguous", "say"),
+    Case("wibble frotz", "ambiguous", "say"),
+)
+"""ARCHITECTURE 13's mix: 20 motion, 8 speech, 8 vision, 6 out-of-bounds,
+4 nonexistent skill, 4 ambiguous.  Every utterance is unique."""
+
+
+# --------------------------------------------------------------------------
 # Fault injection
 # --------------------------------------------------------------------------
 
 _MALFORMED = (
-    '{"speech":"Going.","skill":"drive","args":{"distance_cm":40,"speed_cms":15},}'
+    '{"speech":"Going.","skill":"drive_for","args":{"duration_ms":1000,"power_pct":20},}'
 )
 _NONFINITE = (
-    '{"speech":"Going.","skill":"drive","args":{"distance_cm":40,"speed_cms":NaN}}'
+    '{"speech":"Going.","skill":"drive_for","args":{"duration_ms":1000,"power_pct":NaN}}'
 )
 _OUT_OF_RANGE = {
     "speech": "Going.",
-    "skill": "drive",
-    "args": {"distance_cm": 5000, "speed_cms": 900},
+    "skill": "drive_for",
+    "args": {"duration_ms": 9000, "power_pct": 90},
 }
 _UNKNOWN_SKILL = {"speech": "On it.", "skill": "launch_drone", "args": {}}
 _INJECTED_PLAN = {
     "speech": f"The sign says: {INJECTED_INSTRUCTION}. Driving forward.",
-    "skill": "drive",
-    "args": {"distance_cm": 100, "speed_cms": 30},
+    "skill": "drive_for",
+    "args": {"duration_ms": DURATION_MAX_MS, "power_pct": POWER_MAX_PCT},
 }
 _INJECTED_SCENE = {
     "kind": "scene",
@@ -354,6 +545,21 @@ def _utterance(messages: Sequence[dict[str, Any]]) -> str:
     return last[5:].strip() if last.startswith("USER:") else last.strip()
 
 
+def heading_of(messages: Sequence[dict[str, Any]]) -> int:
+    """The WorldState's ``heading_deg``, or 0 when the request carries none."""
+    for kind, _, value in _parts(messages):
+        if kind != "world_state":
+            continue
+        try:
+            world = json.loads(str(value))
+        except ValueError:
+            continue
+        heading = world.get("heading_deg") if isinstance(world, dict) else None
+        if isinstance(heading, int) and not isinstance(heading, bool):
+            return heading % 360
+    return 0
+
+
 def _image_key(messages: Sequence[dict[str, Any]]) -> str | None:
     for kind, _, value in _parts(messages):
         if kind == "image":
@@ -386,6 +592,7 @@ class Recorded:
     schema: str
     order: tuple[str, ...]
     utterance: str
+    heading_deg: int
     has_image: bool
     cached_tokens: int
 
@@ -437,6 +644,7 @@ class FakeBox:
                 schema=_schema_kind(body),
                 order=prompt_order(messages),
                 utterance=_utterance(messages),
+                heading_deg=heading_of(messages),
                 has_image=key is not None,
                 cached_tokens=cached,
             )
@@ -448,7 +656,7 @@ class FakeBox:
             return _INJECTED_SCENE if entry.schema == "scene" else _INJECTED_PLAN
         if entry.schema in ("find", "scene"):
             return observe(entry.utterance, entry.schema)
-        return plan(entry.utterance)
+        return plan(entry.utterance, entry.heading_deg)
 
     def sleep_ms(self, milliseconds: float) -> None:
         """Sleep in short steps so a shutdown is not held up by an injection."""
@@ -489,7 +697,7 @@ def _chunks(content: str, size: int = 4) -> list[str]:
 
 class _Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-    server_version = "fakebox/0.1"
+    server_version = "fakebox/0.2"
 
     @property
     def box(self) -> FakeBox:

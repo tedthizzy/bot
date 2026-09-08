@@ -1,0 +1,18 @@
+diff --color -ruN a/General_Driver/General_Driver.ino b/General_Driver/General_Driver.ino
+--- a/General_Driver/General_Driver.ino	2026-09-07 18:58:03
++++ b/General_Driver/General_Driver.ino	2026-09-07 18:58:03
+@@ -236,9 +236,14 @@
+ 
+   led_pwm_ctrl(0, 0);
+ 
++#if BOT_BOOT_MISSION
+   if(InfoPrint == 1){Serial.println("Application initialization settings.");}
+   createMission("boot", "these cmds run automatically at boot.");
+   missionPlay("boot", 1);
++#else
++  // bot: no boot mission. A stored speed step would move the robot at power-on.
++  if(InfoPrint == 1){Serial.println("Boot mission disabled (bot).");}
++#endif
+ }
+ 
+ 

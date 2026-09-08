@@ -1,5 +1,6 @@
-"""ARCHITECTURE 4.2, row by row: one case per rejection reason, plus the
-replay window (I-12) and the late-response race (I-11).
+"""ARCHITECTURE 4.2, row by row, with ADR-0013's catalog: one case per
+rejection reason, the power clamp, forward blocking, the replay window (I-12)
+and the late-response race (I-11).
 
 The table below is the point of the file: every ``result.reason`` robotd can
 answer has a named case that produces it, so a refusal is attributable to one
@@ -9,38 +10,25 @@ row rather than to "validation failed".
 from __future__ import annotations
 
 import math
-import sys
 from collections.abc import Callable
-from pathlib import Path
 from typing import Any
 
 import pytest
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "packages"))
-
-from rover_contracts.config import (  # noqa: E402
-    BusConfig,
-    LimitsConfig,
-    RobotConfig,
-)
-from rover_contracts.messages import (  # noqa: E402
+from rover_contracts.config import BusConfig, LimitsConfig, RobotConfig
+from rover_contracts.messages import (
     BusCap,
+    ClearMessage,
     HelloMessage,
     ResultReason,
     SkillMessage,
     Source,
     TwistMessage,
 )
-from rover_contracts.serial_codec import (  # noqa: E402
-    TOF_ERROR_MM,
-    TOF_NO_TARGET_MM,
-    Fault,
-)
-from rover_contracts.skills import goal_deadline_s  # noqa: E402
-from rover_contracts.units import deg_to_rad  # noqa: E402
-from rover_robotd.arbiter import ActiveCommand, CommandKind  # noqa: E402
-from rover_robotd.session import ClientSession  # noqa: E402
-from rover_robotd.validator import (  # noqa: E402
+from rover_contracts.skills import goal_deadline_s
+from rover_contracts.wave_proto import StopFlag
+from rover_robotd.arbiter import ActiveCommand, CommandKind
+from rover_robotd.clients import ClientSession, PeerCredentials
+from rover_robotd.validator import (
     AcceptedSkill,
     AcceptedTwist,
     Rejection,
@@ -56,9 +44,14 @@ CMD = "01J9ZC7K3QF2M8XR4V6T0YAHBD"
 CMD2 = "01J9ZC7K3QF2M8XR4V6T0YAHBE"
 
 
-def config(**bus: Any) -> RobotConfig:
-    """A default config, optionally with ``[bus]`` overrides."""
-    return RobotConfig(bus=BusConfig(**bus)) if bus else RobotConfig()
+def config(**overrides: Any) -> RobotConfig:
+    """A default config, optionally with ``bus`` / ``limits`` overrides."""
+    kwargs: dict[str, Any] = {}
+    if "bus" in overrides:
+        kwargs["bus"] = BusConfig(**overrides["bus"])
+    if "limits" in overrides:
+        kwargs["limits"] = LimitsConfig(**overrides["limits"])
+    return RobotConfig(**kwargs)
 
 
 def session(source: Source = Source.BRAIN, caps: tuple[str, ...] = ("skill",)):
@@ -74,56 +67,58 @@ def session(source: Source = Source.BRAIN, caps: tuple[str, ...] = ("skill",)):
 def context(**overrides: Any) -> ValidationContext:
     base: dict[str, Any] = {
         "now_mono_ns": NOW,
-        "telemetry_age_ms": 18.0,
-        "mcu_fault": 0,
-        "front_range_mm": 2000,
+        "feedback_age_ms": 18.0,
+        "firmware_ok": True,
+        "stop_flags": 0,
         "estop_sw": False,
         "current_turn_id": TURN,
         "active": None,
         "last_motion_start_mono_ns": None,
         "last_motion_turn_id": None,
-        "remaining_path_m": 1.5,
         "remaining_motion_s": 12.0,
     }
     base.update(overrides)
     return ValidationContext(**base)
 
 
-def sender_ttl_ms(skill: str, args: dict[str, Any]) -> int:
-    """The ``goal_ttl_ms`` brain would send for this call.
-
-    ARCHITECTURE 4.2: "brain computes ``goal_ttl_ms`` from the profile, never
-    from a constant".  A constant here is what let the clamp case certify a
-    path that rejected every real drive: with 5000 hard-coded, 5000 >= the
-    *clamped* T2 and the case passed; with the value brain actually sends --
-    derived from the speed it *requested* -- it was answered
-    ``goal_ttl_too_short``.
-    """
-    if skill == "turn":
-        seconds = goal_deadline_s(
-            deg_to_rad(args["angle_deg"]), deg_to_rad(args["rate_dps"])
-        )
-    else:
-        seconds = goal_deadline_s(args["distance_m"], args["speed_mps"])
-    return math.ceil(seconds * 1000.0)
+def drive_ttl_ms(duration_s: float) -> int:
+    """The ``goal_ttl_ms`` a sender derives from the T2 formula."""
+    return math.ceil(goal_deadline_s(duration_s) * 1000.0)
 
 
 def drive(**overrides: Any) -> SkillMessage:
-    skill = overrides.get("skill", "drive")
-    args = overrides.get("args", {"distance_m": 0.40, "speed_mps": 0.15})
+    args = overrides.get("args", {"duration_s": 1.0, "power": 0.15})
     payload: dict[str, Any] = {
         "source": "brain",
         "cmd_id": CMD,
         "seq": 42,
         "turn_id": TURN,
         "issued_mono_ns": 123,
-        "goal_ttl_ms": sender_ttl_ms(skill, args),
-        "skill": "drive",
-        "args": {"distance_m": 0.40, "speed_mps": 0.15},
+        "goal_ttl_ms": drive_ttl_ms(args["duration_s"]),
+        "skill": "drive_for",
+        "args": args,
         "obs": {"frame_id": "cam-000917", "frame_mono_ns": NOW - 100 * MS},
-        # brain sets this on every dispatch (validate.to_bus_message), and a
-        # motion skill without it is refused: an absent flag is not the same
-        # thing as section 7's deliberately-authorized null STT confidence.
+        # brain sets this on every dispatch, and a motion skill without it is
+        # refused: an absent flag is not the same thing as section 7's
+        # deliberately-authorized null STT confidence.
+        "trace": {"authorized_motion": True},
+    }
+    payload.update(overrides)
+    return SkillMessage.model_validate(payload)
+
+
+def turn(**overrides: Any) -> SkillMessage:
+    args = overrides.get("args", {"heading_deg": 90.0})
+    payload: dict[str, Any] = {
+        "source": "brain",
+        "cmd_id": CMD,
+        "seq": 42,
+        "turn_id": TURN,
+        "issued_mono_ns": 123,
+        "goal_ttl_ms": math.ceil(args.get("timeout_s", 4.0) * 1000),
+        "skill": "turn_to",
+        "args": args,
+        "obs": {"frame_id": "cam-000917", "frame_mono_ns": NOW - 100 * MS},
         "trace": {"authorized_motion": True},
     }
     payload.update(overrides)
@@ -150,7 +145,7 @@ def twist(**overrides: Any) -> TwistMessage:
         "source": "teleop",
         "cmd_id": CMD,
         "seq": 901,
-        "twist": {"linear_x_mps": 0.15, "angular_z_radps": 0.35},
+        "twist": {"lin": 0.15, "ang": 0.05},
     }
     payload.update(overrides)
     return TwistMessage.model_validate(payload)
@@ -162,55 +157,70 @@ TELEOP_BUS = {
 }
 
 
+def _reject(
+    validator: Validator,
+    message: SkillMessage,
+    *,
+    client: ClientSession | None = None,
+    ctx: ValidationContext | None = None,
+) -> Rejection:
+    verdict = validator.check_skill(message, client or session(), ctx or context())
+    assert isinstance(verdict, Rejection), f"expected a rejection, got {verdict}"
+    return verdict
+
+
+def _accept(
+    validator: Validator,
+    message: SkillMessage,
+    *,
+    client: ClientSession | None = None,
+    ctx: ValidationContext | None = None,
+) -> AcceptedSkill:
+    verdict = validator.check_skill(message, client or session(), ctx or context())
+    assert isinstance(verdict, AcceptedSkill), f"expected acceptance, got {verdict}"
+    return verdict
+
+
 # ---------------------------------------------------------------------------
 # One case per rejection reason
 # ---------------------------------------------------------------------------
 
 
+def _skill_payload(**fields: Any) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "v": 1,
+        "type": "skill",
+        "source": "brain",
+        "cmd_id": CMD,
+        "seq": 1,
+        "turn_id": TURN,
+        "issued_mono_ns": 1,
+        "goal_ttl_ms": 2000,
+        "skill": "drive_for",
+        "args": {"duration_s": 1.0, "power": 0.15},
+    }
+    payload.update(fields)
+    return payload
+
+
 def _unknown_skill(validator: Validator) -> Rejection:
-    verdict = validator.parse(
-        {
-            "v": 1,
-            "type": "skill",
-            "source": "brain",
-            "cmd_id": CMD,
-            "seq": 1,
-            "turn_id": TURN,
-            "issued_mono_ns": 1,
-            "goal_ttl_ms": 1000,
-            "skill": "fly",
-            "args": {},
-        }
-    )
+    verdict = validator.parse(_skill_payload(skill="fly", args={}))
     assert isinstance(verdict, Rejection)
     return verdict
 
 
 def _bad_args(validator: Validator) -> Rejection:
     verdict = validator.parse(
-        {
-            "v": 1,
-            "type": "skill",
-            "source": "brain",
-            "cmd_id": CMD,
-            "seq": 1,
-            "turn_id": TURN,
-            "issued_mono_ns": 1,
-            "goal_ttl_ms": 1000,
-            "skill": "drive",
-            "args": {"distance_m": 0.4, "speed_mps": 0.15, "extra": 1},
-        }
+        _skill_payload(args={"duration_s": 1.0, "power": 0.15, "extra": 1})
     )
     assert isinstance(verdict, Rejection)
     return verdict
 
 
 def _out_of_bounds(_: Validator) -> Rejection:
-    """``[limits] drive_m`` may be lowered below the catalog's 1.0 m."""
-    lowered = RobotConfig(limits=LimitsConfig(drive_m=0.25))
-    return _reject(
-        Validator(lowered), drive(args={"distance_m": 0.40, "speed_mps": 0.15})
-    )
+    """``[limits] drive_for_max_s`` may be lowered below the catalog's 2 s."""
+    lowered = Validator(config(limits={"drive_for_max_s": 0.5}))
+    return _reject(lowered, drive(args={"duration_s": 1.0, "power": 0.15}))
 
 
 def _source_not_allowed(validator: Validator) -> Rejection:
@@ -224,22 +234,24 @@ def _estop_active(validator: Validator) -> Rejection:
 
 def _stale_seq(validator: Validator) -> Rejection:
     client = session()
-    assert isinstance(
-        validator.check_skill(drive(seq=42), client, context()), AcceptedSkill
-    )
+    _accept(validator, drive(seq=42), client=client)
     return _reject(validator, drive(cmd_id=CMD2, seq=41), client=client)
 
 
-def _not_ready(validator: Validator) -> Rejection:
-    return _reject(validator, drive(), ctx=context(telemetry_age_ms=200.0))
+def _feedback_stale(validator: Validator) -> Rejection:
+    return _reject(validator, drive(), ctx=context(feedback_age_ms=200.0))
+
+
+def _unpatched_firmware(validator: Validator) -> Rejection:
+    return _reject(validator, drive(), ctx=context(firmware_ok=False))
 
 
 def _faulted(validator: Validator) -> Rejection:
-    return _reject(validator, drive(), ctx=context(mcu_fault=int(Fault.OVERCURRENT)))
+    return _reject(validator, drive(), ctx=context(stop_flags=int(StopFlag.LOWBAT)))
 
 
 def _obstacle(validator: Validator) -> Rejection:
-    return _reject(validator, drive(), ctx=context(mcu_fault=int(Fault.TOF_STOP)))
+    return _reject(validator, drive(), ctx=context(stop_flags=int(StopFlag.TOF)))
 
 
 def _obs_stale(validator: Validator) -> Rejection:
@@ -250,28 +262,21 @@ def _obs_stale(validator: Validator) -> Rejection:
 
 
 def _goal_ttl_too_short(validator: Validator) -> Rejection:
-    """drive(0.40 m, 0.15 m/s) is a 4.5 s T2; asking for 3 s is a bug the
+    """drive_for(1.0 s) has a 2.0 s deadline; asking for 1.5 s is a bug the
     sender should see, not something to silently truncate."""
-    return _reject(validator, drive(goal_ttl_ms=3000))
+    return _reject(validator, drive(goal_ttl_ms=1500))
 
 
-def _goal_ttl_too_long(validator: Validator) -> Rejection:
-    """The schema-legal drive(100 cm, 5 cm/s) at 30.5 s.
-
-    ``goal_ttl_ms`` is the schema maximum rather than the profile's 30 500 ms,
-    because the field itself is bounded at 5000: a sender that computed the
-    real T2 could not put it on the wire.  This is the row that catches one
-    that sent the maximum instead.
-    """
-    return _reject(
-        validator,
-        drive(args={"distance_m": 1.0, "speed_mps": 0.05}, goal_ttl_ms=5000),
-    )
+def _goal_ttl_too_long(_: Validator) -> Rejection:
+    """With ``goal_ttl_ms_max`` lowered to 1500 ms, a 1 s drive's 2 s deadline
+    no longer fits, whatever ``goal_ttl_ms`` the sender put on the wire."""
+    lowered = Validator(config(limits={"goal_ttl_ms_max": 1500}))
+    return _reject(lowered, drive(goal_ttl_ms=1500))
 
 
 def _duplicate_cmd(validator: Validator) -> Rejection:
     client = session()
-    assert isinstance(validator.check_skill(drive(), client, context()), AcceptedSkill)
+    _accept(validator, drive(), client=client)
     return _reject(validator, drive(seq=43), client=client)
 
 
@@ -294,8 +299,21 @@ def _rate_limited(validator: Validator) -> Rejection:
     )
 
 
+def _not_ready(validator: Validator) -> Rejection:
+    """A brain skill may not take the wheels from a web stream."""
+    active = ActiveCommand(
+        cmd_id="other",
+        kind=CommandKind.TWIST,
+        source=Source.WEB,
+        session_id="deadbeef",
+        started_mono_ns=NOW,
+        deadline_mono_ns=NOW + 10**10,
+    )
+    return _reject(validator, drive(), ctx=context(active=active))
+
+
 def _budget_exceeded(validator: Validator) -> Rejection:
-    return _reject(validator, drive(), ctx=context(remaining_path_m=0.05))
+    return _reject(validator, drive(), ctx=context(remaining_motion_s=0.5))
 
 
 REJECTIONS: list[tuple[ResultReason, Callable[[Validator], Rejection]]] = [
@@ -305,7 +323,8 @@ REJECTIONS: list[tuple[ResultReason, Callable[[Validator], Rejection]]] = [
     (ResultReason.SOURCE_NOT_ALLOWED, _source_not_allowed),
     (ResultReason.ESTOP_ACTIVE, _estop_active),
     (ResultReason.STALE_SEQ, _stale_seq),
-    (ResultReason.NOT_READY, _not_ready),
+    (ResultReason.FEEDBACK_STALE, _feedback_stale),
+    (ResultReason.UNPATCHED_FIRMWARE, _unpatched_firmware),
     (ResultReason.FAULTED, _faulted),
     (ResultReason.OBSTACLE, _obstacle),
     (ResultReason.OBS_STALE, _obs_stale),
@@ -315,22 +334,9 @@ REJECTIONS: list[tuple[ResultReason, Callable[[Validator], Rejection]]] = [
     (ResultReason.STALE_TURN, _stale_turn),
     (ResultReason.UNAUTHORIZED_UTTERANCE, _unauthorized_utterance),
     (ResultReason.RATE_LIMITED, _rate_limited),
+    (ResultReason.NOT_READY, _not_ready),
     (ResultReason.BUDGET_EXCEEDED, _budget_exceeded),
 ]
-
-
-def _reject(
-    validator: Validator,
-    message: SkillMessage,
-    *,
-    client: ClientSession | None = None,
-    ctx: ValidationContext | None = None,
-) -> Rejection:
-    verdict = validator.check_skill(
-        message, client or session(), ctx or context()
-    )
-    assert isinstance(verdict, Rejection), f"expected a rejection, got {verdict}"
-    return verdict
 
 
 @pytest.mark.parametrize(
@@ -348,9 +354,9 @@ def test_the_table_covers_every_reason_robotd_can_answer() -> None:
     """The reasons robotd never answers from the validator, and why."""
     runtime_only = {
         ResultReason.NONE,
-        ResultReason.SPEED_CLAMPED,  # a clamp is reported, never a rejection
-        ResultReason.TTL_EXPIRED,  # T2, raised by the control loop
-        ResultReason.MCU_NACK,  # the controller refused, after dispatch
+        ResultReason.POWER_CLAMPED,  # a clamp is reported on an acceptance
+        ResultReason.TTL_EXPIRED,  # the deadline, raised by the control loop
+        ResultReason.HEADING_UNAVAILABLE,  # a turn losing its heading, mid-turn
         ResultReason.BOX_LOST,  # brain owns the box link (A20)
     }
     covered = {reason for reason, _ in REJECTIONS}
@@ -358,93 +364,159 @@ def test_the_table_covers_every_reason_robotd_can_answer() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Acceptance, clamping and the cap in force
+# Acceptance, the power clamp and the deadlines
 # ---------------------------------------------------------------------------
 
 
-def test_a_legal_drive_is_accepted_with_the_effective_deadline() -> None:
-    verdict = Validator(config()).check_skill(drive(), session(), context())
-    assert isinstance(verdict, AcceptedSkill)
+def test_a_legal_drive_is_accepted_with_its_deadline_and_motion_estimate() -> None:
+    verdict = _accept(Validator(config()), drive())
     assert verdict.moves
-    assert verdict.deadline_ms == 4500  # min(goal_ttl_ms, T2)
-    assert verdict.est_path_m == pytest.approx(0.40)
-    assert verdict.speed_clamped_to_cms is None
+    assert verdict.deadline_ms == 2000  # min(goal_ttl_ms, T2 = 1.0 * 1.5 + 0.5)
+    assert verdict.est_motion_s == pytest.approx(1.0)
+    assert verdict.power_clamped_to is None
+    assert verdict.args == drive().args
 
 
-@pytest.mark.parametrize(
-    ("front_mm", "expected_cap"),
-    [
-        (2000, 0.30),
-        (TOF_NO_TARGET_MM, 0.30),
-        (1001, 0.30),
-        (1000, 0.20),
-        (400, 0.20),
-        (TOF_ERROR_MM, 0.20),
-        (None, 0.20),
-    ],
-)
-def test_the_speed_cap_unlocks_only_beyond_one_metre(
-    front_mm: int | None, expected_cap: float
-) -> None:
-    assert Validator(config()).speed_cap_mps(front_mm) == expected_cap
+def test_a_longer_goal_ttl_keeps_the_deadline_at_t2() -> None:
+    verdict = _accept(Validator(config()), drive(goal_ttl_ms=5000))
+    assert verdict.deadline_ms == 2000
 
 
-@pytest.mark.parametrize("front_mm", [400, 800])
-def test_a_speed_above_the_cap_is_clamped_and_reported(front_mm: int) -> None:
-    """ARCHITECTURE 6: above the cap in force the value is *clamped*, not
-    rejected, and reported as ``detail.speed_clamped_to_cms``.
-
-    ``front_mm=800`` is the ordinary case -- any wall between the 250 mm stop
-    zone and the 1000 mm unlock threshold, no fault -- and it is the one the
-    constant ``goal_ttl_ms`` hid: brain sends 2500 ms for this call, robotd's
-    T2 for the *clamped* 0.20 m/s is 3500 ms, and comparing the two rejected it
-    ``goal_ttl_too_short``.
-    """
-    args = {"distance_m": 0.40, "speed_mps": 0.30}
-    verdict = Validator(config()).check_skill(
-        drive(args=args, goal_ttl_ms=sender_ttl_ms("drive", args)),
-        session(),
-        context(front_range_mm=front_mm),
+@pytest.mark.parametrize("power", [0.30, 0.25, 0.21])
+def test_a_power_above_the_default_is_clamped_and_reported(power: float) -> None:
+    """ADR-0013: above ``power_default`` the value is *clamped*, not rejected,
+    and the acceptance carries ``power_clamped_to``."""
+    verdict = _accept(
+        Validator(config()), drive(args={"duration_s": 1.0, "power": power})
     )
-    assert isinstance(verdict, AcceptedSkill)
-    assert verdict.args.speed_mps == pytest.approx(0.20)
-    assert verdict.speed_clamped_to_cms == 20
-    # The deadline covers the drive the clamp created, not the one the sender
-    # asked for: 0.40 m at 0.20 m/s is 4.5 s, and publishing the sender's 2.5 s
-    # would abort a drive robotd itself made longer.
-    assert verdict.deadline_ms == 3500
+    assert verdict.args.power == pytest.approx(0.20)  # type: ignore[attr-defined]
+    assert verdict.power_clamped_to == pytest.approx(0.20)
 
 
-def test_a_clamped_drive_keeps_a_deadline_it_can_finish_inside() -> None:
-    """The other half of the same rule: a drive that needs no clamp keeps
-    4.2's ``min(goal_ttl_ms, T2)`` exactly."""
-    verdict = Validator(config()).check_skill(
-        drive(goal_ttl_ms=5000), session(), context()
+def test_a_reverse_power_clamps_with_its_sign() -> None:
+    verdict = _accept(
+        Validator(config()), drive(args={"duration_s": 1.0, "power": -0.30})
     )
-    assert isinstance(verdict, AcceptedSkill)
-    assert verdict.speed_clamped_to_cms is None
-    assert verdict.deadline_ms == 4500
+    assert verdict.args.power == pytest.approx(-0.20)  # type: ignore[attr-defined]
+    assert verdict.power_clamped_to == pytest.approx(0.20)
 
 
-def test_reverse_is_capped_at_thirty_centimetres_under_an_obstacle() -> None:
-    verdict = Validator(config()).check_skill(
-        drive(args={"distance_m": -0.50, "speed_mps": 0.20}),
-        session(),
-        context(mcu_fault=int(Fault.BUMPER)),
+def test_a_power_at_or_below_the_default_is_untouched() -> None:
+    verdict = _accept(
+        Validator(config()), drive(args={"duration_s": 1.0, "power": 0.20})
     )
-    assert isinstance(verdict, AcceptedSkill)
-    assert verdict.args.distance_m == pytest.approx(-0.30)
+    assert verdict.power_clamped_to is None
 
 
-def test_rotation_stays_legal_under_an_obstacle_bit() -> None:
-    """I-5's Pi-side half: forward is refused, rotation is not."""
-    turn = drive(
-        skill="turn", args={"angle_deg": 45.0, "rate_dps": 40.0}, goal_ttl_ms=2500
+def test_a_power_above_the_configured_maximum_is_out_of_bounds() -> None:
+    """``power_max`` may sit below the catalog's 0.30; above it is a refusal,
+    not a clamp."""
+    tight = Validator(config(limits={"power_max": 0.25, "power_default": 0.20}))
+    rejection = _reject(tight, drive(args={"duration_s": 1.0, "power": 0.28}))
+    assert rejection.reason is ResultReason.OUT_OF_BOUNDS
+    assert "power_max" in rejection.detail
+
+
+# ---------------------------------------------------------------------------
+# Stop flags: forward blocking and low battery
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("flag", [StopFlag.TOF, StopFlag.BUMPER])
+def test_forward_is_blocked_but_reverse_and_turning_pass(flag: StopFlag) -> None:
+    validator = Validator(config())
+    ctx = context(stop_flags=int(flag))
+    forward = _reject(validator, drive(), ctx=ctx)
+    assert forward.reason is ResultReason.OBSTACLE
+    reverse = _accept(
+        validator, drive(args={"duration_s": 1.0, "power": -0.15}), ctx=ctx
     )
-    verdict = Validator(config()).check_skill(
-        turn, session(), context(mcu_fault=int(Fault.TOF_STOP))
+    assert reverse.moves
+    assert isinstance(_accept(validator, turn(), ctx=ctx), AcceptedSkill)
+
+
+def test_low_battery_refuses_every_motion_including_reverse_and_turning() -> None:
+    validator = Validator(config())
+    ctx = context(stop_flags=int(StopFlag.LOWBAT | StopFlag.TOF))
+    for message in (
+        drive(),
+        drive(args={"duration_s": 1.0, "power": -0.15}),
+        turn(),
+    ):
+        assert _reject(validator, message, ctx=ctx).reason is ResultReason.FAULTED
+    stream = Validator(config(bus=TELEOP_BUS)).check_twist(
+        twist(twist={"lin": -0.1, "ang": 0.0}), session(Source.TELEOP, ("twist",)), ctx
     )
-    assert isinstance(verdict, AcceptedSkill)
+    assert isinstance(stream, Rejection)
+    assert stream.reason is ResultReason.FAULTED
+
+
+def test_the_heartbeat_and_coast_flags_block_nothing_at_dispatch() -> None:
+    """Both clear on the next speed line, which the accepted goal will send."""
+    ctx = context(stop_flags=int(StopFlag.HEARTBEAT | StopFlag.COAST))
+    assert isinstance(_accept(Validator(config()), drive(), ctx=ctx), AcceptedSkill)
+
+
+def test_low_battery_does_not_mute_a_non_motion_skill() -> None:
+    verdict = _accept(
+        Validator(config()), say(), ctx=context(stop_flags=int(StopFlag.LOWBAT))
+    )
+    assert not verdict.moves
+
+
+# ---------------------------------------------------------------------------
+# turn_to
+# ---------------------------------------------------------------------------
+
+
+def test_a_turn_is_accepted_with_its_own_timeout_as_the_deadline() -> None:
+    verdict = _accept(Validator(config()), turn(goal_ttl_ms=5000))
+    assert verdict.deadline_ms == 4000
+    assert verdict.est_motion_s == 0.0, "how long a turn takes is not known up front"
+
+
+def test_a_turn_whose_goal_ttl_is_below_its_timeout_is_too_short() -> None:
+    rejection = _reject(Validator(config()), turn(goal_ttl_ms=3000))
+    assert rejection.reason is ResultReason.GOAL_TTL_TOO_SHORT
+
+
+def test_a_turn_timeout_above_the_configured_maximum_is_out_of_bounds() -> None:
+    tight = Validator(config(limits={"turn_timeout_max_s": 2.0}))
+    rejection = _reject(tight, turn(args={"heading_deg": 90.0, "timeout_s": 3.0}))
+    assert rejection.reason is ResultReason.OUT_OF_BOUNDS
+
+
+def test_a_turn_is_refused_only_once_the_budget_is_spent() -> None:
+    validator = Validator(config())
+    assert isinstance(
+        _accept(validator, turn(), ctx=context(remaining_motion_s=0.3)), AcceptedSkill
+    )
+    rejection = _reject(validator, turn(), ctx=context(remaining_motion_s=0.0))
+    assert rejection.reason is ResultReason.BUDGET_EXCEEDED
+
+
+def test_a_drive_longer_than_the_remaining_budget_is_refused_up_front() -> None:
+    """Open loop: a drive's motion time is its duration, exactly, so a drive
+    that cannot finish inside the budget never starts."""
+    rejection = _reject(
+        Validator(config()),
+        drive(args={"duration_s": 2.0, "power": 0.15}),
+        ctx=context(remaining_motion_s=1.9),
+    )
+    assert rejection.reason is ResultReason.BUDGET_EXCEEDED
+    assert isinstance(
+        _accept(
+            Validator(config()),
+            drive(args={"duration_s": 1.0, "power": 0.15}),
+            ctx=context(remaining_motion_s=1.0),
+        ),
+        AcceptedSkill,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Non-motion skills skip the motion rows
+# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -455,67 +527,53 @@ def test_rotation_stays_legal_under_an_obstacle_bit() -> None:
 def test_a_motion_skill_without_the_flag_is_unauthorized(
     trace: dict[str, object] | None,
 ) -> None:
-    """Section 7 makes a *null STT confidence* authorized, deliberately.  It
-    says nothing about a missing flag, and treating one as authorized
-    re-enables motion with no authorizing utterance for any sender that never
-    learned to set it -- which is what I-21 asserts cannot happen."""
-    verdict = Validator(config()).check_skill(
-        drive(trace=trace), session(), context()
-    )
-    assert isinstance(verdict, Rejection)
-    assert verdict.reason is ResultReason.UNAUTHORIZED_UTTERANCE
+    rejection = _reject(Validator(config()), drive(trace=trace))
+    assert rejection.reason is ResultReason.UNAUTHORIZED_UTTERANCE
 
 
-@pytest.mark.parametrize(
-    "trace", [None, {}], ids=["no-trace", "empty-trace"]
-)
+@pytest.mark.parametrize("trace", [None, {}], ids=["no-trace", "empty-trace"])
 def test_a_non_motion_skill_needs_no_flag(trace: dict[str, object] | None) -> None:
-    """say and describe_scene must stay permitted when motion is not, so the
-    requirement is on the motion rows only."""
-    verdict = Validator(config()).check_skill(say(trace=trace), session(), context())
-    assert isinstance(verdict, AcceptedSkill)
+    assert isinstance(_accept(Validator(config()), say(trace=trace)), AcceptedSkill)
 
 
 def test_a_non_motion_skill_skips_every_motion_row() -> None:
     """say and describe_scene stay permitted when motion is not, so a stale
-    link cannot silently mute the robot."""
-    verdict = Validator(config()).check_skill(
+    link or stock firmware cannot silently mute the robot."""
+    verdict = _accept(
+        Validator(config()),
         say(),
-        session(),
-        context(telemetry_age_ms=9_000.0, mcu_fault=int(Fault.OVERCURRENT)),
+        ctx=context(
+            feedback_age_ms=None,
+            firmware_ok=False,
+            stop_flags=int(StopFlag.LOWBAT),
+            remaining_motion_s=0.0,
+        ),
     )
-    assert isinstance(verdict, AcceptedSkill)
     assert not verdict.moves
 
 
 def test_a_say_over_three_hundred_characters_does_not_parse() -> None:
     verdict = Validator(config()).parse(
-        {
-            "v": 1,
-            "type": "skill",
-            "source": "brain",
-            "cmd_id": CMD,
-            "seq": 1,
-            "turn_id": TURN,
-            "issued_mono_ns": 1,
-            "goal_ttl_ms": 1000,
-            "skill": "say",
-            "args": {"text": "x" * 301},
-        }
+        _skill_payload(skill="say", args={"text": "x" * 301}, goal_ttl_ms=1000)
     )
     assert isinstance(verdict, Rejection)
     assert verdict.reason is ResultReason.BAD_ARGS
 
 
+def test_no_feedback_at_all_is_stale_feedback() -> None:
+    rejection = _reject(Validator(config()), drive(), ctx=context(feedback_age_ms=None))
+    assert rejection.reason is ResultReason.FEEDBACK_STALE
+
+
 def test_the_cooldown_exempts_later_skills_of_the_same_instruction() -> None:
     """Without the exemption find's sweep loop is rate_limited on its second
     turn (ARCHITECTURE 4.2)."""
-    verdict = Validator(config()).check_skill(
+    verdict = _accept(
+        Validator(config()),
         drive(),
-        session(),
-        context(last_motion_start_mono_ns=NOW - 100 * MS, last_motion_turn_id=TURN),
+        ctx=context(last_motion_start_mono_ns=NOW - 100 * MS, last_motion_turn_id=TURN),
     )
-    assert isinstance(verdict, AcceptedSkill)
+    assert verdict.moves
 
 
 # ---------------------------------------------------------------------------
@@ -527,10 +585,8 @@ def test_a_repeated_cmd_id_cannot_execute_motion_twice() -> None:
     """I-12: resend an accepted skill verbatim."""
     validator = Validator(config())
     client = session()
-    first = validator.check_skill(drive(), client, context())
-    assert isinstance(first, AcceptedSkill)
-    repeat = validator.check_skill(drive(seq=99), client, context())
-    assert isinstance(repeat, Rejection)
+    _accept(validator, drive(), client=client)
+    repeat = _reject(validator, drive(seq=99), client=client)
     assert repeat.reason is ResultReason.DUPLICATE_CMD
 
 
@@ -539,29 +595,22 @@ def test_the_replay_window_holds_the_last_sixty_four_pairs() -> None:
     client = session()
     for index in range(70):
         message = drive(cmd_id=f"01J9ZC7K3QF2M8XR4V6T0Y{index:04d}", seq=index + 1)
-        assert isinstance(
-            validator.check_skill(message, client, context()), AcceptedSkill
-        )
+        _accept(validator, message, client=client)
     assert not validator.replay.seen(Source.BRAIN, "01J9ZC7K3QF2M8XR4V6T0Y0000")
     assert validator.replay.seen(Source.BRAIN, "01J9ZC7K3QF2M8XR4V6T0Y0069")
 
 
 def test_a_late_response_carrying_the_previous_turn_cannot_start_motion() -> None:
     """I-11: the box answer that lands after a stop or a new turn boundary."""
-    validator = Validator(config())
-    verdict = validator.check_skill(
-        drive(turn_id=OLD_TURN), session(), context(current_turn_id=TURN)
+    rejection = _reject(
+        Validator(config()), drive(turn_id=OLD_TURN), ctx=context(current_turn_id=TURN)
     )
-    assert isinstance(verdict, Rejection)
-    assert verdict.reason is ResultReason.STALE_TURN
+    assert rejection.reason is ResultReason.STALE_TURN
 
 
 def test_a_skill_before_any_turn_boundary_is_stale() -> None:
-    verdict = Validator(config()).check_skill(
-        drive(), session(), context(current_turn_id=None)
-    )
-    assert isinstance(verdict, Rejection)
-    assert verdict.reason is ResultReason.STALE_TURN
+    rejection = _reject(Validator(config()), drive(), ctx=context(current_turn_id=None))
+    assert rejection.reason is ResultReason.STALE_TURN
 
 
 def test_a_rejected_command_is_not_added_to_the_replay_window() -> None:
@@ -584,55 +633,61 @@ def test_a_twist_is_refused_while_allow_stream_is_empty() -> None:
 
 
 def test_a_twist_is_accepted_once_the_stream_is_opted_in() -> None:
-    verdict = Validator(config(**TELEOP_BUS)).check_twist(
+    verdict = Validator(config(bus=TELEOP_BUS)).check_twist(
         twist(), session(Source.TELEOP, ("twist",)), context()
     )
     assert isinstance(verdict, AcceptedTwist)
 
 
 def test_a_connection_bound_as_brain_may_not_send_teleop_twists() -> None:
-    """G4-b's named case: hello as brain, then source teleop."""
-    verdict = Validator(config(**TELEOP_BUS)).check_twist(
+    verdict = Validator(config(bus=TELEOP_BUS)).check_twist(
         twist(), session(Source.BRAIN, ("twist",)), context()
     )
     assert isinstance(verdict, Rejection)
     assert verdict.reason is ResultReason.SOURCE_NOT_ALLOWED
 
 
-def test_a_forward_twist_is_refused_under_an_obstacle_bit() -> None:
-    verdict = Validator(config(**TELEOP_BUS)).check_twist(
-        twist(), session(Source.TELEOP, ("twist",)), context(mcu_fault=int(Fault.CLIFF))
+def test_a_forward_twist_is_refused_under_a_forward_block() -> None:
+    verdict = Validator(config(bus=TELEOP_BUS)).check_twist(
+        twist(), session(Source.TELEOP, ("twist",)), context(stop_flags=int(StopFlag.BUMPER))
     )
     assert isinstance(verdict, Rejection)
     assert verdict.reason is ResultReason.OBSTACLE
 
 
-def test_a_reverse_twist_survives_an_obstacle_bit() -> None:
-    verdict = Validator(config(**TELEOP_BUS)).check_twist(
-        twist(twist={"linear_x_mps": -0.10, "angular_z_radps": 0.0}),
-        session(Source.TELEOP, ("twist",)),
-        context(mcu_fault=int(Fault.CLIFF)),
-    )
-    assert isinstance(verdict, AcceptedTwist)
+def test_a_reverse_or_turning_twist_survives_a_forward_block() -> None:
+    validator = Validator(config(bus=TELEOP_BUS))
+    ctx = context(stop_flags=int(StopFlag.TOF))
+    for payload in ({"lin": -0.10, "ang": 0.0}, {"lin": 0.0, "ang": 0.2}):
+        verdict = validator.check_twist(
+            twist(twist=payload), session(Source.TELEOP, ("twist",)), ctx
+        )
+        assert isinstance(verdict, AcceptedTwist), verdict
 
 
-def test_a_twist_needs_fresh_telemetry() -> None:
-    verdict = Validator(config(**TELEOP_BUS)).check_twist(
-        twist(), session(Source.TELEOP, ("twist",)), context(telemetry_age_ms=500.0)
+def test_a_twist_needs_fresh_feedback_from_the_fork() -> None:
+    validator = Validator(config(bus=TELEOP_BUS))
+    stale = validator.check_twist(
+        twist(), session(Source.TELEOP, ("twist",)), context(feedback_age_ms=500.0)
     )
-    assert isinstance(verdict, Rejection)
-    assert verdict.reason is ResultReason.NOT_READY
+    assert isinstance(stale, Rejection)
+    assert stale.reason is ResultReason.FEEDBACK_STALE
+    stock = validator.check_twist(
+        twist(), session(Source.TELEOP, ("twist",)), context(firmware_ok=False)
+    )
+    assert isinstance(stock, Rejection)
+    assert stock.reason is ResultReason.UNPATCHED_FIRMWARE
 
 
 def test_an_out_of_bounds_twist_does_not_parse() -> None:
-    verdict = Validator(config(**TELEOP_BUS)).parse(
+    verdict = Validator(config(bus=TELEOP_BUS)).parse(
         {
             "v": 1,
             "type": "twist",
             "source": "teleop",
             "cmd_id": CMD,
             "seq": 1,
-            "twist": {"linear_x_mps": 3.0, "angular_z_radps": 0.0},
+            "twist": {"lin": 0.31, "ang": 0.0},
         }
     )
     assert isinstance(verdict, Rejection)
@@ -640,33 +695,17 @@ def test_an_out_of_bounds_twist_does_not_parse() -> None:
 
 
 def test_a_non_finite_twist_does_not_parse() -> None:
-    verdict = Validator(config(**TELEOP_BUS)).parse(
+    verdict = Validator(config(bus=TELEOP_BUS)).parse(
         {
             "v": 1,
             "type": "twist",
             "source": "teleop",
             "cmd_id": CMD,
             "seq": 1,
-            "twist": {"linear_x_mps": float("nan"), "angular_z_radps": 0.0},
+            "twist": {"lin": float("nan"), "ang": 0.0},
         }
     )
     assert isinstance(verdict, Rejection)
-
-
-def test_a_lower_priority_skill_cannot_take_the_wheels_from_a_web_stream() -> None:
-    active = ActiveCommand(
-        cmd_id="other",
-        kind=CommandKind.TWIST,
-        source=Source.WEB,
-        session_id="deadbeef",
-        started_mono_ns=NOW,
-        deadline_mono_ns=NOW + 10**10,
-    )
-    verdict = Validator(config()).check_skill(
-        drive(), session(), context(active=active)
-    )
-    assert isinstance(verdict, Rejection)
-    assert verdict.reason is ResultReason.NOT_READY
 
 
 def test_a_second_motion_skill_is_refused_while_one_is_in_flight() -> None:
@@ -677,25 +716,20 @@ def test_a_second_motion_skill_is_refused_while_one_is_in_flight() -> None:
         session_id="deadbeef",
         started_mono_ns=NOW,
         deadline_mono_ns=NOW + 10**10,
-        skill="drive",
+        skill="drive_for",
     )
-    verdict = Validator(config()).check_skill(
-        drive(), session(), context(active=active)
-    )
-    assert isinstance(verdict, Rejection)
-    assert verdict.reason is ResultReason.RATE_LIMITED
+    rejection = _reject(Validator(config()), drive(), ctx=context(active=active))
+    assert rejection.reason is ResultReason.RATE_LIMITED
 
 
 # ---------------------------------------------------------------------------
-# clear (not stop-class)
+# clear (not stop-class) and the connection binding
 # ---------------------------------------------------------------------------
 
 
 def test_clear_is_refused_from_brain() -> None:
-    """G4-l: brain, whose job is acting on model output, must not be able to
-    clear a stop authority."""
-    from rover_contracts.messages import ClearMessage
-
+    """brain, whose job is acting on model output, must not be able to clear a
+    stop authority."""
     message = ClearMessage(source=Source.BRAIN, faults=["estop_sw"])
     rejection = Validator(config()).check_clear(message, session(Source.BRAIN))
     assert rejection is not None
@@ -703,15 +737,8 @@ def test_clear_is_refused_from_brain() -> None:
 
 
 def test_clear_is_accepted_from_web() -> None:
-    from rover_contracts.messages import ClearMessage
-
     message = ClearMessage(source=Source.WEB, faults=["estop_sw"])
     assert Validator(config()).check_clear(message, session(Source.WEB)) is None
-
-
-# ---------------------------------------------------------------------------
-# The connection binding itself
-# ---------------------------------------------------------------------------
 
 
 def test_a_second_hello_on_one_connection_is_refused() -> None:
@@ -724,14 +751,11 @@ def test_a_second_hello_on_one_connection_is_refused() -> None:
 
 
 def test_an_unbound_connection_may_not_command() -> None:
-    verdict = Validator(config()).check_skill(drive(), ClientSession(), context())
-    assert isinstance(verdict, Rejection)
-    assert verdict.reason is ResultReason.SOURCE_NOT_ALLOWED
+    rejection = _reject(Validator(config()), drive(), client=ClientSession())
+    assert rejection.reason is ResultReason.SOURCE_NOT_ALLOWED
 
 
 def test_a_peer_uid_that_does_not_match_the_unit_user_is_refused() -> None:
-    from rover_robotd.session import PeerCredentials
-
     client = ClientSession(peer=PeerCredentials(uid=1000, gid=1000, pid=42))
     with pytest.raises(ValueError, match="may not claim source"):
         client.bind(
@@ -740,36 +764,10 @@ def test_a_peer_uid_that_does_not_match_the_unit_user_is_refused() -> None:
         )
 
 
-def test_a_twist_is_bounded_by_the_configured_twist_limits() -> None:
-    """A35 calls twist the widest motion surface in the design, and A33 says a
-    gate reads the running value from welcome.limits.  Checking only the static
-    catalog row left both [limits] twist keys unenforced anywhere in robotd, so
-    rover-web's joystick honoured them and every other allow-listed client did
-    not."""
-    tight = RobotConfig(
-        bus=BusConfig(**TELEOP_BUS),
-        limits=LimitsConfig(twist_linear_mps=0.05, twist_angular_radps=0.20),
-    )
-    verdict = Validator(tight).check_twist(
-        twist(twist={"linear_x_mps": 0.30, "angular_z_radps": 0.0}),
-        session(Source.TELEOP, ("twist",)),
-        context(),
-    )
-    assert isinstance(verdict, Rejection)
-    assert verdict.reason is ResultReason.OUT_OF_BOUNDS
-    assert "twist_linear_mps" in verdict.detail
-
-    verdict = Validator(tight).check_twist(
-        twist(twist={"linear_x_mps": 0.0, "angular_z_radps": -1.0}),
-        session(Source.TELEOP, ("twist",)),
-        context(),
-    )
-    assert isinstance(verdict, Rejection)
-    assert "twist_angular_radps" in verdict.detail
-
-    inside = Validator(tight).check_twist(
-        twist(twist={"linear_x_mps": 0.04, "angular_z_radps": 0.1}),
-        session(Source.TELEOP, ("twist",)),
-        context(),
-    )
-    assert isinstance(inside, AcceptedTwist)
+def test_seq_is_strictly_increasing_per_connection() -> None:
+    client = session()
+    assert client.seq_ok(5)
+    client.note_seq(5)
+    assert not client.seq_ok(5)
+    assert not client.seq_ok(4)
+    assert client.seq_ok(6)

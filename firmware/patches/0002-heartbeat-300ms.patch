@@ -1,0 +1,30 @@
+diff --color -ruN a/General_Driver/movtion_module.h b/General_Driver/movtion_module.h
+--- a/General_Driver/movtion_module.h	2026-09-07 18:58:03
++++ b/General_Driver/movtion_module.h	2026-09-07 18:58:03
+@@ -402,7 +402,13 @@
+ }
+ 
+ void changeHeartBeatDelay(int inputCmd) {
+-  HEART_BEAT_DELAY = inputCmd;
++  // bot: only tighten. Values above BOT_HEARTBEAT_MS are ignored so nothing on the
++  // wire can weaken the stop. Values <= 0 are ignored too: heartBeatCtrl()
++  // compares unsigned long against this int, so a negative delay would never
++  // fire and a zero would stop the motors right after every command.
++  if (inputCmd > 0 && inputCmd <= BOT_HEARTBEAT_MS) {
++    HEART_BEAT_DELAY = inputCmd;
++  }
+ }
+ 
+ void mm_settings(byte inputMain, byte inputModule) {
+diff --color -ruN a/General_Driver/ugv_config.h b/General_Driver/ugv_config.h
+--- a/General_Driver/ugv_config.h	2026-09-07 18:58:03
++++ b/General_Driver/ugv_config.h	2026-09-07 18:58:03
+@@ -367,7 +367,7 @@
+ 
+ #define SERVO_STOP_DELAY 3
+ 
+-int HEART_BEAT_DELAY = 3000;
++int HEART_BEAT_DELAY = BOT_HEARTBEAT_MS;  // bot: 300 ms; changeHeartBeatDelay() can only lower it
+ unsigned long lastCmdRecvTime = millis();
+ 
+ 

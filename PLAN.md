@@ -78,6 +78,29 @@ Build running: contracts first, then nine components in parallel, integration to
 - [x] Commit; public repo `tedthizzy/bot`; push
 
 
+## Phase 2 — WAVE ROVER chassis (ADR-0013), Pi host first
+
+The chassis decision retired the custom controller track. `v0-pi-sim` tags the last commit of it. Sequence A: the Pi stack runs on the WAVE ROVER first; the phone becomes a second host against the same gates later.
+
+- [x] Tag `v0-pi-sim`; move Pi packages to `hosts/pi/`, ESP32-S3 track to `legacy/firmware-s3/`
+- [x] `docs/protocol.md`: the Waveshare JSON link, the fork's added fields, stop flags, banner
+- [x] `docs/adr/0013-wave-rover-open-loop.md` and the `ARCHITECTURE.md` amendment table
+- [x] Contracts rewritten: `drive_for`/`turn_to`, heading world state, `wave_proto` codec, `[link]` config
+- [ ] Firmware fork: vendored `ugv_base_general`, patches (heartbeat 300 ms, cap 0.30, radios off, boot mission off, ToF/bumper block, banner and feedback fields), compiled in the arduino-cli container
+- [x] `rover-stub`: the simulator speaking the protocol over pty and TCP, with `--stock` and fault flags (38 tests)
+- [ ] robotd reworked: link bring-up and firmware gate, 20 Hz stream from the goal loop, `drive_for`, `turn_to` on the fused yaw, budget in seconds
+- [ ] brain reworked: router, validator, prompt, world state, `find` via `turn_to`
+- [ ] devtools and web reworked: fakebox cases, wirecat, doctor, roverctl, teleop in power units
+- [ ] Contracts tests, config files, caps-match test against `bot_config.h`
+- [ ] Gates re-mapped: G2 becomes patch verification; G4 fault injection; G5 adds `turn_to` accuracy
+- [ ] `docs/verification.md`: the 24 invariants re-mapped, changed ones listed
+- [x] `docs/wiring.md`: WAVE ROVER, Pi powered from the UPS, three data wires, inline stop in the battery lead, ToF on the shared I2C bus
+- [ ] `hosts/android/`: module skeleton, generated Kotlin data classes, one instrumentation test against the stub
+- [x] Deploy scripts retargeted: `/dev/serial0`, Bluetooth off the UART, console off, preflight reads the JSON banner
+- [ ] `make test`, `make lint`, `make sim`, `make gates-full` green; commit; push
+- [ ] `[hw]` G2 on the real board: heartbeat, cap, boot state, e-stop, both wheels held
+- [ ] `[hw]` G5 `turn_to(90)` within ±10° on hardwood and carpet; `yaw_sign` recorded
+
 ## Findings that changed the plan
 
 Recorded here as they land, with the note they came from.

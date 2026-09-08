@@ -2,6 +2,21 @@
 
 Chief architect, 2026-09-07. Supersedes brief.md, spec_v1.md, spec_critique_v2.md, spec_recs_v3.md and the five position papers wherever they disagree.
 
+> **Amendment v1.1, 2026-09-07 — ADR-0013.** The chassis is a Waveshare WAVE ROVER, open loop, with the Pi 4 as host. Read `docs/adr/0013-wave-rover-open-loop.md` first; where it and this document disagree, the ADR wins. In short:
+>
+> | this document says | now |
+> | --- | --- |
+> | A2–A3 custom ESP32-S3 firmware with a freestanding C core | Waveshare `ugv_base_general` fork with safety patches, `firmware/` |
+> | A4–A5 UART5, ASCII frames with CRC-16, session, seq, arm | UART0 on `/dev/serial0` at 115200, Waveshare JSON lines, heartbeat only; `docs/protocol.md` |
+> | A6–A7 body velocity, wheel PI on encoders, robotd integrates odometry | left/right power, open loop, no odometry, no pose |
+> | A21–A25 ToF zones, relay-coil e-stop, JGB37 motors, current layers, battery ladder | firmware blocks forward under 250 mm and refuses motion under 9.9 V; inline switch between UPS and driver board; the chassis's own motors and driver |
+> | §6 `drive(distance, speed)`, `turn(angle, rate)` | `drive_for(duration_ms, power_pct)`, `turn_to(heading_deg)` closed on the fused yaw |
+> | §5.6 WorldState with `pose_cm`, `speed_cap_cms` | `heading_deg` 0..359, `power_cap_pct` |
+> | I-15 budget in metres and seconds | seconds only |
+> | §15 BOM ≈ $434 | chassis + three cells + inline switch + ToF sensor |
+>
+> Sections 4.1, 5.1 and 15 below describe the superseded controller and are kept for the legacy track in `legacy/firmware-s3/`. Everything about the bus (5.2), the model contract (5.3–5.6), the FSM (7), the timeouts, the invariants' intent (8), simulation (10), deploy (11) and gates (13) stands, re-mapped where `docs/verification.md` says so. The tag `v0-pi-sim` is the last commit of the unamended design.
+
 ## 1. Purpose and scope
 
 Build one indoor voice-and-vision rover: a Raspberry Pi 4 4 GB host, an ESP32-S3 motion controller, and an owned GPU box serving one 27B VLM behind an OpenAI-compatible endpoint. Every line of it must run and pass gates on a MacBook Air M4 in simulation — simulated MCU over a pty, fake camera, text input, fake box — before any hardware exists, then deploy to the Pi the same day through one install script. Out of scope for v1: ROS 2, Nav2, LeRobot on the robot, lidar, an arm, a phone, barge-in, any policy that servos the wheels.

@@ -1,201 +1,233 @@
-# Rover MCU firmware — ESP32-S3, ESP-IDF v5.5.5
+# Firmware: Waveshare `ugv_base_general` with safety patches
 
-`firmware/core/` is freestanding C11 and owns the protocol, the arm state
-machine, the TTL, the caps, the slew limiter, the PI controller and the fault
-classifier. `firmware/main/` — this half — owns pins, peripherals and three
-tasks, and calls the four core entry points of ARCHITECTURE 4.1 and nothing
-else. `mcu-sim` links the same core, which is why 19 of the 24 invariants go
-green on a MacBook before this code is ever flashed.
+This directory is a fork of Waveshare's `ugv_base_general` Arduino firmware for
+the WAVE ROVER's General Driver for Robots board (ESP32-WROOM-32UE), plus eight
+patches that make it safe to drive from an unattended host. The result
+announces itself as `bot-wr-1` and implements `docs/protocol.md`; the reasoning
+is `docs/adr/0013-wave-rover-open-loop.md`.
 
-| file | what it owns |
-|---|---|
-| `main/board.h` | every pin and hardware constant, one comment each |
-| `main/app_main.c` | boot-safe outputs, the core instance, the 100 Hz control task |
-| `main/motion.c` | MCPWM at 20 kHz, two OST fault inputs, PCNT quadrature |
-| `main/sensors.c` | I²C, three ToF, INA226, driver NTC, bumper and e-stop |
-| `main/vl53l4cx.c` | the distance-sensor driver (below) |
-| `main/link.c` | UART1 at 921600 and the two byte rings |
-| `main/power.c` | Pi rail, shutdown request, poweroff handshake |
+**Status: compiled, not flashed.** The build below has been run and links; it
+has not yet been written to a board, so nothing in the "on the hardware"
+sections has been observed. Treat those as the expected outcome, not a report.
 
-Anything the core compiles in is used from `firmware/core/rover_config.h` by
-its `ROVER_` name and never copied here: the `B` banner's `safety_hash` is a
-CRC-32 over seven of those constants, so a second copy would be one the Pi
-cannot check.
+Licence: GPL-3.0-or-later, like upstream (`UPSTREAM.md`, `LICENSE`). Nothing
+outside `firmware/` links against this code; the Pi talks to it over a serial
+line.
 
-## Distance sensor: a driver, not a managed component
+## Layout
 
-`main/vl53l4cx.c` is written here rather than pulled from the ESP component
-registry. The registry carries no VL53L4CX driver, and ST's full ULD is a
-multi-object-detection library an order of magnitude larger than the six
-operations this design needs: address assignment, distance mode, timing
-budget, inter-measurement period, a data-ready poll, and one distance with its
-status. The register map is the VL53L1X family map the L4CX shares for that
-subset.
+| path | what |
+| --- | --- |
+| `General_Driver/` | the sketch: upstream sources plus `bot_config.h` (every added constant) and `bot_safety.h` (stop flags, ToF, bumper, battery latch, banner) |
+| `libraries/SCServo/` | Waveshare's bus-servo library, vendored because it is not in the Library Manager |
+| `patches/` | the eight patches as unified diffs, in apply order, with `patches/README.md` |
+| `build.sh`, `Dockerfile` | reproducible compile in Docker (arduino-cli, esp32 core 2.0.17) |
+| `flash.sh` | write the images over USB with esptool on the host |
+| `UPSTREAM.md` | upstream URL, commit, date, licence, what was vendored |
+| `build/`, `.cache/` | outputs and the arduino-cli cache; both gitignored |
 
-ARCHITECTURE 4.1 already records the mode/budget pairing as `[UNVERIFIED]` for
-this part, so the driver writes short mode at `ROVER_TOF_TIMING_BUDGET_MS` and
-`ROVER_TOF_INTER_PERIOD_MS`, **reads both back, and refuses the sensor if they
-differ**. A refused sensor sets its `tof_status` bit, which raises `TOF_STALE`
-and refuses forward motion — the fail-safe direction, and the one an operator
-can recognise. The stated fallback (long mode, 33 ms) is the only other
-pairing in the table; nothing else is accepted, because a budget entry that is
-never written is a magic number nothing can check.
+## The patches
 
-Range status is mapped to the three-valued result of ARCHITECTURE 5.1 in the
-driver, not in the core: `rover_in_t` carries a distance and one status bit
-per sensor and has no `RangeStatus` field. A valid measurement is a distance,
-signal-below-threshold is `65534` (no target — a clear path, I-16), and
-everything else is `65535`.
+1. `bot_config.h`, one file for the whole envelope.
+2. Heartbeat 300 ms; `T:136` can only lower it.
+3. Wi-Fi, HTTP page and ESP-NOW compiled out; serial is the only control path.
+4. No boot mission at power-on.
+5. No encoder pins claimed (the rover has none); GPIO 27 is free for the bumper.
+6. Stop flags from a front VL53L1X, a bumper and the INA219 pack voltage.
+7. Power cap 0.30 on every path, forward block, low-battery refusal, coast flag.
+8. Feedback fields `hb st tf bp cc`, `L`/`R` in host units, `T:1006` banner.
+
+What each one changes and which safety property it serves: `patches/README.md`.
+
+## Compile-time switches (`General_Driver/bot_config.h`)
+
+| constant | default | meaning |
+| --- | --- | --- |
+| `BOT_HEARTBEAT_MS` | 300 | zero the motors after this long without a speed command |
+| `BOT_POWER_CAP` | 0.30f | cap in Waveshare units (full scale 0.5); 60 percent duty |
+| `BOT_WIFI_ENABLED`, `BOT_ESPNOW_ENABLED` | 0, 0 | radios compiled out |
+| `BOT_BOOT_MISSION` | 0 | do not replay the flash "boot" mission |
+| `BOT_ENCODERS` | 0 | do not attach GPIO 34/35/16/27 to the pulse counter |
+| `BOT_TOF_ENABLED`, `BOT_TOF_STOP_MM`, `BOT_TOF_ADDR` | 1, 250, 0x29 | VL53L1X on the OLED's I2C bus; forward blocked below 250 mm |
+| `BOT_TOF_REQUIRED` | 0 | 0: a missing or silent sensor (`tf` = -1) does not block forward, so the rover runs before the sensor arrives. **Set to 1 once the sensor is fitted**: then `tf` = -1 blocks forward and a missing sensor is never treated as clear. |
+| `BOT_BUMPER_ENABLED`, `BOT_BUMPER_PIN` | 0, 27 | INPUT_PULLUP, active low, 20 ms debounce; off until the wiring is confirmed, `bp` still reported |
+| `BOT_LOWBAT_V`, `BOT_LOWBAT_RECOVER_V` | 9.9f, 10.2f | below 9.9 V for 10 s refuses all motion until above 10.2 V for 30 s |
 
 ## Build
 
-Docker only; there is no host IDF install to keep in step. `espressif/idf:v5.5.5`
-publishes a `linux/arm64` manifest (verified: `docker manifest inspect` lists
-`arm64` beside `amd64`), so it runs natively on an M-series Mac.
+Needs Docker (arm64 or amd64) and about 2.5 GB of disk for the core, the
+toolchains and the libraries, cached in `firmware/.cache/`. No Arduino IDE.
 
 ```sh
-firmware/docker/build.sh                # release: no console anywhere (A37)
-firmware/docker/build.sh debug          # console on USB-Serial/JTAG
-firmware/docker/build.sh release clean  # discard sdkconfig and rebuild
+./firmware/build.sh
 ```
 
-Release output lands in `firmware/build/`, debug in `firmware/build-debug/`, and
-each profile owns its own `sdkconfig` inside that directory (`-DSDKCONFIG=`).
-Both halves matter: ESP-IDF writes `sdkconfig` into the *project* directory by
-default, not into `-B`, and values already in it win over `SDKCONFIG_DEFAULTS` —
-so a shared one silently ships `CONFIG_ESP_CONSOLE_NONE=n` in an image the
-operator believes is release, which is the second writer into the motor
-controller A37 and I-18 forbid. `make firmware` goes through this script for the
-same reason; a bare `idf.py build` reuses whatever the last debug build left
-behind. `firmware/sdkconfig` is gitignored.
-
-## Flash
-
-From the host, not the container: Docker Desktop on macOS has no USB
-passthrough, so the IDF container cannot see the port.
+The first run builds a small Debian image with arduino-cli 1.5.1
+(`Dockerfile`), installs `esp32:esp32@2.0.17` and the pinned libraries, and
+compiles. Later runs only compile. The exact compile the script runs is
 
 ```sh
-firmware/docker/flash.sh /dev/tty.usbmodem101          # release
-firmware/docker/flash.sh /dev/tty.usbmodem101 debug
+arduino-cli compile \
+  --fqbn esp32:esp32:esp32:PartitionScheme=huge_app,FlashMode=dio \
+  --libraries /work/libraries \
+  --build-path /work/build/arduino --output-dir /work/build \
+  --warnings default /work/General_Driver
 ```
 
-The script `cd`s into the build directory first, because IDF writes
-`flash_args` with paths relative to it, and calls `esptool` (esptool 5.x
-renamed the entry point from `esptool.py`).
+with `/work` = `firmware/`. Output in `firmware/build/`:
+`General_Driver.ino.bin`, `General_Driver.ino.bootloader.bin`,
+`General_Driver.ino.partitions.bin`, `boot_app0.bin` (copied from the core),
+plus the `.elf` and `.map`.
 
-## Monitor
+Reference build (esp32 2.0.17, huge_app, DIO):
 
-A **release build prints nothing on any interface** — that is A37 and half of
-I-18. There is no console on USB-Serial/JTAG, on the CP2102 UART0 bridge, or
-on UART1. `idf.py monitor` on a release build shows an empty screen and that
-is the correct result.
+```text
+Sketch uses 885001 bytes (28%) of program storage space. Maximum is 3145728 bytes.
+Global variables use 47760 bytes (14%) of dynamic memory, leaving 279920 bytes for local variables. Maximum is 327680 bytes.
+```
 
-To see log output, flash the debug build and open the USB-Serial/JTAG port:
+With the default 4 MB partition table (`FQBN=esp32:esp32:esp32:FlashMode=dio
+./firmware/build.sh`) the same sources give:
+
+```text
+Sketch uses 885001 bytes (67%) of program storage space. Maximum is 1310720 bytes.
+Global variables use 47760 bytes (14%) of dynamic memory, leaving 279920 bytes for local variables. Maximum is 327680 bytes.
+```
+
+For comparison, the unpatched upstream sources with the same core, libraries
+and default table compile to 992021 bytes (75%) of flash and 49756 bytes of
+RAM; the fork is 107 KB smaller because the web page and the Wi-Fi/HTTP paths
+are compiled out.
+
+Why `huge_app` and DIO: Waveshare's own GitHub build of this sketch uses the
+Huge APP table (3 MB app at 0x10000, 0xE0000 of SPIFFS/LittleFS at 0x310000)
+and the module is a 4 MB DIO part; the factory flash package uses the default
+table. The fork fits either. `build.sh` uses huge_app so that flipping
+`BOT_WIFI_ENABLED` back on (which pulls the web page and Wi-Fi stack in) cannot
+run the app slot out. Note that LittleFS lives at a different offset under the
+two tables, so anything the stock firmware stored in flash (missions,
+`wifiConfig.json`) is not visible after a table change; the fork does not
+read it anyway.
+
+Why esp32 core 2.0.17: the code uses the 2.x LEDC API (`ledcSetup`,
+`ledcAttachPin`), which 3.x removed. Waveshare documents 2.0.11; 2.0.17 is the
+last 2.x and has the same API.
+
+Library pins (`build.sh`): ArduinoJson 6.21.5 (the sketch uses the v6 API),
+INA219_WE 1.3.8 (1.4.0 renamed its enums, `BIT_MODE_9` became
+`INA219_BIT_MODE_9`, and upstream `battery_ctrl.h` uses the old names -- pinning
+keeps the vendored file untouched), Adafruit SSD1306 2.5.17, Adafruit GFX
+1.12.6, Adafruit BusIO 1.17.4, ESP32Encoder 5.0.0, PID_v2 2.0.1,
+SimpleKalmanFilter 0.2.0, Adafruit ICM20X 2.0.7, Adafruit Unified Sensor
+1.1.15, VL53L1X 1.3.1 (Pololu). SCServo comes from `libraries/`.
+
+The only warnings the build prints come from upstream `RoArm-M2_module.h`
+(`control reaches end of non-void function`) and are unchanged by the patches.
+
+## Flash from a Mac
+
+1. Build first (`firmware/build/*.bin` must exist).
+2. Power the rover off, **unplug the Pi's TX/RX from the board's UART header**
+   (or power the Pi down): the Pi header is the same UART0 as the USB bridge,
+   and the two would talk over each other. The Pi cannot reset the board; the
+   USB bridge can.
+3. Plug the board's USB-C into the Mac. The bridge is a CP2102 and appears as
+   `/dev/tty.usbserial-XXXXXXXX` (macOS has the driver built in; if nothing
+   appears, `ls /dev/tty.*` before and after plugging in tells you the name).
+4. Hold no buttons. The CP2102's DTR/RTS lines drive EN and IO0, so esptool's
+   default reset sequence enters the bootloader by itself.
 
 ```sh
-firmware/docker/build.sh debug && firmware/docker/flash.sh /dev/tty.usbmodem101 debug
-screen /dev/tty.usbmodem101 115200      # or: idf.py -B build-debug monitor
+./firmware/flash.sh /dev/tty.usbserial-XXXXXXXX
 ```
 
-A debug build advertises itself: `caps` bit 0 and `ctrl_flags` b7 are set, and
-robotd refuses to arm an MCU that reports either. Never leave one in a robot
-meant to move.
+`flash.sh` runs `uvx --from esptool esptool --chip esp32 --port <port> --baud
+460800 write_flash -z --flash_mode dio --flash_freq 80m --flash_size 4MB` with
+the bootloader at 0x1000, the partition table at 0x8000, `boot_app0.bin` at
+0xE000 and the application at 0x10000 -- the offsets Waveshare's factory tool
+uses. `BAUD=921600` also works on this board. esptool identifies the chip
+(`Chip is ESP32-D0WD...`), prints one `Hash of data verified.` per image (four)
+and `Hard resetting via RTS pin...`, and the board reboots into the new
+firmware.
 
-## Verifying the boot banner by hand
+### What a successful boot looks like
 
-The banner is a `B` protocol frame on UART1, not console text. It repeats at
-1 Hz until the first valid `H`, so there is no race to catch it.
+The OLED (128x32, four lines) ends up showing:
 
-On the Pi, after deploy step 8's `dtoverlay=uart5` and step 9's udev rule:
+```text
+WAVE ROVER bot-wr-1
+radio off ToF:none        <- "ToF:ok" once the VL53L1X answers at 0x29
+MAC:XX:XX:XX:XX:XX:XX
+UGV started               <- becomes "V:12.34" (pack volts) after ten seconds
+```
+
+Stock shows `AP:UGV` / `ST: OFF` on the first two lines instead; if you see
+those, the stock firmware is still running.
+
+On the serial line at 115200 the boot prints the stock text lines
+(`Initialize LittleFS...`, `WiFi off (bot).`, `ToF VL53L1X: not found, tf =
+-1.`, `Boot mission disabled (bot).`, the MAC) and then, as the last line of
+`setup()`, the banner:
+
+```json
+{"T":1006,"fw":"bot-wr-1","hb_ms":300,"cap":0.3,"proto":1}
+```
+
+## Verify by hand with a serial terminal
+
+Wheels off the ground. Battery pack switched on (see the note below about USB
+only). Each command is one JSON object followed by a newline; `pyserial-miniterm`
+sends CR LF on Enter, which the firmware accepts.
 
 ```sh
-python -m rover_devtools.wirecat /dev/rover-mcu
+uvx --from pyserial pyserial-miniterm /dev/tty.usbserial-XXXXXXXX 115200
 ```
 
-Or from any machine with the adapter wired to UART1 (GPIO47 TX, GPIO48 RX):
+1. `{"T":143,"cmd":0}` -- stop echoing commands. `{"T":605,"cmd":0}` -- stop
+   the debug prints. (Stock echoes every accepted command; you will see each
+   line you type come back once until echo is off.)
+2. `{"T":1007}` -- the banner comes back:
+   `{"T":1006,"fw":"bot-wr-1","hb_ms":300,"cap":0.3,"proto":1}`.
+   Stock firmware prints nothing.
+3. `{"T":131,"cmd":1}` then `{"T":142,"cmd":200}` -- feedback at 5 Hz (the host
+   uses 50 for 20 Hz). Lines look like
+   `{"T":1001,"L":0,"R":0,"r":...,"p":...,"y":...,"temp":...,"v":11.9,"hb":0,"st":1,"tf":-1,"bp":0,"cc":0}`.
+   `hb` is 0 and `st` is 1 because no speed command has arrived since boot.
+   `tf` is -1 until a VL53L1X is fitted.
+4. `{"T":1,"L":0.9,"R":0.9}` -- the wheels turn forward at 60 percent duty and
+   the next feedback line shows `"L":0.3,"R":0.3,"hb":1,"st":0` with `cc`
+   up by 2 (both sides were clamped). The requested 0.9 never reaches the
+   motors.
+5. Stop typing. Within 300 ms the wheels stop and feedback shows
+   `"L":0,"R":0,"hb":0,"st":1`. At 5 Hz you see this on the second line after
+   your command at the latest.
+6. `{"T":136,"cmd":3000}` then `{"T":1,"L":0.1,"R":0.1}` and stop: the wheels
+   still stop within 300 ms -- the longer heartbeat was ignored.
+   `{"T":136,"cmd":100}` is accepted and stops them within 100 ms.
+7. `{"T":11,"L":255,"R":255}` -- raw PWM is capped too: `L` and `R` read 0.3.
+8. `{"T":1,"L":0.2,"R":0.2}` then `{"T":115}` -- coast: the motors freewheel
+   and `st` shows 16 until the next `T:1`.
+9. Hold a hand 10 cm in front of the VL53L1X, if fitted: `tf` drops below 250,
+   `st` shows 2, a forward `T:1` is applied as `L:0,R:0`, and
+   `{"T":1,"L":-0.2,"R":-0.2}` (reverse) or `{"T":1,"L":0.2,"R":-0.2}`
+   (rotation) still moves.
 
-```sh
-python3 - <<'EOF'
-import serial
-port = serial.Serial('/dev/tty.usbserial-XXXX', 921600, timeout=2)
-while True:
-    line = port.readline().decode('ascii', 'replace').strip()
-    if line.startswith('$B'):
-        print(line)
-        break
-EOF
-```
+Note on USB-only power: with the pack switched off the INA219 reads about 0 V,
+so ten seconds after boot `st` gains bit 8 and every speed command is applied
+as `L:0,R:0` (`cc` still counts the clamps). That is the low-battery refusal
+doing its job, not a fault; switch the pack on for steps 4 to 9. The motors
+have no power without the pack anyway.
 
-A release build on this board prints, with a new random session each boot:
+## What has not been verified
 
-```
-$B,2,1,<session>,256,2,000A,1,3381018647*XXXX
-```
-
-Check, in order:
-
-1. **`caps` = `000A`** — bit 1 cliff sensor, bit 3 INA226. Bit 0 clear is the
-   release check: `000B` means a debug build with a live console, and I-18
-   fails.
-2. **`safety_hash` = `3381018647`**, the CRC-32 of `250,600,500,20,30,50,80`.
-   `deploy/preflight.sh` asserts this against the `[safety]` mirror keys in
-   `config/robot.toml` and prints both constant sets on mismatch. A difference
-   means the firmware and the config disagree about the stop distance.
-3. **`reset_reason`** — 1 is a power-on reset. A `T` frame's `fault` word
-   carrying `0x20000` says the last boot was a Task-WDT panic (I-20) and
-   `0x40000` says a brownout.
-4. **`ctrl_flags` b7 clear** in the `T` frames that follow, which is the same
-   release check read from the running telemetry rather than the banner.
-
-`T` streams at 50 Hz from boot whether or not an `H` has arrived, so a
-`wirecat` on a freshly powered MCU should show telemetry immediately. If it
-shows nothing, the UART pins or the ground are wrong; if it shows `B` and no
-`T`, the control task never started.
-
-## Verifying the arm handshake by hand
-
-Wheels off the ground. The MCU boots DISARMED and stays there until it sees
-`H` then `A` in its own session (I-3), so this is the shortest sequence that
-proves the link is alive in both directions.
-
-Read one `T`, take its `SESS` and `ack_seq`, then send — seq strictly
-increasing, one counter for the whole direction, CRC-16/CCITT-FALSE over the
-body between `$` and `*`:
-
-```
-$H,2,<ack_seq+1>,0,3735928559*....     hello, wildcard session
-$A,2,<ack_seq+2>,<SESS>,90210*....     arm, nonce 90210
-$V,2,<ack_seq+3>,<SESS>,100,0,300,0*.. 100 mm/s forward, TTL 300 ms
-```
-
-`rover_devtools.wirecat` builds and CRCs these for you; by hand, the CRC is
-the same function as `rover_contracts.serial_codec.crc16_ccitt_false`.
-
-Expect:
-
-- `$K` acking the `A` with `result` 0 and `echo` 90210 — the nonce echo is
-  what makes a duplicate `A` detectable.
-- `$E` event 1 `ARM_OK`.
-- `T.state` moving 1 DISARMED → 2 ARMED_IDLE, then 3 ARMED_MOVING while `V`
-  keeps arriving, with `v_cmd_mm_s` ramping toward 100 at the compiled slew
-  rate rather than jumping.
-- `MOTOR_EN` (GPIO12) going high on that first `A` **and staying high**. It
-  must not follow arm state: G3a asserts fewer than ten relay actuations per
-  hour, because cycling a 30 A relay into 1000 µF every disarm welds the one
-  contact the e-stop depends on opening.
-- Stopping the `V` stream: `v_cmd_mm_s` back to 0 within the 300 ms TTL, the
-  driver inputs both **high** (MDD3A brake — PWM zero is not the terminal
-  state I-1 asks for), `fault` bit `0x1` `TTL` set, and `ctrl_flags` b0 clear.
-  Resume the stream and `TTL` clears on the next valid `V`.
-
-If `A` is refused, `K.reason` says why: 9 `estop_asserted` (the mushroom is
-pressed, or the divider on GPIO11 is not reading node A), 12 `undervoltage`,
-15 `sensors_stale` (a ToF failed its read-back or the I²C bus is dead), 16
-`arm_denied_moving`.
-
-## What this half deliberately does not do
-
-No goal is held here, no trajectory is integrated, no frame raises a cap, and
-no host timestamp is ever compared against `esp_timer_get_time()` — `P`'s
-`pi_mono_us` is echoed in `O` as an opaque token and is never read as a time
-(I-17). Those rules live in the core; this file set gives it pins.
+- The firmware has been compiled (sizes above) but not flashed; none of the
+  OLED, serial or motor behaviour above has been observed on a board.
+- VL53L1X behaviour on this bus (shared with the OLED, INA219 and IMU at the
+  stock 100 kHz) and the range-status mapping in `bot_safety.h` are untested on
+  hardware. `BOT_TOF_REQUIRED` stays 0 until they are.
+- The `/dev/tty.usbserial-*` name is the CP2102's usual one on macOS 12 and
+  later; check with `ls /dev/tty.*`.
+- `tests/unit/test_caps_match.py` (mentioned in `packages/rover_contracts/skills.py`)
+  did not exist when this was written; `bot_config.h` keeps every define on one
+  line with a plain literal so a regex test can read `BOT_POWER_CAP` and
+  `BOT_HEARTBEAT_MS`.

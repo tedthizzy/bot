@@ -21,7 +21,7 @@ from typing import Any, Final, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from rover_contracts.serial_codec import SAFETY_HASH_KEYS, safety_hash
+from rover_contracts.wave_proto import POWER_CAP
 
 __all__ = [
     "AudioConfig",
@@ -33,11 +33,11 @@ __all__ = [
     "ConfigError",
     "ENV_PREFIX",
     "LimitsConfig",
+    "LinkConfig",
     "LogConfig",
     "RobotConfig",
     "RobotIdentity",
     "SafetyConfig",
-    "SerialConfig",
     "SttConfig",
     "TtsConfig",
     "VadConfig",
@@ -52,36 +52,26 @@ ENV_PREFIX: Final = "ROVER__"
 _SECRET_SUFFIXES: Final = ("_key", "_token", "_secret")
 
 CEILINGS: Final[Mapping[str, float]] = {
-    # [limits] -- the compiled ceiling for every key (A33).
-    "limits.drive_m": 1.0,
-    "limits.speed_mps": 0.30,
-    "limits.speed_default_mps": 0.20,
-    "limits.turn_deg": 180.0,
-    "limits.rate_dps": 60.0,
-    "limits.accel_mps2": 0.5,
-    "limits.alpha_radps2": 1.0,
-    "limits.frame_ttl_ms": 500,
+    # [limits] -- the compiled ceiling for every key (A33).  power_max is the
+    # firmware fork's BOT_POWER_CAP; a config above it would ask robotd to send
+    # what the controller will clamp anyway, and a clamp the host did not
+    # expect is a clamp it cannot report.
+    "limits.power_max": POWER_CAP,
+    "limits.power_default": POWER_CAP,
+    "limits.drive_for_max_s": 2.0,
+    "limits.turn_timeout_max_s": 4.0,
+    "limits.turn_tolerance_deg": 20.0,
     "limits.goal_ttl_ms_max": 5000,
-    "limits.budget_path_m": 1.5,
     "limits.budget_motion_s": 12,
     "limits.motion_cooldown_ms": 3000,
-    "limits.motion_idle_disarm_ms": 5000,
-    "limits.twist_linear_mps": 0.30,
-    "limits.twist_angular_radps": 1.047,
+    "limits.twist_power": POWER_CAP,
     "limits.twist_renew_ms": 200,
     # [safety]
     "safety.obs_max_age_ms": 5000,
-    "safety.link_alive_max_age_ms": 200,
+    "safety.heartbeat_ms": 300,
+    "safety.feedback_max_age_ms": 150,
     "safety.tof_stop_mm": 250,
-    "safety.tof_slow_mm": 600,
-    "safety.slow_zone_w_mrad_s": 500,
-    "safety.tof_timing_budget_ms": 20,
-    "safety.tof_inter_period_ms": 30,
-    "safety.tof_poll_hz": 50,
-    "safety.cliff_baseline_mm": 98,
-    "safety.cliff_delta_mm": 80,
-    "safety.obstacle_escalate_s": 30,
-    "safety.r_pack_mohm": 65,
+    "safety.low_battery_v": 9.9,
     # [stt] thresholds
     "stt.min_confidence": 0.5,
     "stt.min_chars": 2,
@@ -99,84 +89,87 @@ class _Section(BaseModel):
 
 
 class RobotIdentity(_Section):
-    """``[robot]``: geometry, and the wake-word and TTS identity."""
+    """``[robot]``: the name the wake word and the face answer to.  No geometry:
+    the rover is open loop and nothing on the host integrates wheel travel."""
 
-    wheel_radius_m: float = Field(default=0.045, gt=0.0)
-    track_m: float = Field(default=0.150, gt=0.0)
-    ticks_per_rev: int = Field(default=2200, gt=0)
     name: str = Field(default="rover", min_length=1, max_length=32)
 
 
 class LimitsConfig(_Section):
     """``[limits]``, republished verbatim as ``welcome.limits``."""
 
-    drive_m: float = Field(default=1.0, gt=0.0)
-    speed_mps: float = Field(default=0.30, gt=0.0)
-    speed_default_mps: float = Field(default=0.20, gt=0.0)
-    turn_deg: float = Field(default=180.0, gt=0.0)
-    rate_dps: float = Field(default=60.0, gt=0.0)
-    accel_mps2: float = Field(default=0.5, gt=0.0)
-    alpha_radps2: float = Field(default=1.0, gt=0.0)
-    frame_ttl_ms: int = Field(default=300, ge=50, le=500)
+    power_max: float = Field(default=0.30, gt=0.0)
+    """The most robotd will ever send, in Waveshare units (full scale 0.5).
+    Ceiling is the firmware fork's compiled cap."""
+    power_default: float = Field(default=0.20, gt=0.0)
+    """What a model call is clamped to, so the first drives on a new floor are
+    slow.  Raise it in config once G5 has measured the floor."""
+    power_min: float = Field(default=0.08, ge=0.0)
+    """Below this the motors stall on carpet; ``turn_to`` never commands less."""
+    drive_for_max_s: float = Field(default=2.0, gt=0.0)
+    turn_timeout_max_s: float = Field(default=4.0, gt=0.0)
+    turn_tolerance_deg: float = Field(default=5.0, ge=2.0)
+    turn_kp: float = Field(default=0.004, gt=0.0)
+    """Power per degree of heading error for ``turn_to``: 0.004 × 45° = 0.18."""
     goal_ttl_ms_max: int = Field(default=5000, ge=100)
-    budget_path_m: float = Field(default=1.5, gt=0.0)
     budget_motion_s: float = Field(default=12, gt=0.0)
     motion_cooldown_ms: int = Field(default=3000, ge=0)
-    motion_idle_disarm_ms: int = Field(default=5000, gt=0)
-    twist_linear_mps: float = Field(default=0.30, gt=0.0)
-    twist_angular_radps: float = Field(default=1.047, gt=0.0)
+    twist_power: float = Field(default=0.30, gt=0.0)
     twist_renew_ms: int = Field(default=200, gt=0)
 
     @model_validator(mode="after")
-    def _default_within_cap(self) -> LimitsConfig:
-        if self.speed_default_mps > self.speed_mps:
-            raise ValueError("speed_default_mps must not exceed speed_mps")
+    def _ordered(self) -> LimitsConfig:
+        if self.power_default > self.power_max:
+            raise ValueError("power_default must not exceed power_max")
+        if self.power_min >= self.power_default:
+            raise ValueError("power_min must be below power_default")
+        if self.twist_power > self.power_max:
+            raise ValueError("twist_power must not exceed power_max")
         return self
 
 
 class SafetyConfig(_Section):
     """``[safety]``, republished verbatim as ``welcome.safety``.
 
-    The seven :data:`~rover_contracts.serial_codec.SAFETY_HASH_KEYS` are
-    read-only mirrors of firmware constants: editing them changes nothing on the
-    MCU, it makes preflight's ``safety_hash`` assertion fail.
+    ``heartbeat_ms``, ``tof_stop_mm`` and ``low_battery_v`` are mirrors of
+    constants the firmware fork compiles in.  Editing them here changes nothing
+    on the controller: robotd compares ``heartbeat_ms`` with the value in the
+    boot banner and refuses to move when they disagree.
     """
 
     obs_max_age_ms: int = Field(default=5000, gt=0)
-    link_alive_max_age_ms: int = Field(default=200, gt=0)
+    heartbeat_ms: int = Field(default=300, ge=50)
+    """What the firmware zeroes the motors after.  robotd streams at
+    ``[link] command_hz`` so the controller sees several commands per period."""
+    feedback_max_age_ms: int = Field(default=150, gt=0)
+    """T0: feedback older than this is a dead link.  Zeros keep flowing, new
+    motion is refused, a goal in flight is failed."""
     tof_stop_mm: int = Field(default=250, gt=0)
-    tof_slow_mm: int = Field(default=600, gt=0)
-    slow_zone_w_mrad_s: int = Field(default=500, gt=0)
-    tof_timing_budget_ms: int = Field(default=20, gt=0)
-    tof_inter_period_ms: int = Field(default=30, gt=0)
-    tof_poll_hz: int = Field(default=50, gt=0)
-    cliff_baseline_mm: int = Field(default=98, gt=0)
-    cliff_delta_mm: int = Field(default=80, gt=0)
-    obstacle_escalate_s: int = Field(default=30, gt=0)
-    r_pack_mohm: int = Field(default=65, gt=0)
-    """Mirror of ``ROVER_R_PACK_MOHM``; what ``state.battery.oc_v`` is
-    computed from, so the bus reports the estimate A25's ladder evaluates."""
-
-    @model_validator(mode="after")
-    def _zones_ordered(self) -> SafetyConfig:
-        if self.tof_stop_mm >= self.tof_slow_mm:
-            raise ValueError("tof_stop_mm must be below tof_slow_mm")
-        return self
-
-    def safety_hash(self) -> int:
-        """CRC-32 over the seven mirror keys, to compare against ``B.safety_hash``."""
-        return safety_hash(*(getattr(self, key) for key in SAFETY_HASH_KEYS))
+    low_battery_v: float = Field(default=9.9, gt=0.0)
+    require_patched_firmware: bool = True
+    """Refuse motion unless the banner and the fork's feedback fields are seen.
+    Only a bench with stock firmware and the wheels off the floor sets this
+    false, and ``rover-stub --stock`` is how G2 proves the refusal."""
 
 
-class SerialConfig(_Section):
-    """``[serial]``.  Code names only the symlink, never ``ttyAMA4`` (A4)."""
+class LinkConfig(_Section):
+    """``[link]``: the serial line to the rover's controller.
 
-    backend: Literal["uart", "pty"] = "uart"
-    port: str = "/dev/rover-mcu"
-    baud: int = Field(default=921600, gt=0)
-    setpoint_hz: int = Field(default=20, gt=0)
-    cmd_gate_max_age_ms: int = Field(default=150, gt=0)
-    reseed_wait_ms: int = Field(default=500, gt=0)
+    On the Pi it is the GPIO UART the board's header is wired to.  In
+    simulation it is the pseudo terminal ``rover-stub --pty`` prints, or a TCP
+    port; the bytes are identical."""
+
+    backend: Literal["serial", "tcp"] = "serial"
+    port: str = "/dev/serial0"
+    baud: int = Field(default=115200, gt=0)
+    tcp_host: str = "127.0.0.1"
+    tcp_port: int = Field(default=7777, gt=0, lt=65536)
+    command_hz: int = Field(default=20, ge=5, le=50)
+    feedback_interval_ms: int = Field(default=50, ge=20)
+    yaw_sign: Literal[-1, 1] = 1
+    """+1 when the board's fused yaw increases turning left (counter-clockwise
+    from above), -1 otherwise.  Confirmed on the unit at G5 and recorded here."""
+    banner_wait_ms: int = Field(default=1500, gt=0)
     open_retry_ms: int = Field(default=500, gt=0)
 
 
@@ -359,7 +352,7 @@ class RobotConfig(_Section):
 
     robot: RobotIdentity = Field(default_factory=RobotIdentity)
     limits: LimitsConfig = Field(default_factory=LimitsConfig)
-    serial: SerialConfig = Field(default_factory=SerialConfig)
+    link: LinkConfig = Field(default_factory=LinkConfig)
     bus: BusConfig = Field(default_factory=BusConfig)
     camera: CameraConfig = Field(default_factory=CameraConfig)
     audio: AudioConfig = Field(default_factory=AudioConfig)
@@ -375,14 +368,22 @@ class RobotConfig(_Section):
 
     @model_validator(mode="after")
     def _cross_section_rules(self) -> RobotConfig:
-        if self.serial.cmd_gate_max_age_ms >= self.safety.link_alive_max_age_ms:
+        # T0 must trip before the firmware's own heartbeat does, or robotd
+        # would learn the link is dead only after the controller already
+        # stopped: the host must refuse to command what it cannot observe.
+        if self.safety.feedback_max_age_ms >= self.safety.heartbeat_ms:
             raise ValueError(
-                "cmd_gate_max_age_ms must be below link_alive_max_age_ms "
-                f"({self.serial.cmd_gate_max_age_ms} >= "
-                f"{self.safety.link_alive_max_age_ms})"
+                "feedback_max_age_ms must be below heartbeat_ms "
+                f"({self.safety.feedback_max_age_ms} >= {self.safety.heartbeat_ms})"
             )
-        if self.limits.frame_ttl_ms > self.safety.obs_max_age_ms:
-            raise ValueError("frame_ttl_ms must not exceed obs_max_age_ms")
+        # Six commands per heartbeat period at the default rates; fewer than
+        # three and one dropped line is a false stop.
+        if 1000.0 / self.link.command_hz * 3 > self.safety.heartbeat_ms:
+            raise ValueError(
+                "command_hz must give at least three commands per heartbeat_ms"
+            )
+        if self.link.feedback_interval_ms >= self.safety.feedback_max_age_ms:
+            raise ValueError("feedback_interval_ms must be below feedback_max_age_ms")
         # 5.8 calls [robot] name "the wake-word + TTS identity", and the wake
         # model is trained for exactly one name (open item 11).  Renaming the
         # robot without a matching model leaves it listening for the old name
@@ -398,9 +399,6 @@ class RobotConfig(_Section):
                 )
         return self
 
-    def safety_hash(self) -> int:
-        """``B.safety_hash`` as computed from the ``[safety]`` mirror keys."""
-        return self.safety.safety_hash()
 
 
 def _identity(text: str) -> str:

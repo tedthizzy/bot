@@ -1,4 +1,41 @@
-# Deviations from ARCHITECTURE.md
+# Deviations from the architecture
+
+Two eras. Entries under **v1.1** are against `ARCHITECTURE.md` as amended by
+ADR-0013 (WAVE ROVER). Entries under **v0** were written against the original
+ESP32-S3 design and are kept as history; the code they describe is under
+`legacy/firmware-s3/` or was rewritten.
+
+## v1.1 — WAVE ROVER
+
+- **Repo layout differs from ARCHITECTURE §12 and from the memo that proposed
+  the pivot.** Host packages live under `hosts/pi/` (the memo said `robotd/`,
+  `brain/`, `web/` at the top level) and the shared contracts keep the name
+  `rover_contracts` (the memo said `roverlib`). The simulator is
+  `rover_devtools.rover_stub` with the console script `rover-stub`, not a
+  top-level `sim/rover_stub.py`, so it sits beside `fakebox` and is importable
+  by the tests. Names inside the repo stay consistent with each other; the
+  memo's spellings are mapped here once.
+- **`power` is the Waveshare speed value, not a fraction of full scale.**
+  Full scale on the wire is 0.5, so the 0.30 cap is 60 percent PWM duty. The
+  memo's "power ≤ 0.3" and "send L 0.9, observe clamp" read most naturally
+  with power equal to the wire value, and that is what the contracts define.
+  `power_pct` in the model's integers is the same number times 100.
+- **The heartbeat stays at 300 ms on the Pi's UART**, not the memo's 500 ms.
+  500 ms was proposed for Bluetooth SPP, which the Pi host does not use; the
+  fork compiles 300 and refuses to raise it over the wire. A Bluetooth build
+  would change the compiled constant, not the protocol.
+- **The Pi is powered from the UPS's Type-C 5 V output, not the driver
+  board's header.** The research on the schematic showed the battery lead the
+  stop switch interrupts also feeds the board's 5 V buck; cutting it would drop
+  the Pi on every stop and make the stop unobservable. Three data wires replace
+  the full header connection. `docs/wiring.md` carries the fallback.
+- **The bumper input is off by default** (`BOT_BUMPER_ENABLED 0`) until the
+  header pin is confirmed on the physical board revision, and the
+  time-of-flight sensor is optional (`BOT_TOF_REQUIRED 0`) so the rover runs
+  before the sensor arrives. Both are stated in `docs/wiring.md` as things to
+  enable, with what enabling them changes.
+
+## v0 — ESP32-S3 controller (historical)
 
 Each entry: what was implemented, why it differs from the document, and what a
 reviewer should check. Append; do not rewrite other components' entries.

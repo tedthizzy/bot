@@ -33,18 +33,14 @@ from rover_brain.box import (  # noqa: E402
     OpenAITransport,
 )
 from rover_contracts.config import BoxConfig  # noqa: E402
-from rover_contracts.messages import Face  # noqa: E402
+from rover_contracts.messages import Face, SkillName  # noqa: E402
 from rover_contracts.observations import FindObservation  # noqa: E402
-from rover_contracts.skills import SKILLS  # noqa: E402
-from rover_contracts.worldstate import (  # noqa: E402
-    MotionBudget,
-    PoseCm,
-    WorldState,
-)
+from rover_contracts.skills import CATALOG, SKILLS  # noqa: E402
+from rover_contracts.worldstate import MotionBudget, WorldState  # noqa: E402
 
 DRIVE = (
-    '{"speech":"Heading over.","skill":"drive",'
-    '"args":{"distance_cm":40,"speed_cms":15}}'
+    '{"speech":"Heading over.","skill":"drive_for",'
+    '"args":{"duration_ms":1000,"power_pct":15}}'
 )
 FOUND = (
     '{"kind":"find","present":true,"center_x_permille":610,"confidence":"medium",'
@@ -53,17 +49,15 @@ FOUND = (
 IMAGE = b"\xff\xd8\xff\xdbJPEG-ish\xff\xd9"
 
 WORLD = WorldState(
-    pose_cm=PoseCm(x=142, y=-30),
     heading_deg=87,
     battery_pct=62,
     obstacle_ahead=False,
     front_range_cm=120,
-    front_at_max=False,
     bumper=False,
     moving=False,
-    speed_cap_cms=30,
-    allowed_skills=["drive", "turn", "stop", "say", "describe_scene", "find", "set_face"],
-    motion_budget_left=MotionBudget(path_cm=110, seconds=9),
+    power_cap_pct=20,
+    allowed_skills=[skill.value for skill in SkillName],
+    motion_budget_left=MotionBudget(seconds=9),
 )
 
 
@@ -141,7 +135,7 @@ async def test_the_prompt_is_built_in_a17s_order() -> None:
     parts = user_parts(payload)
     assert parts[0]["type"] == "image_url"
     assert parts[0]["image_url"]["url"].startswith("data:image/jpeg;base64,")
-    assert json.loads(parts[1]["text"])["pose_cm"] == {"x": 142, "y": -30}
+    assert json.loads(parts[1]["text"])["heading_deg"] == 87
     assert parts[2]["text"] == "USER: go to the table"
 
 
@@ -185,7 +179,7 @@ async def test_json_object_mode_asks_for_json_and_still_validates() -> None:
     box = BoxClient(BoxConfig(structured_output_mode="json_object"), transport)
     plan = await box.plan(world=WORLD, utterance="go")
     assert transport.payloads[0]["response_format"] == {"type": "json_object"}
-    assert plan.call.skill == "drive"
+    assert plan.call.skill == "drive_for"
 
 
 @pytest.mark.asyncio
@@ -237,22 +231,27 @@ async def test_a_hallucinated_skill_twice_is_a_rejection() -> None:
 
 @pytest.mark.asyncio
 async def test_out_of_range_integers_are_told_to_the_model_then_rejected() -> None:
-    line = '{"speech":"","skill":"drive","args":{"distance_cm":400,"speed_cms":15}}'
+    line = (
+        '{"speech":"","skill":"drive_for","args":{"duration_ms":4000,"power_pct":15}}'
+    )
     transport = StubTransport([line, line])
     with pytest.raises(BoxRejected) as caught:
         await client(transport).plan(world=WORLD, utterance="go far")
     assert caught.value.reason == "out_of_range"
     complaint = transport.payloads[1]["messages"][-1]["content"]
-    assert "distance_cm" in complaint
+    assert "duration_ms" in complaint
 
 
 @pytest.mark.asyncio
 async def test_a_schema_invalid_reply_is_repaired_by_the_retry() -> None:
-    bad = '{"speech":"","skill":"drive","args":{"distance_cm":40,"speed_cms":15,"x":1}}'
+    bad = (
+        '{"speech":"","skill":"drive_for",'
+        '"args":{"duration_ms":1000,"power_pct":15,"x":1}}'
+    )
     transport = StubTransport([bad, DRIVE])
     plan = await client(transport).plan(world=WORLD, utterance="go")
     assert plan.retried is True
-    assert plan.call.args.distance_cm == 40
+    assert plan.call.args.duration_ms == 1000
 
 
 @pytest.mark.asyncio
@@ -385,6 +384,40 @@ def test_the_set_face_enum_matches_the_contract() -> None:
     assert branch["properties"]["args"]["properties"]["expr"]["enum"] == [
         face.value for face in Face
     ]
+
+
+def test_the_schema_is_generated_from_the_catalog_in_order() -> None:
+    """Seven branches, one per model skill, in the catalog's order, with every
+    ``$ref`` inlined and no prose: a grammar back end sees a flat ``oneOf`` and
+    nothing to resolve, and ``make schemas`` writes exactly this object."""
+    consts = [b["properties"]["skill"]["const"] for b in SKILL_CALL_SCHEMA["oneOf"]]
+    assert consts == [s.name for s in CATALOG if s.model_args is not None]
+    assert len(consts) == 7 and set(consts) == {s.value for s in SkillName}
+    rendered = json.dumps(SKILL_CALL_SCHEMA)
+    assert "$ref" not in rendered and "$defs" not in rendered
+    assert "title" not in rendered and "description" not in rendered
+    for branch in SKILL_CALL_SCHEMA["oneOf"]:
+        model = SKILLS[branch["properties"]["skill"]["const"]].model_args
+        assert model is not None
+        expected = model.model_json_schema()
+        args = branch["properties"]["args"]
+        assert args["required"] == list(expected.get("required", []))
+        assert set(args["properties"]) == set(expected["properties"])
+
+
+def test_the_drive_and_turn_branches_carry_the_open_loop_arguments() -> None:
+    by_skill = {b["properties"]["skill"]["const"]: b for b in SKILL_CALL_SCHEMA["oneOf"]}
+    drive = by_skill["drive_for"]["properties"]["args"]["properties"]
+    assert drive == {
+        "duration_ms": {"type": "integer", "minimum": 100, "maximum": 2000},
+        "power_pct": {"type": "integer", "minimum": -30, "maximum": 30},
+    }
+    turn = by_skill["turn_to"]["properties"]["args"]["properties"]
+    assert turn == {"heading_deg": {"type": "integer", "minimum": 0, "maximum": 359}}
+    rendered = json.dumps(SKILL_CALL_SCHEMA)
+    for retired in ("drive", "turn", "distance_cm", "speed_cms", "angle_deg", "rate_dps"):
+        assert retired not in by_skill
+        assert f'"{retired}"' not in rendered
 
 
 # -- the transport releases its HTTP response -------------------------------

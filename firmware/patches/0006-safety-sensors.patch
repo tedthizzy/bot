@@ -1,0 +1,222 @@
+diff --color -ruN a/General_Driver/General_Driver.ino b/General_Driver/General_Driver.ino
+--- a/General_Driver/General_Driver.ino	2026-09-07 18:58:03
++++ b/General_Driver/General_Driver.ino	2026-09-07 18:58:03
+@@ -48,6 +48,9 @@
+ // functions for IMU ctrl.
+ #include "IMU_ctrl.h"
+ 
++// bot: stop flags, front time-of-flight, bumper, low-battery latch.
++#include "bot_safety.h"
++
+ // functions for movtion ctrl. 
+ #include "movtion_module.h"
+ 
+@@ -235,6 +238,12 @@
+   // bot: the WAVE ROVER has no encoders; GPIO 34, 35, 16 and 27 stay free.
+ #endif
+ 
++  // bot: front ToF on Wire, bumper input, battery latch.
++  bot_safetyInit();
++#if BOT_TOF_ENABLED
++  screenLine_1 += bot_tofPresent ? " ToF:ok" : " ToF:none";
++#endif
++
+   screenLine_2 = String("MAC:") + macToString(thisDevMac);
+   oled_update();
+ 
+@@ -283,6 +292,8 @@
+   oledInfoUpdate();
+ 
+   updateIMUData();
++
++  bot_safetyUpdate();  // bot: stop flags 2/4/8 from the ToF, bumper and battery
+ 
+   if (baseFeedbackFlow) {
+     baseInfoFeedback();
+diff --color -ruN a/General_Driver/bot_safety.h b/General_Driver/bot_safety.h
+--- a/General_Driver/bot_safety.h	1969-12-31 18:00:00
++++ b/General_Driver/bot_safety.h	2026-09-07 18:58:03
+@@ -0,0 +1,183 @@
++// bot_safety.h -- fork additions to ugv_base_general: the stop flags, the
++// front time-of-flight sensor, the bumper and the low-battery latch.
++//
++// Constants: bot_config.h. Wire contract: docs/protocol.md. Included from
++// General_Driver.ino after IMU_ctrl.h and before movtion_module.h, whose motor
++// chokepoint reads bot_stopFlags.
++
++#if BOT_TOF_ENABLED
++#include <VL53L1X.h>
++#endif
++
++// Stop-flag bits other than BOT_ST_HEARTBEAT, which baseInfoFeedback() mirrors
++// from heartbeatStopFlag at the moment it reports. Bits 2, 4 and 8 are set by
++// bot_safetyUpdate(); bit 16 is set by the T:115 handler and cleared by the
++// next speed command.
++uint8_t bot_stopFlags = 0;
++
++// Speed values clamped to the cap since boot: feedback field cc, wraps at 65535.
++uint16_t bot_clamp_count = 0;
++
++// Front range in millimetres: feedback field tf. -1 = no sensor or no reading.
++int bot_tof_mm = -1;
++
++// Debounced bumper state: feedback field bp.
++bool bot_bumper = false;
++
++// Low-battery latch: stop flag 8.
++bool bot_lowbatLatched = false;
++
++#if BOT_TOF_ENABLED
++VL53L1X bot_tof;
++bool bot_tofPresent = false;
++unsigned long bot_tofLastSampleMs = 0;
++unsigned long bot_tofLastPollMs = 0;
++#endif
++
++
++// --- front time-of-flight ------------------------------------------------
++
++void bot_tofInit() {
++#if BOT_TOF_ENABLED
++  bot_tof.setBus(&Wire);
++  bot_tof.setTimeout(100);
++#if BOT_TOF_ADDR != 0x29
++  // The Pololu library has no "talk to this address" setter: setAddress() writes
++  // the new address to a sensor at the current one (0x29 after power-up) and
++  // then uses it. A sensor already at BOT_TOF_ADDR just sees a NACKed write.
++  bot_tof.setAddress(BOT_TOF_ADDR);
++#endif
++  bot_tofPresent = bot_tof.init();
++  if (bot_tofPresent) {
++    bot_tof.setDistanceMode(VL53L1X::Short);
++    bot_tof.setMeasurementTimingBudget(BOT_TOF_BUDGET_US);
++    bot_tof.startContinuous(BOT_TOF_PERIOD_MS);
++    bot_tofLastSampleMs = millis();
++  }
++  if (InfoPrint == 1) {
++    Serial.println(bot_tofPresent ? "ToF VL53L1X: found." : "ToF VL53L1X: not found, tf = -1.");
++  }
++#endif
++}
++
++// Non-blocking: polls for a finished sample every BOT_TOF_POLL_MS, never waits.
++void bot_tofUpdate(unsigned long now) {
++#if BOT_TOF_ENABLED
++  if (!bot_tofPresent) {
++    bot_tof_mm = -1;
++    return;
++  }
++  if (now - bot_tofLastPollMs >= BOT_TOF_POLL_MS) {
++    bot_tofLastPollMs = now;
++    if (bot_tof.dataReady()) {
++      uint16_t mm = bot_tof.read(false);
++      bot_tofLastSampleMs = now;
++      switch (bot_tof.ranging_data.range_status) {
++      case VL53L1X::RangeValid:
++      case VL53L1X::RangeValidMinRangeClipped:
++      case VL53L1X::RangeValidNoWrapCheckFail:
++        bot_tof_mm = mm;
++        break;
++      case VL53L1X::MinRangeFail:     // a target closer than the sensor can measure
++        bot_tof_mm = 0;
++        break;
++      default:                        // weak signal, out of bounds, wrap-around, hw fault
++        bot_tof_mm = -1;
++        break;
++      }
++    }
++  }
++  if (now - bot_tofLastSampleMs > BOT_TOF_STALE_MS) {
++    bot_tof_mm = -1;                  // the sensor went silent: unplugged or bus fault
++  }
++#endif
++}
++
++
++// --- bumper --------------------------------------------------------------
++
++void bot_bumperInit() {
++#if BOT_BUMPER_ENABLED
++  pinMode(BOT_BUMPER_PIN, INPUT_PULLUP);
++#endif
++}
++
++// Active low, adopted after BOT_BUMPER_DEBOUNCE_MS of a steady reading.
++void bot_bumperUpdate(unsigned long now) {
++#if BOT_BUMPER_ENABLED
++  static bool rawLast = false;
++  static unsigned long rawSince = 0;
++  bool raw = (digitalRead(BOT_BUMPER_PIN) == LOW);
++  if (raw != rawLast) {
++    rawLast = raw;
++    rawSince = now;
++  } else if (now - rawSince >= BOT_BUMPER_DEBOUNCE_MS) {
++    bot_bumper = raw;
++  }
++#endif
++}
++
++
++// --- low battery ---------------------------------------------------------
++
++// Samples the INA219 every BOT_BATT_SAMPLE_MS (stock reads it every 10 s for
++// the OLED). Latches after BOT_LOWBAT_TRIP_MS continuously below BOT_LOWBAT_V,
++// clears after BOT_LOWBAT_RECOVER_MS continuously above BOT_LOWBAT_RECOVER_V.
++void bot_batteryUpdate(unsigned long now) {
++  static unsigned long sampleMs = 0;
++  static unsigned long sinceMs = 0;
++  static bool counting = false;
++  if (now - sampleMs < BOT_BATT_SAMPLE_MS) {
++    return;
++  }
++  sampleMs = now;
++  inaDataUpdate();
++  bool pastThreshold = bot_lowbatLatched ? (busVoltage_V > BOT_LOWBAT_RECOVER_V)
++                                         : (busVoltage_V < BOT_LOWBAT_V);
++  unsigned long hold = bot_lowbatLatched ? BOT_LOWBAT_RECOVER_MS : BOT_LOWBAT_TRIP_MS;
++  if (!pastThreshold) {
++    counting = false;
++    return;
++  }
++  if (!counting) {
++    counting = true;
++    sinceMs = now;
++    return;
++  }
++  if (now - sinceMs >= hold) {
++    bot_lowbatLatched = !bot_lowbatLatched;
++    counting = false;
++  }
++}
++
++
++// --- glue ----------------------------------------------------------------
++
++void bot_safetyInit() {
++  bot_tofInit();
++  bot_bumperInit();
++}
++
++// Called once per loop() before the feedback. Recomputes stop flags 2, 4 and 8;
++// flag 16 (coast) belongs to the command handlers and is carried over.
++void bot_safetyUpdate() {
++  unsigned long now = millis();
++  bot_tofUpdate(now);
++  bot_bumperUpdate(now);
++  bot_batteryUpdate(now);
++
++  uint8_t flags = bot_stopFlags & BOT_ST_COAST;
++#if BOT_TOF_ENABLED
++  bool tofBlocks = (bot_tof_mm >= 0) ? (bot_tof_mm < BOT_TOF_STOP_MM) : (BOT_TOF_REQUIRED != 0);
++  if (tofBlocks) {
++    flags |= BOT_ST_TOF;
++  }
++#endif
++  if (bot_bumper) {
++    flags |= BOT_ST_BUMPER;
++  }
++  if (bot_lowbatLatched) {
++    flags |= BOT_ST_LOWBAT;
++  }
++  bot_stopFlags = flags;
++}

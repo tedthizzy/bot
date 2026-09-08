@@ -1,0 +1,103 @@
+diff --color -ruN a/General_Driver/General_Driver.ino b/General_Driver/General_Driver.ino
+--- a/General_Driver/General_Driver.ino	2026-09-07 18:58:03
++++ b/General_Driver/General_Driver.ino	2026-09-07 18:58:03
+@@ -67,7 +67,9 @@
+ #include "uart_ctrl.h"
+ 
+ // functions for http & web server.
++#if BOT_WIFI_ENABLED  // bot: the web page is a second control path; compiled out
+ #include "http_server.h"
++#endif
+ 
+ 
+ void moduleType_RoArmM2() {
+@@ -190,6 +192,7 @@
+   if(InfoPrint == 1){Serial.println("Reset joint torque to ST_TORQUE_MAX.");}
+   RoArmM2_dynamicAdaptation(0, ST_TORQUE_MAX, ST_TORQUE_MAX, ST_TORQUE_MAX, ST_TORQUE_MAX);
+ 
++#if BOT_WIFI_ENABLED
+   screenLine_3 = "WiFi init";
+   oled_update();
+   if(InfoPrint == 1){Serial.println("WiFi init.");}
+@@ -199,11 +202,22 @@
+   oled_update();
+   if(InfoPrint == 1){Serial.println("http & web init.");}
+   initHttpWebServer();
++#else
++  // bot: radios compiled out (docs/protocol.md); the serial line is the only control path.
++  WiFi.mode(WIFI_OFF);
++  screenLine_0 += String(" ") + BOT_FW_TAG;
++  screenLine_1 = "radio off";
++  screenLine_3 = "WiFi off";
++  oled_update();
++  if(InfoPrint == 1){Serial.println("WiFi off (bot).");}
++#endif
+ 
++#if BOT_ESPNOW_ENABLED
+   screenLine_3 = "ESP-NOW init";
+   oled_update();
+   if(InfoPrint == 1){Serial.println("ESP-NOW init.");}
+   initEspNow();
++#endif
+ 
+   screenLine_3 = "UGV started";
+   oled_update();
+@@ -230,7 +244,9 @@
+ 
+ void loop() {
+   serialCtrl();
++#if BOT_WIFI_ENABLED
+   server.handleClient();
++#endif
+ 
+   // read and compute the info of joints.
+   switch (moduleType) {
+diff --color -ruN a/General_Driver/uart_ctrl.h b/General_Driver/uart_ctrl.h
+--- a/General_Driver/uart_ctrl.h	2026-09-07 18:58:03
++++ b/General_Driver/uart_ctrl.h	2026-09-07 18:58:03
+@@ -368,6 +368,7 @@
+ 
+ 
+ 	// esp-now settings.
++#if BOT_ESPNOW_ENABLED  // bot: ESP-NOW is compiled out; these commands are no-ops
+   case CMD_BROADCAST_FOLLOWER:
+   											changeBroadcastMode(
+   											jsonCmdReceive["mode"],
+@@ -410,7 +411,10 @@
+ 
+ 
+ 
++#endif  // BOT_ESPNOW_ENABLED
++
+ 	// wifi settings.
++#if BOT_WIFI_ENABLED  // bot: Wi-Fi is compiled out; these commands are no-ops
+ 	case CMD_WIFI_ON_BOOT: 
+ 												configWifiModeOnBoot(
+ 												jsonCmdReceive["cmd"]
+@@ -441,6 +445,7 @@
+ 												jsonCmdReceive["sta_password"]
+ 												);break;
+ 	case CMD_WIFI_STOP: 	wifiStop();break;
++#endif  // BOT_WIFI_ENABLED
+ 
+ 
+ 
+diff --color -ruN a/General_Driver/ugv_config.h b/General_Driver/ugv_config.h
+--- a/General_Driver/ugv_config.h	2026-09-07 18:58:03
++++ b/General_Driver/ugv_config.h	2026-09-07 18:58:03
+@@ -16,13 +16,13 @@
+ //             1 - flow-leader(group): sending cmds
+ //             2 - flow-leader(single): sending cmds to a single follower
+ //             3 - [default]follower: recv cmds
+-byte espNowMode = 3;
++byte espNowMode = BOT_ESPNOW_ENABLED ? 3 : 0;  // bot: none when ESP-NOW is compiled out
+ 
+ // set the broadcast ctrl mode.
+ // broadcast mac address: FF:FF:FF:FF:FF:FF.
+ // true  - [default]it can be controled by broadcast mac address.
+ // false - it won't be controled by broadcast mac address.
+-bool ctrlByBroadcast = true;
++bool ctrlByBroadcast = BOT_ESPNOW_ENABLED ? true : false;  // bot: never when compiled out
+ 
+ // you can define some whitelist mac addresses here.
+ uint8_t mac_whitelist_broadcast[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};

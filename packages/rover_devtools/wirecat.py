@@ -1,16 +1,18 @@
-"""A readable live decode of the Pi<->MCU line protocol (ARCHITECTURE 5.1).
+"""A readable live decode of the rover link (``docs/protocol.md``).
 
-Deploy step 10 is this tool: with UART5 wired and the udev rule in place but
-``rover.target`` not yet started, ``python -m rover_devtools.wirecat
-/dev/rover-mcu`` reads the ``B`` banner on the operational link and confirms the
-release ``caps`` word, the ``safety_hash`` and ``ctrl_flags`` b7 clear (I-18).
+The bench check on deploy day is this tool: with the board wired to the Pi's
+UART and ``rover.target`` stopped, ``python -m rover_devtools.wirecat
+/dev/serial0`` shows the ``T:1006`` banner and the ``T:1001`` feedback stream
+exactly as the host's decoder sees them, and says whether the banner's
+heartbeat and cap agree with the configuration robotd will refuse motion
+against.  In simulation the same tool reads ``rover-stub``'s pty path or its
+TCP port; the bytes are identical.
 
-Decoding is entirely ``rover_contracts.serial_codec``: this module renders, it
-never re-implements the grammar.  It is read-only by default -- the fd itself is
-``O_RDONLY``, because I-18 says only robotd writes the port -- and ``--ping`` is
-the one opt-in that transmits, for the diagnostic ``P``/``O`` round trip 5.1
-names wirecat as a sender of.  ``--ping`` refuses to run while something is
-listening on the robotd bus, the same guard ``roverctl arm`` carries.
+Decoding is entirely ``rover_contracts.wave_proto.decode_line``: this module
+renders and counts, it never re-implements the grammar.  It is read-only by
+default -- the fd itself is ``O_RDONLY``, because I-18 says only robotd writes
+the port -- and ``--request`` is the one opt-in that transmits: feedback on and
+a banner request, once, refused while anything is listening on the robotd bus.
 """
 
 from __future__ import annotations
@@ -23,68 +25,121 @@ import sys
 import termios
 import time
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
-from rover_contracts.serial_codec import (
-    TOF_ERROR_MM,
-    TOF_NO_TARGET_MM,
-    AckFrame,
-    AckReason,
-    AckResult,
-    ArmFrame,
-    BootFrame,
-    CapBit,
-    ClearFaultFrame,
-    CtrlFlag,
-    DecodeErr,
-    DecodeOk,
-    DecodeResult,
-    EventCode,
-    EventFrame,
-    FrameReader,
-    HelloFrame,
-    McuState,
-    PingFrame,
-    PongFrame,
-    StopFrame,
-    TelemetryFrame,
-    VelocityFrame,
-    VFlag,
-    ack_type_letter,
-    encode_frame,
-    fault_names,
+from rover_contracts.wave_proto import (
+    LINE_MAX_BYTES,
+    POWER_CAP,
+    Banner,
+    Dropped,
+    Feedback,
+    Imu,
+    StopFlag,
+    Unknown,
+    banner_request,
+    decode_line,
+    feedback_flow,
 )
 
 from rover_devtools import load_config_or_default
 
-__all__ = ["main", "open_serial", "render"]
+__all__ = [
+    "KINDS",
+    "Counters",
+    "LineSplitter",
+    "banner_verdict",
+    "kind_of",
+    "main",
+    "open_serial",
+    "open_tcp",
+    "render",
+]
+
+KINDS: tuple[str, ...] = ("feedback", "imu", "banner", "unknown", "dropped")
+"""What ``decode_line`` can return, in the names ``--only``/``--exclude`` take."""
+
+Decoded = Feedback | Imu | Banner | Unknown | Dropped
 
 
-def _socket_is_live(path: str) -> bool:
-    """True when something is accepting on ``path``.  A stale socket file with
-    no listener answers ECONNREFUSED and is not a reason to refuse."""
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    sock.settimeout(0.3)
-    try:
-        sock.connect(path)
-    except OSError:
-        return False
-    finally:
-        sock.close()
-    return True
+def kind_of(decoded: Decoded) -> str:
+    if isinstance(decoded, Feedback):
+        return "feedback"
+    if isinstance(decoded, Imu):
+        return "imu"
+    if isinstance(decoded, Banner):
+        return "banner"
+    if isinstance(decoded, Unknown):
+        return "unknown"
+    return "dropped"
 
 
-def open_serial(path: str | Path, baud: int = 921600, *, write: bool = False) -> int:
+@dataclass
+class Counters:
+    """What went past, so a corrupted link looks different from a silent one."""
+
+    feedback: int = 0
+    imu: int = 0
+    banner: int = 0
+    unknown: int = 0
+    dropped: int = 0
+    stock: int = 0
+    """Feedback lines without the fork's fields: stock firmware."""
+
+    def count(self, decoded: Decoded) -> None:
+        kind = kind_of(decoded)
+        setattr(self, kind, getattr(self, kind) + 1)
+        if isinstance(decoded, Feedback) and not decoded.patched:
+            self.stock += 1
+
+    def summary(self) -> str:
+        return (
+            f"{self.feedback} feedback ({self.stock} stock), {self.imu} imu, "
+            f"{self.banner} banner, {self.unknown} unknown, {self.dropped} dropped"
+        )
+
+
+class LineSplitter:
+    """Bytes in, ``\\n``-terminated lines out.  A line that grows past the
+    protocol's 512 bytes without a newline is handed on whole, so
+    ``decode_line`` drops it as oversize rather than the buffer growing for
+    ever; blank lines (a ``\\r\\n`` ending) are not lines."""
+
+    def __init__(self) -> None:
+        self._buf = bytearray()
+
+    def feed(self, data: bytes) -> list[bytes]:
+        self._buf += data
+        lines: list[bytes] = []
+        while True:
+            index = self._buf.find(b"\n")
+            if index < 0:
+                if len(self._buf) > LINE_MAX_BYTES:
+                    lines.append(bytes(self._buf))
+                    self._buf.clear()
+                break
+            line = bytes(self._buf[:index])
+            del self._buf[: index + 1]
+            if line.strip():
+                lines.append(line)
+        return lines
+
+
+# --------------------------------------------------------------------------
+# Sources
+# --------------------------------------------------------------------------
+
+
+def open_serial(path: str | Path, baud: int = 115200, *, write: bool = False) -> int:
     """Open a tty (or a pty slave) raw at ``baud`` and return the fd.
 
     The default is ``O_RDONLY``: I-18 says only robotd writes the port, and a
     read-only fd is what makes that structural rather than a promise in a help
-    string.  ``write=True`` is the ``--ping`` opt-in.
+    string.  ``write=True`` is the ``--request`` opt-in.
 
-    ``termios`` carries no ``B921600`` on macOS, where the only serial device
-    that matters is ``mcu_sim``'s pty and the speed is meaningless.  The speed
-    is set when the constant exists and skipped when it does not, rather than
-    refusing to run on the platform every sim gate is developed on.
+    A pty has no line speed and ``termios`` on macOS lacks some ``B<baud>``
+    constants, so the speed is set when the constant exists and skipped when it
+    does not.  A regular file opens as itself, for replaying a capture.
     """
     mode = os.O_RDWR if write else os.O_RDONLY
     fd = os.open(str(path), mode | os.O_NOCTTY | os.O_NONBLOCK)
@@ -117,243 +172,244 @@ def open_serial(path: str | Path, baud: int = 921600, *, write: bool = False) ->
     return fd
 
 
-def _bits(value: int, enum: type[CtrlFlag] | type[VFlag] | type[CapBit]) -> str:
-    names = "|".join(bit.name or "?" for bit in enum if value & bit) or "-"
-    return f"0x{value:X}[{names}]"
+def open_tcp(host: str, port: int) -> int:
+    """Connect to ``rover-stub --tcp`` (or a robotd ``[link] backend="tcp"``
+    peer) and return the socket's fd, non-blocking, so the read loop treats it
+    like the serial fd."""
+    sock = socket.create_connection((host, port), timeout=3.0)
+    sock.setblocking(False)
+    return sock.detach()
 
 
-def _fault(value: int) -> str:
-    return f"0x{value:X}[{'|'.join(fault_names(value)) or '-'}]"
+def _parse_tcp(spec: str) -> tuple[str, int]:
+    host, sep, port = spec.rpartition(":")
+    if not sep:
+        host, port = "", spec
+    return host or "127.0.0.1", int(port)
 
 
-def _range_mm(value: int) -> str:
-    if value == TOF_NO_TARGET_MM:
-        return "no_target"
-    if value == TOF_ERROR_MM:
-        return "ERROR"
-    return f"{value}mm"
-
-
-def _member(enum: type[McuState] | type[EventCode] | type[AckReason] | type[AckResult],
-            value: int) -> str:
+def _socket_is_live(path: str) -> bool:
+    """True when something is accepting on ``path``.  A stale socket file with
+    no listener answers ECONNREFUSED and is not a reason to refuse."""
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(0.3)
     try:
-        return enum(value).name
-    except ValueError:
-        return str(value)
+        sock.connect(path)
+    except OSError:
+        return False
+    finally:
+        sock.close()
+    return True
 
 
-def _body(frame: object) -> str:
-    """The type-specific half of a display line."""
-    if isinstance(frame, BootFrame):
-        version = (
-            f"{frame.fw_ver >> 16 & 0xFF}."
-            f"{frame.fw_ver >> 8 & 0xFF}.{frame.fw_ver & 0xFF}"
+# --------------------------------------------------------------------------
+# Rendering
+# --------------------------------------------------------------------------
+
+
+def _flags(flags: StopFlag | None) -> str:
+    if flags is None:
+        return "-"
+    names = "|".join(flag.name.lower() for flag in StopFlag if flags & flag)
+    return f"0x{int(flags):X}[{names or '-'}]"
+
+
+def _tof(value: int | None) -> str:
+    if value is None:
+        return "-"
+    return "none" if value < 0 else f"{value}mm"
+
+
+def _body(decoded: Decoded, raw: bytes) -> str:
+    if isinstance(decoded, Feedback):
+        base = (
+            f"L={decoded.left:+.3f} R={decoded.right:+.3f} "
+            f"yaw={decoded.yaw_deg:+.1f} roll={decoded.roll_deg:+.1f} "
+            f"pitch={decoded.pitch_deg:+.1f} temp={decoded.temp_c:.1f}C "
+            f"v={decoded.bus_v:.2f}V"
         )
+        if not decoded.patched:
+            return f"{base}  stock"
         return (
-            f"fw={version} proto={frame.proto_ver} caps={_bits(frame.caps, CapBit)} "
-            f"reset={frame.reset_reason} safety_hash={frame.safety_hash}"
+            f"{base}  hb={int(bool(decoded.hb))} st={_flags(decoded.st)} "
+            f"tf={_tof(decoded.tof_mm)} bp={int(bool(decoded.bumper))} "
+            f"cc={decoded.clamp_count}"
         )
-    if isinstance(frame, TelemetryFrame):
+    if isinstance(decoded, Banner):
         return (
-            f"{_member(McuState, frame.state)} ack={frame.ack_seq} "
-            f"flags={_bits(frame.ctrl_flags, CtrlFlag)} fault={_fault(frame.fault)} "
-            f"v={frame.v_meas_mm_s}/{frame.v_cmd_mm_s}mm/s "
-            f"w={frame.w_meas_mrad_s}/{frame.w_cmd_mrad_s}mrad/s "
-            f"ticks={frame.left_ticks},{frame.right_ticks} "
-            f"front={_range_mm(frame.tof_front_mm)} "
-            f"cliff={_range_mm(frame.tof_cliff_mm)} "
-            f"bat={frame.vbat_mv}mV {frame.imotor_ma}mA age={frame.sensor_age_ms}ms "
-            f"late={frame.loop_late_pct}% rx_drop={frame.rx_drop} "
-            f"motion={frame.motion}"
+            f"fw={decoded.fw} hb_ms={decoded.hb_ms} cap={decoded.cap:g} "
+            f"proto={decoded.proto}"
         )
-    if isinstance(frame, AckFrame):
+    if isinstance(decoded, Imu):
+        gx, gy, gz = decoded.gyro_dps
+        ax, ay, az = decoded.accel
         return (
-            f"acks {ack_type_letter(frame.ack_type)} seq={frame.ack_seq} "
-            f"{_member(AckResult, frame.result)} "
-            f"reason={_member(AckReason, frame.reason)} echo={frame.echo}"
+            f"yaw={decoded.yaw_deg:+.1f} roll={decoded.roll_deg:+.1f} "
+            f"pitch={decoded.pitch_deg:+.1f} gyro=({gx:+.1f},{gy:+.1f},{gz:+.1f})dps "
+            f"accel=({ax:+.2f},{ay:+.2f},{az:+.2f}) temp={decoded.temp_c:.1f}C"
         )
-    if isinstance(frame, EventFrame):
-        return f"{_member(EventCode, frame.event)} arg={frame.arg} mcu_us={frame.mcu_us}"
-    if isinstance(frame, PongFrame):
-        return f"echo={frame.echo_pi_mono_us} mcu_us={frame.mcu_us}"
-    if isinstance(frame, VelocityFrame):
-        return (
-            f"v={frame.v_mm_s}mm/s w={frame.w_mrad_s}mrad/s "
-            f"ttl={frame.frame_ttl_ms}ms flags={_bits(frame.flags, VFlag)}"
-        )
-    if isinstance(frame, HelloFrame):
-        return f"host_boot_id={frame.host_boot_id}"
-    if isinstance(frame, ArmFrame):
-        return f"nonce={frame.nonce}"
-    if isinstance(frame, StopFrame):
-        return "brake" if frame.mode == 0 else "coast"
-    if isinstance(frame, ClearFaultFrame):
-        return f"clear {_fault(frame.mask)}"
-    if isinstance(frame, PingFrame):
-        return f"pi_mono_us={frame.pi_mono_us}"
-    return ""
+    if isinstance(decoded, Unknown):
+        return f"T={decoded.t}"
+    return f"{decoded.reason}: {raw[:80]!r}"
 
 
-def render(result: DecodeResult, *, elapsed: float = 0.0, raw: bool = False) -> str:
-    """One display line for one decoded line.
+def render(
+    decoded: Decoded, *, elapsed: float = 0.0, raw: bytes = b"", show_raw: bool = False
+) -> str:
+    """One display line for one wire line.
 
-    A rejected line prints its reason rather than vanishing: I-2's whole point
-    is that drops are counted and visible, so a corrupted link looks different
-    from a silent one.
+    A dropped line prints its reason and its bytes rather than vanishing: the
+    protocol counts and drops, and the operator needs to see the difference
+    between a link that is quiet and one that is corrupt.
     """
-    if isinstance(result, DecodeErr):
-        return (
-            f"{elapsed:8.3f}  !  {result.reason.name}({int(result.reason)}) "
-            f"{result.detail}: {result.raw!r}"
-        )
-    frame = result.frame
-    line = (
-        f"{elapsed:8.3f}  {type(frame).TYPE}  seq={frame.seq} sess={frame.session}  "
-        f"{_body(frame)}"
-    )
-    if raw:
-        line += f"\n{'':10}raw {encode_frame(frame)!r}"
+    kind = kind_of(decoded)
+    marker = "!" if kind == "dropped" else " "
+    line = f"{elapsed:8.3f} {marker} {kind:<8} {_body(decoded, raw)}"
+    if show_raw and kind != "dropped":
+        line += f"\n{'':10}raw {raw!r}"
     return line
 
 
-def _selected(letter: str, only: str, exclude: str) -> bool:
-    return (not only or letter in only) and letter not in exclude
+def banner_verdict(banner: Banner, heartbeat_ms: int) -> tuple[bool, str]:
+    """robotd's own test of a banner: the compiled heartbeat must equal
+    ``[safety] heartbeat_ms`` and the cap the 0.30 ceiling."""
+    matched = banner.hb_ms == heartbeat_ms and abs(banner.cap - POWER_CAP) < 1e-6
+    return matched, (
+        f"wirecat: banner {'MATCH' if matched else 'MISMATCH'}: "
+        f"hb_ms {banner.hb_ms} (config {heartbeat_ms}), "
+        f"cap {banner.cap:g} (ceiling {POWER_CAP:g})"
+    )
+
+
+# --------------------------------------------------------------------------
+# main
+# --------------------------------------------------------------------------
+
+
+def _kinds(text: str, parser: argparse.ArgumentParser) -> frozenset[str]:
+    names = frozenset(part.strip() for part in text.split(",") if part.strip())
+    unknown = names - set(KINDS)
+    if unknown:
+        parser.error(f"unknown kind {', '.join(sorted(unknown))}; choose from {KINDS}")
+    return names
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m rover_devtools.wirecat",
-        description="Decode the Pi<->MCU line protocol live (ARCHITECTURE 5.1).",
-    )
-    parser.add_argument("device", help="/dev/rover-mcu, or ./run/mcu.pty in sim")
-    parser.add_argument("--baud", type=int, default=921600)
-    parser.add_argument(
-        "--only", default="", metavar="TYPES", help="show only these type letters"
+        description="Decode the rover link live (docs/protocol.md).",
     )
     parser.add_argument(
-        "--exclude",
-        default="",
-        metavar="TYPES",
-        help="hide these type letters, e.g. --exclude T for the 50 Hz stream",
+        "device", nargs="?",
+        help="/dev/serial0, the pty path rover-stub printed, or a capture file",
     )
-    parser.add_argument("--count", type=int, default=0, help="stop after N frames")
+    parser.add_argument("--tcp", metavar="HOST:PORT", help="read a rover-stub --tcp port")
+    parser.add_argument("--baud", type=int, default=115200)
+    parser.add_argument(
+        "--only", default="", metavar="KINDS",
+        help="show only these kinds, comma-separated: " + ",".join(KINDS),
+    )
+    parser.add_argument(
+        "--exclude", default="", metavar="KINDS",
+        help="hide these kinds, e.g. --exclude feedback for the 20 Hz stream",
+    )
+    parser.add_argument("--count", type=int, default=0, help="stop after N shown lines")
     parser.add_argument("--seconds", type=float, default=0.0, help="stop after N s")
-    parser.add_argument("--raw", action="store_true", help="also print the frame bytes")
+    parser.add_argument("--raw", action="store_true", help="also print the line bytes")
     parser.add_argument(
-        "--config",
-        metavar="PATH",
-        help="assert the B banner's safety_hash against this config's [safety]",
+        "--config", metavar="PATH",
+        help="the [safety] heartbeat_ms a banner is compared with",
     )
     parser.add_argument(
-        "--ping",
-        action="store_true",
-        help="send a diagnostic P once a second once the session is known. "
-        "This WRITES to the port: never use it while robotd is running (I-18)",
+        "--request", action="store_true",
+        help="send feedback-on and a banner request once. This WRITES to the "
+        "link: never use it while robotd is running (I-18)",
     )
     args = parser.parse_args(argv)
+    if (args.device is None) == (args.tcp is None):
+        parser.error("give a device path or --tcp HOST:PORT, not both")
+    only, exclude = _kinds(args.only, parser), _kinds(args.exclude, parser)
 
-    config, origin = load_config_or_default(args.config)
-    bus_sock = config.bus.sock
-    expected_hash: int | None = None
-    if args.config is not None:
-        expected_hash = config.safety_hash()
-        print(f"wirecat: [safety] from {origin}, safety_hash={expected_hash}")
+    try:
+        config, origin = load_config_or_default(args.config)
+    except (OSError, ValueError) as exc:
+        print(f"wirecat: {exc}", file=sys.stderr)
+        return 2
+    heartbeat_ms = config.safety.heartbeat_ms
+    where = args.tcp or args.device
+    print(f"wirecat: [safety] heartbeat_ms={heartbeat_ms} from {origin}; reading {where}")
 
-    # --ping is the one path that transmits, so it gets the guard roverctl's
-    # arm/disarm already has: a live listener on the bus means robotd owns the
-    # port, and a second writer advancing the MCU's last_down desynchronises
-    # robotd's stream until it resyncs -- a diagnostic that stops the robot.
-    if args.ping and _socket_is_live(bus_sock):
+    # --request is the one path that transmits, so it is guarded: a live
+    # listener on the bus means robotd owns the link, and a second writer's
+    # feedback or echo setting is robotd's problem the moment it lands.
+    if args.request and _socket_is_live(config.bus.sock):
         print(
-            f"wirecat: {bus_sock} has a listener, so robotd owns {args.device}. "
-            "Only robotd writes the port (I-18); --ping would be a second "
-            "writer. Stop rover-robotd, or drop --ping to watch read-only.",
+            f"wirecat: {config.bus.sock} has a listener, so robotd owns {where}. "
+            "Only robotd writes the port (I-18); --request would be a second "
+            "writer. Stop rover-robotd, or drop --request to watch read-only.",
             file=sys.stderr,
         )
         return 2
 
     try:
-        fd = open_serial(args.device, args.baud, write=args.ping)
-    except OSError as exc:
-        print(f"wirecat: cannot open {args.device}: {exc}", file=sys.stderr)
+        if args.tcp:
+            fd = open_tcp(*_parse_tcp(args.tcp))
+        else:
+            fd = open_serial(args.device, args.baud, write=args.request)
+    except (OSError, ValueError) as exc:
+        print(f"wirecat: cannot open {where}: {exc}", file=sys.stderr)
         return 2
 
-    reader = FrameReader()
+    mode = os.fstat(fd).st_mode
+    eof_ends = stat.S_ISREG(mode) or stat.S_ISSOCK(mode)
+    if args.request:
+        os.write(fd, feedback_flow(True))
+        os.write(fd, banner_request())
+
+    splitter = LineSplitter()
+    counters = Counters()
     started = time.monotonic()
     shown = 0
-    session = 0
-    down_seq = 0
-    next_ping = started + 1.0
-    banner_checked = False
     status = 0
     try:
         while True:
             now = time.monotonic()
             if args.seconds and now - started >= args.seconds:
                 break
-            if args.ping and session and down_seq and now >= next_ping:
-                os.write(
-                    fd,
-                    encode_frame(
-                        PingFrame(down_seq, session, time.monotonic_ns() // 1000)
-                    ),
-                )
-                down_seq = (down_seq + 1) & 0xFFFF
-                next_ping = now + 1.0
             try:
                 data = os.read(fd, 4096)
             except BlockingIOError:
-                data = b""
+                time.sleep(0.005)
+                continue
             except OSError as exc:
                 print(f"wirecat: read failed: {exc}", file=sys.stderr)
                 return 1
             if not data:
+                # A file or a socket has nothing more to say; a tty is quiet.
+                if eof_ends:
+                    break
                 time.sleep(0.005)
                 continue
-            for result in reader.feed(data):
-                if isinstance(result, DecodeOk):
-                    frame = result.frame
-                    # The seq re-seed of A8: the MCU's last_down never moves
-                    # backwards, so a diagnostic P has to start above its ack.
-                    # Re-seeded once, and again on a session change -- which 5.1
-                    # says to treat exactly like a port open.
-                    if isinstance(frame, TelemetryFrame) and (
-                        not down_seq or frame.session != session
-                    ):
-                        session, down_seq = frame.session, (frame.ack_seq + 1) & 0xFFFF
-                    if not _selected(type(frame).TYPE, args.only, args.exclude):
-                        continue
-                print(render(result, elapsed=now - started, raw=args.raw))
+            for line in splitter.feed(data):
+                decoded = decode_line(line)
+                counters.count(decoded)
+                if isinstance(decoded, Banner):
+                    matched, verdict = banner_verdict(decoded, heartbeat_ms)
+                    print(verdict)
+                    if not matched:
+                        status = 1
+                kind = kind_of(decoded)
+                if (only and kind not in only) or kind in exclude:
+                    continue
+                print(render(decoded, elapsed=now - started, raw=line, show_raw=args.raw))
                 shown += 1
-                if (
-                    expected_hash is not None
-                    and not banner_checked
-                    and isinstance(result, DecodeOk)
-                    and isinstance(result.frame, BootFrame)
-                ):
-                    banner_checked = True
-                    got = result.frame.safety_hash
-                    matched = got == expected_hash
-                    print(
-                        f"wirecat: safety_hash "
-                        f"{'MATCH' if matched else 'MISMATCH'}: banner {got}, "
-                        f"config {expected_hash}"
-                    )
-                    status = 0 if matched else 1
                 if args.count and shown >= args.count:
                     return status
             sys.stdout.flush()
     except KeyboardInterrupt:
         return 130
     finally:
-        counters = reader.counters
-        print(
-            f"wirecat: {counters.ok} ok, {counters.dropped} dropped "
-            f"(crc {counters.bad_crc}, length {counters.bad_length}, "
-            f"type {counters.unknown_type}, version {counters.unsupported_version}, "
-            f"session {counters.bad_session})",
-            file=sys.stderr,
-        )
+        print(f"wirecat: {counters.summary()}", file=sys.stderr)
         os.close(fd)
     return status
 

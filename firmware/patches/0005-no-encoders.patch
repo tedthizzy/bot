@@ -1,0 +1,33 @@
+diff --color -ruN a/General_Driver/General_Driver.ino b/General_Driver/General_Driver.ino
+--- a/General_Driver/General_Driver.ino	2026-09-07 18:58:03
++++ b/General_Driver/General_Driver.ino	2026-09-07 18:58:03
+@@ -227,9 +227,13 @@
+ 
+   updateOledWifiInfo();
+ 
++#if BOT_ENCODERS
+   initEncoders();
+ 
+   pidControllerInit();
++#else
++  // bot: the WAVE ROVER has no encoders; GPIO 34, 35, 16 and 27 stay free.
++#endif
+ 
+   screenLine_2 = String("MAC:") + macToString(thisDevMac);
+   oled_update();
+@@ -266,6 +270,7 @@
+     runNewJsonCmd = false;
+   }
+ 
++#if BOT_ENCODERS  // bot: no encoders attached, so no counts to read and no PID to run
+   getLeftSpeed();
+ 
+   LeftPidControllerCompute();
+@@ -273,6 +278,7 @@
+   getRightSpeed();
+   
+   RightPidControllerCompute();
++#endif
+   
+   oledInfoUpdate();
+ 

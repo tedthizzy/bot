@@ -1,6 +1,6 @@
 # Research notes
 
-Thirteen notes on the 2026 state of the art for each subsystem, written before the
+Fourteen notes on the 2026 state of the art for each subsystem, written before the
 architecture and cited by decision id throughout it. Each records what a current
 practitioner would build, corrects the original brief where it was wrong, and tags
 every number as measured, vendor-stated or inferred.
@@ -25,6 +25,7 @@ author, so treat their numbers as provisional and confirm anything you would gat
 | `phone_peripheral` | adding a phone later as a removable head | no |
 | `host_hardware` | whether the Pi 4 is the right host, and upgrade triggers | no |
 | `bom_parts` | concrete 2026 parts and prices | no |
+| `wave_rover_hw` | the WAVE ROVER chassis: UPS, driver board, Pi header, motors, firmware package, prices; from the schematics and the firmware source | primary sources, single researcher |
 
 The five unverified notes lost their verifier to a session limit, not to a finding.
 

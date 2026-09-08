@@ -1,0 +1,13 @@
+# The rover's controller port, restricted to one group.
+#
+# The WAVE ROVER's driver board is wired to the Pi header's UART0. With
+# dtoverlay=disable-bt that is the PL011 at fe201000, which the firmware aliases
+# as /dev/serial0; [link] port names the alias and the string ttyAMA0 appears
+# nowhere in any component. Keyed on the device-tree node rather than the tty
+# number so a kernel renumbering cannot silently move the rule. Confirm on a
+# new kernel with:  ls -l /sys/class/tty/ttyAMA*/device
+#
+# 0660 root:rover is how "only robotd writes the port" becomes a filesystem
+# fact: robotd's user is in group rover, and I-18 asserts one pid holds it.
+
+SUBSYSTEM=="tty", KERNELS=="fe201000.serial", GROUP="rover", MODE="0660"

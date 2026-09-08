@@ -100,3 +100,35 @@ dependency of anything this repository publishes.
 and cite third-party pages; the quotes belong to their authors and every one
 carries its source URL. See `docs/research/README.md` for which notes were
 independently verified.
+
+## Firmware fork (`firmware/`)
+
+**`firmware/` is GPL-3.0-or-later**, not Apache-2.0. It is a fork of
+Waveshare's `ugv_base_general` (commit `d308df9`, 2025-11-28, GPL-3.0 -- see
+`firmware/UPSTREAM.md`), carrying eight safety patches (`firmware/patches/`).
+The boundary that keeps the rest of this repository Apache-2.0 is the same one
+as for Piper: nothing here is imported or linked; the Pi and the board exchange
+JSON text over a serial line. The earlier "ESP-IDF v5.5.5 / `firmware/main/`"
+row above describes the retired ESP32-S3 design now under `legacy/firmware-s3/`
+and does not apply to this directory.
+
+Pulled by `firmware/build.sh` into the gitignored `firmware/.cache/`, never
+committed:
+
+| thing | version | licence (verify before relying on it) |
+|---|---|---|
+| arduino-esp32 core `esp32:esp32` | 2.0.17 | LGPL-2.1 (Arduino core), Apache-2.0 (ESP-IDF components) |
+| arduino-cli (in the Docker image) | 1.5.1 | GPL-3.0 |
+| ArduinoJson | 6.21.5 | MIT |
+| Adafruit SSD1306, Adafruit GFX Library, Adafruit ICM20X | 2.5.17, 1.12.6, 2.0.7 | BSD-3-Clause |
+| Adafruit BusIO | 1.17.4 | MIT |
+| Adafruit Unified Sensor | 1.1.15 | Apache-2.0 |
+| INA219_WE | 1.3.8 | MIT |
+| ESP32Encoder | 5.0.0 | MIT |
+| PID_v2 | 2.0.1 | MIT |
+| SimpleKalmanFilter | 0.2.0 | MIT |
+| VL53L1X (Pololu) | 1.3.1 | MIT |
+| `esptool` (via `uvx`, flash time only) | latest | GPL-2.0-or-later |
+
+Vendored in the tree: `firmware/libraries/SCServo/`, Waveshare's bus-servo
+library, taken from the same GPL-3.0 repository.

@@ -25,7 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "packages"))
 
 from rover_brain.main import RobotdClient  # noqa: E402
 from rover_contracts.messages import (  # noqa: E402
-    DriveBusArgs,
+    DriveForBusArgs,
     ResultStatus,
     SkillMessage,
     Source,
@@ -129,9 +129,9 @@ def skill() -> SkillMessage:
         seq=1,
         turn_id=TURN,
         issued_mono_ns=time.monotonic_ns(),
-        goal_ttl_ms=5000,
-        skill="drive",
-        args=DriveBusArgs(distance_m=0.2, speed_mps=0.15),
+        goal_ttl_ms=2000,
+        skill="drive_for",
+        args=DriveForBusArgs(duration_s=1.0, power=0.15),
     )
 
 

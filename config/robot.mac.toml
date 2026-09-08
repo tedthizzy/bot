@@ -4,49 +4,47 @@
 # the paths differ, because principle 6 says fakes are configuration, never a
 # code branch: there is no `if sys.platform` anywhere in the components.
 #
-#     make sim        # uses this file
+#     make sim        # uses this file, with rover-stub on TCP :7777
 #
 # Everything under ./run and ./data is relative to the repo root and gitignored.
 # `make sim` must never try to write /data.
 
 [robot]
-wheel_radius_m = 0.045
-track_m        = 0.150
-ticks_per_rev  = 2200
-name           = "rover"
+name = "rover"
 
 [limits]
 # Identical to the Pi.  The gates assert against welcome.limits, so a simulation
 # that quietly ran wider bounds would prove nothing.
-drive_m               = 1.0
-speed_mps             = 0.30
-speed_default_mps     = 0.20
-turn_deg              = 180.0
-rate_dps              = 60.0
-accel_mps2            = 0.5
-alpha_radps2          = 1.0
-frame_ttl_ms          = 300
-goal_ttl_ms_max       = 5000
-budget_path_m         = 1.5
-budget_motion_s       = 12.0
-motion_cooldown_ms    = 3000
-motion_idle_disarm_ms = 5000
-twist_linear_mps      = 0.30
-twist_angular_radps   = 1.047
-twist_renew_ms        = 200
+power_max          = 0.30
+power_default      = 0.20
+power_min          = 0.08
+drive_for_max_s    = 2.0
+turn_timeout_max_s = 4.0
+turn_tolerance_deg = 5.0
+turn_kp            = 0.004
+goal_ttl_ms_max    = 5000
+budget_motion_s    = 12
+motion_cooldown_ms = 3000
+twist_power        = 0.30
+twist_renew_ms     = 200
 
-[serial]
-backend             = "pty"
-# mcu-sim symlinks this to whatever pty slave the OS allocated -- /dev/ttysNNN
-# on macOS is unpredictable -- and removes it on exit.  robotd retries open()
-# every open_retry_ms until it appears, which is what removes `make sim`'s
-# start-order dependency.
-port                = "./run/mcu.pty"
-baud                = 921600
-setpoint_hz         = 20
-cmd_gate_max_age_ms = 150
-reseed_wait_ms      = 500
-open_retry_ms       = 500
+[link]
+# TCP rather than a pty.  `make sim` starts `rover-stub --tcp 7777`, and a
+# loopback port is an address both processes agree on before either starts; a
+# pty's path (/dev/ttysNNN on macOS) exists only once rover-stub has printed it,
+# so it would have to be pasted or injected at run time.  The bytes on either
+# transport are identical, and robotd retries the connection every
+# open_retry_ms, which is what removes `make sim`'s start-order dependency.
+backend              = "tcp"
+port                 = "/dev/serial0"   # ignored on tcp; for a pty run, set backend = "serial" and paste the path rover-stub --pty prints
+baud                 = 115200           # ignored on tcp; kept so the key set matches the Pi
+tcp_host             = "127.0.0.1"
+tcp_port             = 7777             # STUB_PORT in the Makefile
+command_hz           = 20
+feedback_interval_ms = 50
+yaw_sign             = 1                # rover-stub's default --yaw-sign 1: heading increases when R > L, a left turn
+banner_wait_ms       = 1500
+open_retry_ms        = 500
 
 [bus]
 sock        = "./run/robotd.sock"
@@ -135,22 +133,17 @@ ocv_per_cell = [4.20, 4.00, 3.85, 3.70, 3.60, 3.50, 3.30, 3.20]
 soc_pct      = [ 100,   85,   70,   50,   35,   20,    8,    0]
 
 [safety]
-obs_max_age_ms        = 5000
-link_alive_max_age_ms = 200
+# Identical to the Pi.  rover-stub implements the same compiled constants, and
+# `rover-stub --stock` is how G2 proves the unpatched-firmware refusal.
+obs_max_age_ms           = 5000
+feedback_max_age_ms      = 150
+require_patched_firmware = true
 
-# The seven mirror keys, unchanged: mcu-sim links the same firmware/core/ C
-# code, so its compiled safety_hash is the same number the Pi asserts.
-tof_stop_mm          = 250
-tof_slow_mm          = 600
-slow_zone_w_mrad_s   = 500
-tof_timing_budget_ms = 20
-tof_inter_period_ms  = 30
-tof_poll_hz          = 50
-cliff_delta_mm       = 80
-
-cliff_baseline_mm   = 98
-obstacle_escalate_s = 30
-r_pack_mohm = 65                # mirror of ROVER_R_PACK_MOHM; state.battery.oc_v is computed from it
+# The three firmware mirrors, unchanged: BOT_HEARTBEAT_MS, BOT_TOF_STOP_MM,
+# BOT_LOWBAT_V.  tests/unit/test_caps_match.py holds them against the header.
+heartbeat_ms  = 300
+tof_stop_mm   = 250
+low_battery_v = 9.9
 
 [log]
 dir                = "./data/logs"

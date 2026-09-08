@@ -2,18 +2,19 @@
 
 Five entry points, one job each:
 
-``mcu_sim``    the firmware host simulator behind a pty, so robotd opens a
-               device path exactly as it opens the real serial port
-``fakebox``    a deterministic OpenAI-compatible endpoint with injectable
-               misbehaviour -- what the gates run against
-``wirecat``    a readable live decode of the Pi<->MCU line protocol (5.1)
-``roverctl``   the one operator CLI (ARCHITECTURE 12: ``rover-cli`` is not a name)
-``doctor``     the preflight report, the first thing to run when a step fails
+``rover_stub``  the simulated WAVE ROVER of ``docs/protocol.md`` on a pty or a
+                TCP port, so robotd opens a device exactly as it opens
+                ``/dev/serial0``
+``fakebox``     a deterministic OpenAI-compatible endpoint with injectable
+                misbehaviour -- what the gates run against
+``wirecat``     a readable live decode of the rover link
+``roverctl``    the one operator CLI (ARCHITECTURE 12: ``rover-cli`` is not a name)
+``doctor``      the preflight report, the first thing to run when a step fails
 
 Nothing here is imported by a robot process.  Principle 6 keeps the fakes in
-configuration: ``[serial] backend="pty"`` points robotd at ``mcu_sim``'s device
-path and ``[box] url`` points brain at ``fakebox``, so no component carries a
-branch for being simulated.
+configuration: ``[link] port`` points robotd at ``rover-stub``'s pty (or
+``[link] backend="tcp"`` at its port) and ``[box] url`` points brain at
+``fakebox``, so no component carries a branch for being simulated.
 """
 
 from __future__ import annotations
@@ -28,7 +29,7 @@ __all__ = [
     "resolve_config_path",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 CONFIG_SEARCH_PATHS: tuple[str, ...] = ("config/robot.toml", "config/robot.mac.toml")
 """Where the tools look when no ``--config`` is given, in order.  The Mac file

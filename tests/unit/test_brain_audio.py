@@ -54,7 +54,11 @@ from rover_contracts.config import (  # noqa: E402
     VadConfig,
     WakeConfig,
 )
-from rover_contracts.messages import ResultReason, ResultStatus  # noqa: E402
+from rover_contracts.messages import (  # noqa: E402
+    ResultDetail,
+    ResultReason,
+    ResultStatus,
+)
 
 # -- capture -----------------------------------------------------------------
 
@@ -300,6 +304,46 @@ def test_completion_speech_is_a_table_driven_by_the_result() -> None:
         "Give me a moment before the next move."
     )
     assert reason_sentence(ResultReason.ESTOP_ACTIVE) == "The emergency stop is on."
+
+
+def test_the_open_loop_results_have_their_own_sentences() -> None:
+    done, aborted, none = ResultStatus.DONE, ResultStatus.ABORTED, ResultReason.NONE
+    assert completion_sentence(done, none, skill="drive_for") == "Done driving."
+    assert completion_sentence(done, none, skill="turn_to") == "Facing that way now."
+    assert completion_sentence(done, ResultReason.POWER_CLAMPED) == (
+        "Done, at my top power."
+    )
+    assert completion_sentence(aborted, ResultReason.UNPATCHED_FIRMWARE) == (
+        "The controller isn't running my safety firmware, so I won't move."
+    )
+    assert completion_sentence(aborted, ResultReason.FEEDBACK_STALE) == (
+        "I've lost the controller's feedback, so I stopped."
+    )
+    assert completion_sentence(aborted, ResultReason.HEADING_UNAVAILABLE) == (
+        "I can't tell which way I'm facing, so I stopped."
+    )
+    assert completion_sentence(aborted, ResultReason.OBSTACLE) == (
+        "Something is in the way."
+    )
+
+
+def test_a_timed_out_turn_reports_the_rounded_heading_error() -> None:
+    """The only number in the table is the executor's measurement."""
+    timeout, none = ResultStatus.TIMEOUT, ResultReason.NONE
+    off = ResultDetail(turned_deg=78.0, heading_error_deg=-12.4)
+    assert completion_sentence(timeout, none, skill="turn_to", detail=off) == (
+        "I ran out of time turning; I'm 12 degrees off."
+    )
+    half = ResultDetail(heading_error_deg=12.5)
+    rounded = completion_sentence(timeout, none, skill="turn_to", detail=half)
+    assert "13 degrees" in rounded
+    # Without a measurement, or for another skill, the status row is spoken.
+    assert completion_sentence(timeout, none, skill="turn_to") == (
+        "That took too long, so I stopped."
+    )
+    assert completion_sentence(timeout, none, skill="drive_for", detail=off) == (
+        "That took too long, so I stopped."
+    )
 
 
 def test_every_result_status_and_reason_has_a_sentence() -> None:

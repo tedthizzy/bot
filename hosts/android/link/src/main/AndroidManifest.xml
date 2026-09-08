@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  link runs in its own OS process, as robotd does on the Pi: a frozen brain or
+  a frozen face must never be able to stop the 20 Hz stream of zeros (I-14).
+  The process that feeds the firmware's heartbeat is kept the smallest one.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- TCP to rover-stub in simulation.  The real link is USB serial. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+
+    <application>
+        <service
+            android:name=".LinkService"
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice"
+            android:process=":link" />
+    </application>
+
+</manifest>

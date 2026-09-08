@@ -1,103 +1,51 @@
-# ARCHITECTURE 12: macos-latest runs `uv sync + make test + make gates`;
-# ubuntu-24.04-arm runs `make docker-dev`. The platform split is load-bearing
-# for directive 3 — nothing ships that cannot run on the MacBook first — so it
-# has a file behind it rather than a claim.
-#
-# The cheap, always-informative checks (secrets, dependency closure, schema
-# drift, bounds vs compiled caps) run first and on Linux, so a leak or a drift
-# is a red mark in seconds rather than after a full macOS test run.
-
 name: ci
-
 on:
   push:
     branches: [main]
   pull_request:
   workflow_dispatch:
-
 permissions:
   contents: read
-
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
-
 jobs:
   checks:
-    name: secrets, deps, schemas, caps
+    name: secrets, deps, schemas, caps, kotlin
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-
-      # This repo is public. A credential, a LAN address, a MAC address or a
-      # home directory path in what git publishes fails the build.
       - name: secret scan
-        run: ./deploy/check-secrets.sh
-
+        run: ./hosts/pi/deploy/check-secrets.sh
       - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
-
       - name: sync
         run: uv sync --frozen --group dev
-
-      # robotd MUST NOT import an ML library (4.2). Resolved from uv.lock, so
-      # this is exact and offline: numpy, sherpa-onnx and sounddevice live in
-      # the [speech] extra and must stay there.
       - name: robotd dependency closure has no ML package
         run: make deps-check
-
-      # box/schema/*.json is generated from rover_contracts. One definition of
-      # the model's output schema, not two.
       - name: schema drift
         run: make schema-check
-
-      # I-4 at the level above the wire: an operational bound in
-      # skills.CATALOG that exceeds the cap firmware/core compiled in would
-      # make robotd the last line of defence, which principle 1 forbids.
-      # Skips while firmware/core/rover_config.h does not exist; arms itself
-      # the moment it lands.
-      - name: operational bounds inside the compiled controller caps
+      - name: generated Kotlin drift
+        run: make kotlin-check
+      - name: operational bounds inside the firmware fork's compiled caps
         run: .venv/bin/python -m pytest tests/unit/test_caps_match.py -v
-
       - name: lint
         run: make lint
-
   mac:
-    name: unit + contract + gates (macOS)
+    name: unit + gates (macOS)
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v5
-
       - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
-
-      # The bare-Mac install, with no speech extra: four core packages must
-      # resolve on macOS, which is what makes `make sim` and `make test` work
-      # with no hardware and no Linux-only wheel.
       - name: sync
         run: uv sync --frozen --group dev
-
-      # The C core builds under clang with ASan and UBSan and runs the same
-      # tests/contract/serial_vectors.jsonl the Python codec does. `make test`
-      # covers both halves; this step exists so a firmware failure is legible
-      # on its own line.
-      - name: firmware core host tests
-        run: make test-firmware
-
-      - name: unit + contract
-        run: make test-py
-
-      # gates-sim, not gates: `make gates` alone starts no rover, and every
-      # case whose precondition is "something is listening" then skips while
-      # run_gate maps "nothing ran" to a pass. Eleven enforcement cases -- the
-      # sim halves of I-8, I-11, I-12, I-14, I-15, I-22 and I-23 -- only run
-      # with the six processes up.
+      - name: unit
+        run: make test
       - name: gates (fast subset, against a booted sim rover)
         run: make gates-sim GATES_SIM_ARGS='-k "g2 or g4"'
-
-
       - name: gate results
         if: always()
         uses: actions/upload-artifact@v4
@@ -105,16 +53,10 @@ jobs:
           name: gate-results
           path: logs/gates/
           if-no-files-found: ignore
-
   arm64:
     name: linux/arm64 parity
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v5
-
-      # The one thing this job proves that the macOS job cannot: that
-      # `uv pip install -e .[speech]` resolves on aarch64 Linux, including
-      # pyopen-wakeword, whose only wheel is manylinux_2_35 aarch64. It is the
-      # file behind A30's platform split.
       - name: docker-dev
         run: make docker-dev

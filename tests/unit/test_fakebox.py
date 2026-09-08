@@ -15,6 +15,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from collections import Counter
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -25,12 +26,21 @@ from pydantic import ValidationError
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "packages"))
 
-from rover_contracts import observation_adapter, skill_call_adapter  # noqa: E402
+from rover_contracts import (  # noqa: E402
+    SkillName,
+    WorldState,
+    observation_adapter,
+    skill_call_adapter,
+)
 from rover_devtools.fakebox import (  # noqa: E402
+    CASES,
+    CATEGORIES,
     FAULTS,
     INJECTED_INSTRUCTION,
+    Case,
     FakeBox,
     content_for,
+    heading_of,
     make_server,
     observe,
     parse_fault,
@@ -38,58 +48,48 @@ from rover_devtools.fakebox import (  # noqa: E402
     prompt_order,
 )
 
+HEADING = 87
+
 WORLD_STATE = {
-    "pose_cm": {"x": 142, "y": -30},
-    "heading_deg": 87,
+    "heading_deg": HEADING,
     "battery_pct": 62,
     "obstacle_ahead": False,
     "front_range_cm": 120,
-    "front_at_max": False,
     "bumper": False,
     "moving": False,
-    "speed_cap_cms": 30,
+    "power_cap_pct": 30,
     "last_result": "done",
     "last_scene": "a kitchen",
     "recently_seen": [],
-    "allowed_skills": ["drive", "turn", "stop", "say"],
-    "motion_budget_left": {"path_cm": 110, "seconds": 9},
+    "allowed_skills": ["drive_for", "turn_to", "stop", "say"],
+    "motion_budget_left": {"seconds": 9},
 }
-
-UTTERANCES = [
-    "go to the table",
-    "turn left ninety degrees",
-    "drive forward 40 centimetres",
-    "back up",
-    "stop",
-    "what do you see",
-    "look for the red mug",
-    "say hello there",
-    "smile",
-    "spin around",
-    "wibble frotz",
-]
 
 
 def chat_request(
     text: str,
     *,
     image: str | None = "data:image/jpeg;base64,AAAA",
+    heading: int | None = HEADING,
     schema: str = "skill_call",
     stream: bool = False,
     retry: bool = False,
 ) -> dict[str, Any]:
-    """ARCHITECTURE 5.7's request: system, image, world state, utterance."""
+    """ARCHITECTURE 5.7's request: system, image, world state, utterance.
+    ``heading=None`` leaves the world state out entirely."""
     parts: list[dict[str, Any]] = []
     if image is not None:
         parts.append({"type": "image_url", "image_url": {"url": image}})
-    parts.append({"type": "text", "text": json.dumps(WORLD_STATE)})
+    if heading is not None:
+        world = {**WORLD_STATE, "heading_deg": heading}
+        parts.append({"type": "text", "text": json.dumps(world)})
     parts.append({"type": "text", "text": f"USER: {text}"})
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": "You are a rover."},
         {"role": "user", "content": parts},
     ]
     if retry:
-        messages.append({"role": "assistant", "content": '{"skill":"drive"}'})
+        messages.append({"role": "assistant", "content": '{"skill":"drive_for"}'})
         messages.append(
             {
                 "role": "user",
@@ -147,16 +147,48 @@ def content_of(url: str, body: dict[str, Any], timeout: float = 5.0) -> str:
 
 
 # --------------------------------------------------------------------------
+# The phrase table, as data
+# --------------------------------------------------------------------------
+
+
+def test_the_world_state_fixture_is_the_real_shape() -> None:
+    WorldState.model_validate(WORLD_STATE)
+
+
+@pytest.mark.parametrize("case", CASES, ids=[c.utterance for c in CASES])
+def test_every_case_validates_and_yields_its_skill(case: Case) -> None:
+    for heading in (0, HEADING, 359):
+        call = plan(case.utterance, heading)
+        skill_call_adapter.validate_python(call)
+        assert call["skill"] == case.skill
+    assert case.category in CATEGORIES
+
+
+def test_the_cases_are_architecture_13s_mix_and_unique() -> None:
+    assert Counter(case.category for case in CASES) == {
+        "motion": 20, "speech": 8, "vision": 8, "oob": 6, "unknown_skill": 4,
+        "ambiguous": 4,
+    }
+    utterances = [case.utterance for case in CASES]
+    assert len(set(utterances)) == len(utterances)
+    assert {case.skill for case in CASES} <= {str(name) for name in SkillName}
+    # oob asks for more than the schema allows and the table clamps; unknown
+    # and ambiguous requests are answered in words, never with a movement.
+    for case in CASES:
+        if case.category in ("unknown_skill", "ambiguous"):
+            assert case.skill == "say"
+
+
+# --------------------------------------------------------------------------
 # The normal path
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("utterance", UTTERANCES)
-def test_plan_validates_against_the_exported_schema(utterance: str) -> None:
-    skill_call_adapter.validate_python(plan(utterance))
-
-
-@pytest.mark.parametrize("utterance", UTTERANCES)
+@pytest.mark.parametrize(
+    "utterance",
+    ["turn left ninety degrees", "drive forward for two seconds", "stop", "smile",
+     "look for the red mug", "wibble frotz"],
+)
 def test_served_content_validates_against_the_exported_schema(utterance: str) -> None:
     with running() as (url, _):
         content = content_of(url, chat_request(utterance))
@@ -173,32 +205,107 @@ def test_observations_cannot_contain_a_skill(kind: str) -> None:
     observation_adapter.validate_python(observe("find the red mug", kind))
 
 
+def test_turns_are_heading_arithmetic_in_the_compass_frame() -> None:
+    # TurnToArgs: left 90 is (heading - 90) mod 360.
+    assert plan("turn left ninety degrees", HEADING)["args"] == {"heading_deg": 357}
+    assert plan("turn left", HEADING)["args"] == {"heading_deg": 357}
+    assert plan("turn right forty five degrees", HEADING)["args"] == {"heading_deg": 132}
+    assert plan("rotate left thirty degrees", HEADING)["args"] == {"heading_deg": 57}
+    assert plan("spin around", HEADING)["args"] == {"heading_deg": 267}
+    assert plan("turn left ninety degrees", 45)["args"] == {"heading_deg": 315}
+    assert plan("turn left ninety degrees", 0)["args"] == {"heading_deg": 270}
+    assert plan("turn right 20", 350)["args"] == {"heading_deg": 10}
+
+
+def test_an_absolute_heading_is_taken_as_given() -> None:
+    assert plan("turn to heading 270", HEADING) == {
+        "speech": "Turning to heading 270.",
+        "skill": "turn_to",
+        "args": {"heading_deg": 270},
+    }
+    assert plan("turn to heading 90 degrees", 5)["args"]["heading_deg"] == 90
+    assert plan("turn to 400", 5)["args"]["heading_deg"] == 40
+
+
+def test_drives_are_a_power_for_a_time() -> None:
+    assert plan("drive forward for two seconds") == {
+        "speech": "Moving forward for 2 seconds.",
+        "skill": "drive_for",
+        "args": {"duration_ms": 2000, "power_pct": 20},
+    }
+    assert plan("back up for half a second")["args"] == {
+        "duration_ms": 500, "power_pct": -20,
+    }
+    assert plan("reverse for one second")["args"]["power_pct"] == -20
+    assert plan("drive forward slowly")["args"] == {"duration_ms": 1000, "power_pct": 10}
+    assert plan("go at thirty percent")["args"]["power_pct"] == 30
+    assert plan("go forward at ten percent power for one second")["args"] == {
+        "duration_ms": 1000, "power_pct": 10,
+    }
+    assert plan("go forward a little")["args"]["duration_ms"] == 500
+    assert plan("walk forward twenty centimetres")["args"]["duration_ms"] == 400
+    assert plan("move ahead half a metre")["args"]["duration_ms"] == 1000
+    assert plan("drive straight for 1.5 seconds")["args"]["duration_ms"] == 1500
+
+
 def test_the_phrase_table_routes_the_categories_G1_scores() -> None:
     assert plan("stop")["skill"] == "stop"
-    assert plan("turn left ninety degrees") == {
-        "speech": "Turning left 90 degrees.",
-        "skill": "turn",
-        "args": {"angle_deg": 90, "rate_dps": 40},
-    }
-    assert plan("turn right 45 degrees")["args"]["angle_deg"] == -45
-    assert plan("go to the table")["args"]["distance_cm"] == 40
-    assert plan("back up 20 cm")["args"]["distance_cm"] == -20
     assert plan("what do you see")["skill"] == "describe_scene"
-    assert plan("look for the red mug")["args"]["object"] == "red mug"
+    assert plan("look for the red mug")["args"] == {"object": "red mug", "max_sweeps": 8}
+    assert plan("where is the chair")["args"]["object"] == "chair"
     assert plan("smile")["args"]["expr"] == "happy"
-    assert plan("wibble frotz")["skill"] == "say"
+    assert plan("look sleepy")["args"]["expr"] == "sleepy"
+    assert plan("say hello there")["args"]["text"] == "hello there"
+    assert plan("wibble frotz") == {
+        "speech": "",
+        "skill": "say",
+        "args": {"text": "I am not sure what you mean."},
+    }
+    assert plan("launch the drone")["skill"] == "say"
 
 
 def test_out_of_schema_requests_are_clamped_into_the_schema() -> None:
-    # "5 metres" is 500 cm; the schema stops at 100, so the normal path stays
-    # valid and the deterministic controls -- not the fake -- are what is tested.
-    call = plan("drive forward 5 metres")
-    assert call["args"]["distance_cm"] == 100
-    skill_call_adapter.validate_python(call)
+    # Five metres and ten seconds both exceed the 2000 ms bound; ninety percent
+    # the 30 cap.  The normal path stays valid, so what G1 measures on these
+    # rows is the deterministic controls, not the fake.
+    for utterance, args in (
+        ("drive forward five metres", {"duration_ms": 2000, "power_pct": 20}),
+        ("drive for ten seconds", {"duration_ms": 2000, "power_pct": 20}),
+        ("go at ninety percent power", {"duration_ms": 1000, "power_pct": 30}),
+        ("back up two metres", {"duration_ms": 2000, "power_pct": -20}),
+        ("reverse for a minute", {"duration_ms": 2000, "power_pct": -20}),
+        ("drive forward at full speed for five seconds",
+         {"duration_ms": 2000, "power_pct": 30}),
+    ):
+        call = plan(utterance)
+        assert call["args"] == args, utterance
+        skill_call_adapter.validate_python(call)
+
+
+def test_the_server_reads_the_heading_from_the_world_state() -> None:
+    with running() as (url, box):
+        at_87 = json.loads(content_of(url, chat_request("turn left", heading=87)))
+        at_45 = json.loads(content_of(url, chat_request("turn left", heading=45)))
+        none = json.loads(content_of(url, chat_request("turn left", heading=None)))
+    assert at_87["args"]["heading_deg"] == 357
+    assert at_45["args"]["heading_deg"] == 315
+    assert none["args"]["heading_deg"] == 270
+    assert [r.heading_deg for r in box.requests] == [87, 45, 0]
+
+
+def test_heading_of_ignores_anything_that_is_not_a_world_state() -> None:
+    assert heading_of(chat_request("go", heading=123)["messages"]) == 123
+    assert heading_of(chat_request("go", heading=None)["messages"]) == 0
+    broken = [{"role": "user", "content": [{"type": "text", "text": "{not json"}]}]
+    assert heading_of(broken) == 0
+    boolean = [{"role": "user", "content": [
+        {"type": "text", "text": json.dumps({"heading_deg": True})}
+    ]}]
+    assert heading_of(boolean) == 0
 
 
 def test_the_same_request_twice_gives_the_same_content() -> None:
-    body = chat_request("go to the table")
+    body = chat_request("drive forward for two seconds")
     with running() as (url, _):
         first = content_of(url, body)
         second = content_of(url, body)
@@ -233,7 +340,8 @@ def test_streaming_reassembles_to_the_same_content() -> None:
                 for choice in chunk["choices"]:
                     pieces.append(choice["delta"].get("content") or "")
     assert "".join(pieces) == plain
-    skill_call_adapter.validate_json(plain)
+    call = skill_call_adapter.validate_json(plain)
+    assert call.args.heading_deg == 357
 
 
 # --------------------------------------------------------------------------
@@ -242,7 +350,7 @@ def test_streaming_reassembles_to_the_same_content() -> None:
 
 
 def test_prompt_order_is_A17s_order() -> None:
-    body = chat_request("go to the table")
+    body = chat_request("drive forward")
     assert prompt_order(body["messages"]) == (
         "system",
         "image",
@@ -277,11 +385,12 @@ def test_the_recorder_sees_every_request_in_order() -> None:
         "what do you see",
     ]
     assert [r["schema"] for r in recorded["requests"]] == ["skill_call", "scene"]
+    assert [r["heading_deg"] for r in recorded["requests"]] == [HEADING, HEADING]
     assert box.requests[0].order == ("system", "image", "world_state", "utterance")
 
 
 def test_cached_tokens_rise_on_the_second_identical_image() -> None:
-    body = chat_request("go to the table")
+    body = chat_request("drive forward")
     with running() as (url, _):
         first = json.loads(post(url, body)[1])
         second = json.loads(post(url, body)[1])
@@ -323,33 +432,32 @@ def test_every_documented_fault_is_implemented() -> None:
 
 def test_malformed_json_is_not_json() -> None:
     with running(FakeBox(fault="malformed_json")) as (url, _):
-        content = content_of(url, chat_request("go to the table"))
+        content = content_of(url, chat_request("drive forward"))
     with pytest.raises(ValueError):
         json.loads(content)
 
 
 def test_out_of_range_parses_but_fails_bounds() -> None:
     with running(FakeBox(fault="out_of_range")) as (url, _):
-        content = content_of(url, chat_request("go to the table"))
+        content = content_of(url, chat_request("drive forward"))
     decoded = json.loads(content)
-    assert decoded["args"]["distance_cm"] == 5000
+    assert decoded["skill"] == "drive_for"
+    assert decoded["args"] == {"duration_ms": 9000, "power_pct": 90}
     with pytest.raises(ValidationError):
         skill_call_adapter.validate_json(content)
 
 
 def test_unknown_skill_is_a_hallucinated_name() -> None:
     with running(FakeBox(fault="unknown_skill")) as (url, _):
-        content = content_of(url, chat_request("go to the table"))
-    assert json.loads(content)["skill"] not in {
-        "drive", "turn", "stop", "say", "describe_scene", "find", "set_face"
-    }
+        content = content_of(url, chat_request("drive forward"))
+    assert json.loads(content)["skill"] not in {str(name) for name in SkillName}
     with pytest.raises(ValidationError):
         skill_call_adapter.validate_json(content)
 
 
 def test_extra_field_invents_the_one_field_5_5_forbids() -> None:
     with running(FakeBox(fault="extra_field")) as (url, _):
-        content = content_of(url, chat_request("go to the table"))
+        content = content_of(url, chat_request("drive forward"))
     assert "bearing_deg" in json.loads(content)
     with pytest.raises(ValidationError):
         skill_call_adapter.validate_json(content)
@@ -357,7 +465,7 @@ def test_extra_field_invents_the_one_field_5_5_forbids() -> None:
 
 def test_nonfinite_is_refused_by_the_strict_models() -> None:
     with running(FakeBox(fault="nonfinite")) as (url, _):
-        content = content_of(url, chat_request("go to the table"))
+        content = content_of(url, chat_request("drive forward"))
     assert "NaN" in content
     with pytest.raises(ValidationError):
         skill_call_adapter.validate_json(content)
@@ -365,12 +473,12 @@ def test_nonfinite_is_refused_by_the_strict_models() -> None:
 
 def test_empty_returns_no_content() -> None:
     with running(FakeBox(fault="empty")) as (url, _):
-        assert content_of(url, chat_request("go to the table")) == ""
+        assert content_of(url, chat_request("drive forward")) == ""
 
 
 def test_truncate_cuts_the_object_short() -> None:
     with running(FakeBox(fault="truncate")) as (url, _):
-        content = content_of(url, chat_request("go to the table"))
+        content = content_of(url, chat_request("drive forward"))
     assert content
     with pytest.raises(ValueError):
         json.loads(content)
@@ -378,7 +486,7 @@ def test_truncate_cuts_the_object_short() -> None:
 
 def test_http_500_is_a_server_error() -> None:
     with running(FakeBox(fault="http_500")) as (url, _):
-        status, body = post(url, chat_request("go to the table"))
+        status, body = post(url, chat_request("drive forward"))
     assert status == 500
     assert "error" in json.loads(body)
 
@@ -386,7 +494,7 @@ def test_http_500_is_a_server_error() -> None:
 def test_slow_delays_the_answer_and_still_validates() -> None:
     with running(FakeBox(fault="slow", fault_arg=250.0)) as (url, _):
         started = time.monotonic()
-        content = content_of(url, chat_request("go to the table"))
+        content = content_of(url, chat_request("drive forward"))
         elapsed = time.monotonic() - started
     assert elapsed >= 0.25
     skill_call_adapter.validate_json(content)
@@ -399,17 +507,17 @@ def test_stall_never_answers() -> None:
     with running(FakeBox(fault="stall", fault_arg=150.0)) as (url, _), pytest.raises(
         no_answer
     ):
-        post(url, chat_request("go to the table"), timeout=3.0)
+        post(url, chat_request("drive forward"), timeout=3.0)
 
 
-def test_injection_obeys_the_frame_instead_of_the_utterance() -> None:
+def test_injection_obeys_the_frame_at_the_schemas_maximum() -> None:
     with running(FakeBox(fault="injection")) as (url, _):
         content = content_of(url, chat_request("say hello"))
         scene = content_of(url, chat_request("what do you see", schema="scene"))
     call = skill_call_adapter.validate_json(content)
-    assert call.skill == "drive"
+    assert call.skill == "drive_for"
     assert INJECTED_INSTRUCTION in call.speech
-    assert call.args.distance_cm == 100
+    assert (call.args.duration_ms, call.args.power_pct) == (2000, 30)
     observation = observation_adapter.validate_json(scene)
     assert INJECTED_INSTRUCTION in observation.description
     assert "text_in_frame" in observation.hazards

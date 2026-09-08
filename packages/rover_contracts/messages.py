@@ -17,19 +17,23 @@ from typing import Annotated, Final, Literal, TypeVar
 
 from pydantic import (
     BaseModel,
-    BeforeValidator,
     ConfigDict,
     Field,
-    PlainSerializer,
     TypeAdapter,
     model_validator,
 )
 
 from rover_contracts.config import LimitsConfig, SafetyConfig
 from rover_contracts.ids import SESSION_ID_PATTERN, ULID_PATTERN
-from rover_contracts.serial_codec import McuState
 
 __all__ = [
+    "DriveForArgs",
+    "DriveForBusArgs",
+    "DriveForCall",
+    "StateRover",
+    "TurnToArgs",
+    "TurnToBusArgs",
+    "TurnToCall",
     "BUS_SKILL_ARGS",
     "BrainCancelMessage",
     "BrainClientMessage",
@@ -40,9 +44,6 @@ __all__ = [
     "ClearableFault",
     "ClientMessage",
     "DescribeSceneCall",
-    "DriveArgs",
-    "DriveBusArgs",
-    "DriveCall",
     "EnumValue",
     "ErrorMessage",
     "EstopMessage",
@@ -58,7 +59,6 @@ __all__ = [
     "FsmState",
     "HelloMessage",
     "NoArgs",
-    "OdomDelta",
     "PingMessage",
     "PttEndMessage",
     "PttStartMessage",
@@ -80,22 +80,13 @@ __all__ = [
     "Source",
     "StateActive",
     "StateBattery",
-    "StateMcu",
     "StateMessage",
-    "StatePose",
-    "StateRails",
-    "StateRanges",
-    "StateTof",
     "StateTwist",
-    "StateWheels",
     "StopCall",
     "StopMessage",
     "StrictModel",
     "SubscribeMessage",
     "SubscribeTopic",
-    "TurnArgs",
-    "TurnBusArgs",
-    "TurnCall",
     "TurnMessage",
     "TwistMessage",
     "TwistPayload",
@@ -167,10 +158,10 @@ class SubscribeTopic(StrEnum):
 
 
 class SkillName(StrEnum):
-    """The seven skills the model may emit (ARCHITECTURE 6)."""
+    """The seven skills the model may emit (ARCHITECTURE 6, ADR-0013)."""
 
-    DRIVE = "drive"
-    TURN = "turn"
+    DRIVE_FOR = "drive_for"
+    TURN_TO = "turn_to"
     STOP = "stop"
     SAY = "say"
     DESCRIBE_SCENE = "describe_scene"
@@ -207,7 +198,7 @@ class ResultReason(StrEnum):
     UNKNOWN_SKILL = "unknown_skill"
     BAD_ARGS = "bad_args"
     OUT_OF_BOUNDS = "out_of_bounds"
-    SPEED_CLAMPED = "speed_clamped"
+    POWER_CLAMPED = "power_clamped"
     STALE_SEQ = "stale_seq"
     DUPLICATE_CMD = "duplicate_cmd"
     STALE_TURN = "stale_turn"
@@ -222,7 +213,9 @@ class ResultReason(StrEnum):
     OBS_STALE = "obs_stale"
     SOURCE_NOT_ALLOWED = "source_not_allowed"
     UNAUTHORIZED_UTTERANCE = "unauthorized_utterance"
-    MCU_NACK = "mcu_nack"
+    UNPATCHED_FIRMWARE = "unpatched_firmware"
+    HEADING_UNAVAILABLE = "heading_unavailable"
+    FEEDBACK_STALE = "feedback_stale"
     ESTOP_ACTIVE = "estop_active"
     BOX_LOST = "box_lost"
 
@@ -231,42 +224,27 @@ class EventKind(StrEnum):
     """``event.kind``: the Pi-side text table for the ``E`` codes of 5.1, plus
     the one event robotd raises on its own."""
 
-    ARM_OK = "arm_ok"
-    ARM_DENIED = "arm_denied"
-    TTL_EXPIRED = "ttl_expired"
-    TTL_RECOVERED = "ttl_recovered"
-    FAULT_SET = "fault_set"
-    FAULT_CLEARED = "fault_cleared"
+    LINK_UP = "link_up"
+    LINK_LOST = "link_lost"
+    HEARTBEAT_TIMEOUT = "heartbeat_timeout"
+    HEARTBEAT_RECOVERED = "heartbeat_recovered"
     CAP_CLAMP = "cap_clamp"
-    WDT_REBOOT = "wdt_reboot"
-    BROWNOUT = "brownout"
-    I2C_ERROR = "i2c_error"
-    TOF_STATUS = "tof_status"
-    SESSION_RESET = "session_reset"
-    LOOP_OVERRUN = "loop_overrun"
-    STALL = "stall"
-    CAL_STORED = "cal_stored"
-    MCU_RESTART = "mcu_restart"
+    TOF_BLOCK = "tof_block"
+    BUMPER = "bumper"
+    LOW_BATTERY = "low_battery"
+    UNPATCHED_FIRMWARE = "unpatched_firmware"
+    ROVER_RESTART = "rover_restart"
+    FEEDBACK_STALE = "feedback_stale"
+    FAULT_CLEARED = "fault_cleared"
 
 
 class ClearableFault(StrEnum):
     """What a ``clear`` message may name: the latched fault class, plus the
     software e-stop latch robotd persists in ``/run/rover/estop``."""
 
-    ESTOP = "estop"
-    OVERCURRENT = "overcurrent"
-    STALL = "stall"
-    UNDERVOLT_S = "undervolt_s"
-    UNDERVOLT_D = "undervolt_d"
-    DRIVER_FAULT = "driver_fault"
-    ENC_IMPLAUS = "enc_implaus"
-    LOOP_OVERRUN = "loop_overrun"
-    LINK_CRC = "link_crc"
-    WDT_REBOOT = "wdt_reboot"
-    BROWNOUT = "brownout"
-    DRIVER_HOT = "driver_hot"
-    OBSTACLE_LATCHED = "obstacle_latched"
     ESTOP_SW = "estop_sw"
+    OBSTACLE_LATCHED = "obstacle_latched"
+    LOW_BATTERY = "low_battery"
 
 
 class FsmState(StrEnum):
@@ -298,40 +276,33 @@ MonoNs = Annotated[int, Field(ge=0)]
 Scalar = bool | int | float | str | None
 
 
-def _mcu_state(value: object) -> object:
-    """The bus carries the state's name; the codec carries its number."""
-    if isinstance(value, str):
-        try:
-            return McuState[value]
-        except KeyError:
-            raise ValueError(f"unknown mcu state {value!r}") from None
-    return value
-
-
-McuStateName = Annotated[
-    McuState,
-    BeforeValidator(_mcu_state),
-    PlainSerializer(lambda state: McuState(state).name, return_type=str),
-]
-
-
 # --------------------------------------------------------------------------
 # Skill arguments -- what the model emits (integers, A11)
 # --------------------------------------------------------------------------
 
 
-class DriveArgs(StrictModel):
-    """``drive`` as the model writes it."""
+class DriveForArgs(StrictModel):
+    """``drive_for`` as the model writes it.  Open loop: a power for a time.
 
-    distance_cm: int = Field(ge=-100, le=100)
-    speed_cms: int = Field(ge=5, le=30)
+    ``power_pct`` is percent of Waveshare full scale, so 30 is the 0.30 cap the
+    firmware compiles in; the sign is the direction.  Zero is not a drive."""
+
+    duration_ms: int = Field(ge=100, le=2000)
+    power_pct: int = Field(ge=-30, le=30)
+
+    @model_validator(mode="after")
+    def _nonzero(self) -> DriveForArgs:
+        if self.power_pct == 0:
+            raise ValueError("power_pct 0 is not a drive; use stop")
+        return self
 
 
-class TurnArgs(StrictModel):
-    """``turn`` as the model writes it; ``+`` is CCW."""
+class TurnToArgs(StrictModel):
+    """``turn_to`` as the model writes it: an absolute compass-style heading in
+    whole degrees, 0..359, in the frame the WorldState's ``heading_deg`` uses.
+    The model turns left 90 by asking for ``(heading - 90) mod 360``."""
 
-    angle_deg: int = Field(ge=-180, le=180)
-    rate_dps: int = Field(ge=5, le=60)
+    heading_deg: int = Field(ge=0, le=359)
 
 
 class SayArgs(StrictModel):
@@ -362,19 +333,29 @@ class NoArgs(StrictModel):
 # --------------------------------------------------------------------------
 
 
-class DriveBusArgs(StrictModel):
-    """``drive`` in SI.  Above the cap in force the speed is clamped, not
-    rejected; these are the absolute bounds robotd may never exceed."""
+class DriveForBusArgs(StrictModel):
+    """``drive_for`` on the bus.  ``power`` is in Waveshare units (full scale
+    0.5); above ``[limits] power_max`` it is clamped, not rejected.  0.30 is the
+    absolute bound: the firmware fork clamps there too, so robotd can never
+    send more than the controller would apply."""
 
-    distance_m: float = Field(ge=-1.0, le=1.0)
-    speed_mps: float = Field(gt=0.0, le=0.30)
+    duration_s: float = Field(gt=0.0, le=2.0)
+    power: float = Field(ge=-0.30, le=0.30)
+
+    @model_validator(mode="after")
+    def _nonzero(self) -> DriveForBusArgs:
+        if self.power == 0.0:
+            raise ValueError("power 0 is not a drive; use stop")
+        return self
 
 
-class TurnBusArgs(StrictModel):
-    """``turn`` on the bus.  ``rate_dps`` 60 is the 1.047 rad/s of ARCHITECTURE 6."""
+class TurnToBusArgs(StrictModel):
+    """``turn_to`` on the bus: an absolute heading, a deadline, a tolerance.
+    robotd closes the loop on the rover's fused yaw; there is no encoder."""
 
-    angle_deg: float = Field(ge=-180.0, le=180.0)
-    rate_dps: float = Field(gt=0.0, le=60.0)
+    heading_deg: float = Field(ge=0.0, lt=360.0)
+    timeout_s: float = Field(default=4.0, gt=0.0, le=4.0)
+    tolerance_deg: float = Field(default=5.0, ge=2.0, le=20.0)
 
 
 class SayBusArgs(StrictModel):
@@ -384,8 +365,8 @@ class SayBusArgs(StrictModel):
 
 
 BUS_SKILL_ARGS: Final[dict[str, type[StrictModel]]] = {
-    "drive": DriveBusArgs,
-    "turn": TurnBusArgs,
+    "drive_for": DriveForBusArgs,
+    "turn_to": TurnToBusArgs,
     "say": SayBusArgs,
     "describe_scene": NoArgs,
     "find": FindArgs,
@@ -404,16 +385,16 @@ Speech = Annotated[str, Field(max_length=160)]
 value is truncated at the validator, never a reason to refuse a valid skill."""
 
 
-class DriveCall(StrictModel):
+class DriveForCall(StrictModel):
     speech: Speech
-    skill: Literal["drive"]
-    args: DriveArgs
+    skill: Literal["drive_for"]
+    args: DriveForArgs
 
 
-class TurnCall(StrictModel):
+class TurnToCall(StrictModel):
     speech: Speech
-    skill: Literal["turn"]
-    args: TurnArgs
+    skill: Literal["turn_to"]
+    args: TurnToArgs
 
 
 class StopCall(StrictModel):
@@ -447,8 +428,8 @@ class SetFaceCall(StrictModel):
 
 
 SkillCall = Annotated[
-    DriveCall
-    | TurnCall
+    DriveForCall
+    | TurnToCall
     | StopCall
     | SayCall
     | DescribeSceneCall
@@ -529,8 +510,8 @@ class SkillMessage(StrictModel):
     turn_id: Ulid
     issued_mono_ns: MonoNs
     goal_ttl_ms: int = Field(ge=100, le=5000)
-    skill: Literal["drive", "turn", "say", "describe_scene", "find", "set_face"]
-    args: DriveBusArgs | TurnBusArgs | SayBusArgs | FindArgs | SetFaceArgs | NoArgs
+    skill: Literal["drive_for", "turn_to", "say", "describe_scene", "find", "set_face"]
+    args: DriveForBusArgs | TurnToBusArgs | SayBusArgs | FindArgs | SetFaceArgs | NoArgs
     obs: SkillObs | None = None
     trace: SkillTrace | None = None
 
@@ -546,10 +527,12 @@ class SkillMessage(StrictModel):
 
 
 class TwistPayload(StrictModel):
-    """A35's streamed velocity, renewed every 200 ms or it lapses."""
+    """A35's streamed command, renewed every 200 ms or it lapses.  Open loop, so
+    both axes are in power units: ``lin`` drives both sides, ``ang`` is added to
+    the right and subtracted from the left, and each side is then clamped."""
 
-    linear_x_mps: float = Field(ge=-0.30, le=0.30)
-    angular_z_radps: float = Field(ge=-1.047, le=1.047)
+    lin: float = Field(ge=-0.30, le=0.30)
+    ang: float = Field(ge=-0.30, le=0.30)
 
 
 class TwistMessage(StrictModel):
@@ -621,133 +604,99 @@ class WelcomeMessage(StrictModel):
     type: Literal["welcome"] = "welcome"
     session: str = Field(pattern=SESSION_ID_PATTERN)
     robotd_version: str = Field(min_length=1, max_length=32)
-    mcu_session: int = Field(ge=1, le=0xFFFF)
+    rover_fw: str | None = Field(default=None, max_length=32)
+    """The firmware fork's banner tag, or ``null`` while the link is down or the
+    firmware is stock.  Motion is refused in both cases."""
     limits: LimitsConfig
     safety: SafetyConfig
 
 
-class StateMcu(StrictModel):
-    state: McuStateName
-    fault: int = Field(ge=0, le=0xFFFFFFFF)
-    session: int = Field(ge=0, le=0xFFFF)
-    age_ms: int = Field(ge=0)
-    last_ack_seq: int = Field(ge=0, le=0xFFFF)
-    loop_late_pct: int = Field(ge=0, le=255)
-    rx_drop: int = Field(ge=0, le=0xFFFF)
-    """``T.rx_drop`` verbatim: the MCU's down-direction drop counter, u16 on
-    the wire, so the bound is the wire's."""
+class StateRover(StrictModel):
+    """What the controller last reported, with robotd's arrival stamp.
+
+    ``fw`` is ``null`` for stock firmware, and that alone makes ``ready``
+    false: a controller without the fork's heartbeat and cap is not one robotd
+    will drive.  ``heading_deg`` is the fused yaw in (-180, 180], sign already
+    corrected by ``[link] yaw_sign``."""
+
+    fw: str | None = Field(default=None, max_length=32)
+    hb_ok: bool
+    stop_flags: int = Field(ge=0, le=31)
+    feedback_age_ms: int = Field(ge=0)
+    cmd_left: float = Field(ge=-0.5, le=0.5)
+    cmd_right: float = Field(ge=-0.5, le=0.5)
+    heading_deg: float = Field(gt=-180.0, le=180.0)
+    yaw_rate_dps: float | None = None
+    roll_deg: float
+    pitch_deg: float
+    temp_c: float
+    clamp_count: int = Field(ge=0, le=0xFFFF)
     motion: bool
-
-
-class StatePose(StrictModel):
-    frame_id: Literal["odom"] = "odom"
-    x_m: float
-    y_m: float
-    yaw_rad: float
+    """Either applied side non-zero in the last feedback."""
 
 
 class StateTwist(StrictModel):
-    linear_x_mps: float
-    angular_z_radps: float
+    """The command robotd is currently streaming, in power units."""
 
-
-class StateWheels(StrictModel):
-    left_ticks: int
-    right_ticks: int
-    ticks_per_rev: int = Field(gt=0)
-    wheel_radius_m: float = Field(gt=0.0)
-    track_m: float = Field(gt=0.0)
-
-
-class StateRanges(StrictModel):
-    """``front`` is ``null`` for the 65535 sensor-error sentinel and 6.0 with
-    ``front_at_max`` for the 65534 no-target return -- never 65.534 (I-16)."""
-
-    front: float | None = Field(default=None, ge=0.0)
-    cliff: float | None = Field(default=None, ge=0.0)
-
-
-class StateTof(StrictModel):
-    """Per-sensor coverage.  One dead forward sensor refuses forward whatever
-    the other reports."""
-
-    front_l_ok: bool
-    front_r_ok: bool
+    lin: float = Field(ge=-0.30, le=0.30)
+    ang: float = Field(ge=-0.30, le=0.30)
 
 
 class StateBattery(StrictModel):
+    """From the board's INA219 bus voltage.  No current or open-circuit
+    estimate: the board does not report them."""
+
     pack_v: float = Field(ge=0.0)
-    oc_v: float = Field(ge=0.0)
-    current_a: float
     pct: int = Field(ge=0, le=100)
-
-
-class StateRails(StrictModel):
-    servo: bool
 
 
 class StateActive(StrictModel):
     cmd_id: Ulid
-    skill: Literal["drive", "turn", "say", "describe_scene", "find", "set_face"]
+    skill: Literal["drive_for", "turn_to", "say", "describe_scene", "find", "set_face"]
     source: EnumValue[Source]
     progress: float = Field(ge=0.0, le=1.0)
     deadline_in_ms: int = Field(ge=0)
 
 
 class StateBudget(StrictModel):
-    """What I-15's per-instruction budget has left on ``mcu.turn_id``'s
-    instruction, from the one ledger that enforces it.
+    """What I-15's per-instruction budget has left on the current instruction,
+    from the one ledger that enforces it.  Open loop, so the budget is motion
+    time: robotd charges every 20 ms slot in which it streamed a non-zero
+    command, and a dispatch-time estimate booked elsewhere is not the budget
+    robotd applies."""
 
-    Published so nothing else has to keep a second, differently-accounted copy:
-    robotd charges measured odometry and measured motion seconds, and a
-    dispatch-time estimate booked elsewhere is not the budget robotd applies.
-    """
-
-    path_m: float = Field(ge=0.0)
     motion_s: float = Field(ge=0.0)
 
 
 class StateMessage(StrictModel):
-    """Published at ``[bus] state_hz`` and on any change of ``mcu.state``,
-    ``mcu.fault``, ``active.cmd_id`` or ``armed``."""
+    """Published at ``[bus] state_hz`` and on any change of ``rover.hb_ok``,
+    ``rover.stop_flags``, ``rover.fw``, ``active.cmd_id`` or ``ready``."""
 
     v: Literal[1] = 1
     type: Literal["state"] = "state"
     t_utc_ns: int = Field(ge=0)
     t_mono_ns: MonoNs
-    mcu: StateMcu
-    armed: bool
-    pose: StatePose
+    rover: StateRover
     twist: StateTwist
-    wheels: StateWheels
-    ranges_m: StateRanges
-    front_at_max: bool
-    tof: StateTof
+    front_m: float | None = Field(default=None, ge=0.0)
+    """Front range in metres, ``null`` when the sensor is absent or has no
+    reading.  ``null`` is not a clear path (I-16)."""
     bumper: bool
-    estop_hw: bool
     estop_sw: bool
     battery: StateBattery
-    rails: StateRails
     active: StateActive | None = None
     budget: StateBudget
     ready: bool
     reason: str = Field(default="", max_length=64)
 
 
-class OdomDelta(StrictModel):
-    x_m: float
-    y_m: float
-    yaw_rad: float
-
-
 class ResultDetail(StrictModel):
     """What a completed or clamped command reports back."""
 
-    traveled_m: float | None = None
-    turned_deg: float | None = None
     duration_ms: int | None = Field(default=None, ge=0)
-    odom_delta: OdomDelta | None = None
-    speed_clamped_to_cms: int | None = Field(default=None, ge=0)
+    turned_deg: float | None = None
+    heading_error_deg: float | None = None
+    power_clamped_to: float | None = Field(default=None, ge=0.0, le=0.30)
 
 
 class ResultMessage(StrictModel):

@@ -1,45 +1,45 @@
 """Every model accepts the architecture's own example and rejects each way of
 getting it wrong.
 
-The valid examples are copied from ARCHITECTURE 5.2, 5.3, 5.4, 5.5, 5.6, 5.8
-and 5.9, with the elided ULIDs filled in.  If one of these stops parsing, the
-document and the code have diverged.
+The examples follow ARCHITECTURE 5.2, 5.3, 5.4, 5.5, 5.6 and 5.9 as amended by
+ADR-0013 -- open loop: a drive is a power for a time, a turn is a heading closed
+on the controller's fused yaw, and there is no pose -- with the elided ULIDs
+filled in.  If one of these stops parsing, the documents and the code have
+diverged.  ``config/robot.toml`` loading is covered in ``test_config.py``.
 """
 
 from __future__ import annotations
 
 import json
 import math
-import sys
-from pathlib import Path
 
 import pytest
+from hypothesis import given
+from hypothesis import strategies as st
 from pydantic import ValidationError
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "packages"))
-
-from rover_contracts import (  # noqa: E402
+from rover_contracts import (
     BUS_SKILL_ARGS,
     CATALOG,
-    CEILINGS,
-    LATCHED_FAULTS,
     MOTION_SKILLS,
     NON_MOTION_SKILLS,
+    POWER_CAP,
     SKILLS,
+    TWIST,
+    TWIST_BOUNDS,
     ClearableFault,
-    ConfigError,
-    EventCode,
+    DriveForBusArgs,
     EventKind,
-    Fault,
     FindObservation,
     FrameHeader,
     JsonlWriter,
-    McuState,
+    LimitsConfig,
+    ResultReason,
     ResultStatus,
+    SafetyConfig,
     SkillMessage,
     SkillName,
-    Source,
     StateMessage,
+    TwistPayload,
     Unit,
     WelcomeMessage,
     WorldState,
@@ -47,22 +47,23 @@ from rover_contracts import (  # noqa: E402
     brain_client_adapter,
     client_adapter,
     decode_ulid,
+    goal_deadline_s,
     is_session_id,
     is_ulid,
-    load_config,
     new_cmd_id,
     new_session_id,
     new_turn_id,
     new_ulid,
     observation_adapter,
+    power_from_pct,
     read_jsonl,
     server_adapter,
     skill_call_adapter,
 )
-from rover_contracts.config import _SourceName  # noqa: E402
 
 CMD_ID = "01J9ZC7K3QF2M8XR4V6T0YAHBD"
 TURN_ID = "01J9ZC7K000000000000000000"
+T_UTC_NS = 1757260802230000000
 
 
 # --------------------------------------------------------------------------
@@ -106,14 +107,13 @@ def test_bus_session_ids_are_eight_hex_characters():
 
 
 # --------------------------------------------------------------------------
-# SkillCall (ARCHITECTURE 5.4)
+# SkillCall (ARCHITECTURE 5.4) -- what the model emits, in integers (A11)
 # --------------------------------------------------------------------------
 
 SKILL_CALLS = [
-    {"speech": "Heading over.", "skill": "drive",
-     "args": {"distance_cm": 40, "speed_cms": 15}},
-    {"speech": "Turning left.", "skill": "turn",
-     "args": {"angle_deg": 45, "rate_dps": 40}},
+    {"speech": "Heading over.", "skill": "drive_for",
+     "args": {"duration_ms": 1500, "power_pct": 20}},
+    {"speech": "Turning.", "skill": "turn_to", "args": {"heading_deg": 270}},
     {"speech": "Stopping.", "skill": "stop", "args": {}},
     {"speech": "", "skill": "say",
      "args": {"text": "There is a mug on the table."}},
@@ -140,51 +140,116 @@ def test_skill_call_has_seven_branches_and_speech_first():
         assert set(target["required"]) == {"speech", "skill", "args"}
 
 
-@pytest.mark.parametrize(
-    "bad",
-    [
-        {"speech": "x", "skill": "fly", "args": {}},                       # unknown skill
-        {"speech": "x", "skill": "drive", "args": {"distance_cm": 40}},    # missing arg
-        # extra field, out of bounds, below the floor, a float where an integer
-        # is required, a coerced string, an over-long speech, a missing argument,
-        # an unknown face, A14's eight sweeps, args that should be empty, a
-        # missing speech, and a top-level extra.
-        {"speech": "x", "skill": "drive",
-         "args": {"distance_cm": 40, "speed_cms": 15, "extra": 1}},
-        {"speech": "x", "skill": "drive",
-         "args": {"distance_cm": 200, "speed_cms": 15}},
-        {"speech": "x", "skill": "drive",
-         "args": {"distance_cm": 40, "speed_cms": 4}},
-        {"speech": "x", "skill": "drive",
-         "args": {"distance_cm": 0.4, "speed_cms": 15}},
-        {"speech": "x", "skill": "drive",
-         "args": {"distance_cm": "40", "speed_cms": 15}},
-        {"speech": "x" * 161, "skill": "stop", "args": {}},
-        {"speech": "x", "skill": "turn", "args": {"angle_deg": 45}},
-        {"speech": "x", "skill": "set_face", "args": {"expr": "smug"}},
-        {"speech": "x", "skill": "find",
-         "args": {"object": "mug", "max_sweeps": 9}},
-        {"speech": "x", "skill": "stop", "args": {"now": True}},
-        {"skill": "stop", "args": {}},
-        {"speech": "x", "skill": "drive", "args": {}, "extra": 1},
-    ],
-)
+@pytest.mark.parametrize("power_pct", [-30, -1, 1, 30])
+def test_drive_for_takes_both_directions_up_to_the_cap(power_pct):
+    call = {"speech": "", "skill": "drive_for",
+            "args": {"duration_ms": 100, "power_pct": power_pct}}
+    assert skill_call_adapter.validate_python(call).args.power_pct == power_pct
+
+
+@pytest.mark.parametrize("heading_deg", [0, 359])
+def test_turn_to_takes_the_whole_compass(heading_deg):
+    call = {"speech": "", "skill": "turn_to", "args": {"heading_deg": heading_deg}}
+    assert skill_call_adapter.validate_python(call).args.heading_deg == heading_deg
+
+
+def _drive(**args):
+    return {"speech": "x", "skill": "drive_for",
+            "args": {"duration_ms": 500, "power_pct": 20, **args}}
+
+
+def _turn(**args):
+    return {"speech": "x", "skill": "turn_to", "args": {"heading_deg": 90, **args}}
+
+
+BAD_SKILL_CALLS = {
+    "unknown_skill": {"speech": "x", "skill": "fly", "args": {}},
+    "retired_drive": {"speech": "x", "skill": "drive",
+                      "args": {"distance_cm": 40, "speed_cms": 15}},
+    "retired_turn": {"speech": "x", "skill": "turn",
+                     "args": {"angle_deg": 45, "rate_dps": 40}},
+    "missing_arg": {"speech": "x", "skill": "drive_for", "args": {"duration_ms": 500}},
+    "extra_arg": _drive(extra=1),
+    "top_level_extra": {"speech": "x", "skill": "stop", "args": {}, "extra": 1},
+    "duration_over": _drive(duration_ms=2001),
+    "duration_under": _drive(duration_ms=99),
+    "duration_float": _drive(duration_ms=500.0),
+    "duration_nan": _drive(duration_ms=math.nan),
+    "duration_inf": _drive(duration_ms=math.inf),
+    "power_over": _drive(power_pct=31),
+    "power_under": _drive(power_pct=-31),
+    "power_zero": _drive(power_pct=0),
+    "power_float": _drive(power_pct=20.0),
+    "power_string": _drive(power_pct="20"),
+    "power_bool": _drive(power_pct=True),
+    "power_neg_inf": _drive(power_pct=-math.inf),
+    "heading_360": _turn(heading_deg=360),
+    "heading_negative": _turn(heading_deg=-1),
+    "heading_float": _turn(heading_deg=90.0),
+    "heading_string": _turn(heading_deg="90"),
+    "heading_bool": _turn(heading_deg=True),
+    "heading_nan": _turn(heading_deg=math.nan),
+    "turn_args_on_drive": {"speech": "x", "skill": "drive_for",
+                           "args": {"heading_deg": 90}},
+    "drive_args_on_turn": {"speech": "x", "skill": "turn_to",
+                           "args": {"duration_ms": 500, "power_pct": 20}},
+    "speech_too_long": {"speech": "x" * 161, "skill": "stop", "args": {}},
+    "missing_speech": {"skill": "stop", "args": {}},
+    "stop_with_args": {"speech": "x", "skill": "stop", "args": {"now": True}},
+    "unknown_face": {"speech": "x", "skill": "set_face", "args": {"expr": "smug"}},
+    "nine_sweeps": {"speech": "x", "skill": "find",
+                    "args": {"object": "mug", "max_sweeps": 9}},
+    "zero_sweeps": {"speech": "x", "skill": "find",
+                    "args": {"object": "mug", "max_sweeps": 0}},
+    "empty_object": {"speech": "x", "skill": "find",
+                     "args": {"object": "", "max_sweeps": 1}},
+    "empty_say": {"speech": "x", "skill": "say", "args": {"text": ""}},
+    "long_say": {"speech": "x", "skill": "say", "args": {"text": "x" * 241}},
+}
+
+
+@pytest.mark.parametrize("bad", BAD_SKILL_CALLS.values(), ids=list(BAD_SKILL_CALLS))
 def test_bad_skill_calls_rejected(bad):
     with pytest.raises(ValidationError):
         skill_call_adapter.validate_python(bad)
 
 
-def test_the_model_cannot_emit_a_bearing_or_a_distance_in_metres():
+@pytest.mark.parametrize(
+    "args",
+    [{"distance_m": 0.4, "speed_mps": 0.15}, {"distance_cm": 40, "power_pct": 20},
+     {"duration_ms": 500, "power_pct": 20, "speed_mps": 0.1}],
+    ids=["metres", "centimetres", "smuggled_speed"],
+)
+def test_the_model_cannot_emit_a_distance(args):
+    # ADR-0013: no encoder, so no distance anywhere in the catalog.
     with pytest.raises(ValidationError):
         skill_call_adapter.validate_python(
-            {"speech": "x", "skill": "drive",
-             "args": {"distance_m": 0.4, "speed_mps": 0.15}}
+            {"speech": "x", "skill": "drive_for", "args": args}
         )
 
 
 # --------------------------------------------------------------------------
 # robotd bus, client -> robotd (ARCHITECTURE 5.2)
 # --------------------------------------------------------------------------
+
+SKILL_MESSAGE = {
+    "v": 1, "type": "skill", "source": "brain", "cmd_id": CMD_ID, "seq": 42,
+    "turn_id": TURN_ID, "issued_mono_ns": 123456789012, "goal_ttl_ms": 2750,
+    "skill": "drive_for", "args": {"duration_s": 1.5, "power": 0.20},
+    "obs": {"frame_id": "cam-000917", "frame_mono_ns": 98764000000},
+    "trace": {"model": "rover-vlm", "prompt_sha256": "ab12",
+              "authorized_motion": True},
+}
+
+TURN_TO_MESSAGE = {
+    **SKILL_MESSAGE, "skill": "turn_to", "goal_ttl_ms": 5000,
+    "args": {"heading_deg": 270.0, "timeout_s": 4.0, "tolerance_deg": 5.0},
+}
+
+TWIST_MESSAGE = {
+    "v": 1, "type": "twist", "source": "teleop", "cmd_id": CMD_ID, "seq": 901,
+    "twist": {"lin": 0.15, "ang": -0.10},
+}
 
 CLIENT_MESSAGES = [
     {"v": 1, "type": "hello", "source": "brain", "pid": 1234,
@@ -193,250 +258,414 @@ CLIENT_MESSAGES = [
      "state_hz": 10},
     {"v": 1, "type": "turn", "source": "brain", "turn_id": TURN_ID},
     {"v": 1, "type": "ping", "source": "brain"},
-    {"v": 1, "type": "skill", "source": "brain", "cmd_id": CMD_ID, "seq": 42,
-     "turn_id": TURN_ID, "issued_mono_ns": 123456789012, "goal_ttl_ms": 5000,
-     "skill": "drive", "args": {"distance_m": 0.40, "speed_mps": 0.15},
-     "obs": {"frame_id": "cam-000917", "frame_mono_ns": 98764000000},
-     "trace": {"model": "rover-vlm", "prompt_sha256": "ab12"}},
-    {"v": 1, "type": "twist", "source": "teleop", "cmd_id": CMD_ID, "seq": 901,
-     "twist": {"linear_x_mps": 0.15, "angular_z_radps": 0.35}},
+    SKILL_MESSAGE,
+    TURN_TO_MESSAGE,
+    TWIST_MESSAGE,
     {"v": 1, "type": "cancel", "source": "brain", "cmd_id": CMD_ID,
      "reason": "barge_in"},
     {"v": 1, "type": "stop", "source": "brain", "reason": "stop_word"},
     {"v": 1, "type": "estop", "source": "web", "reason": "user"},
     {"v": 1, "type": "clear", "source": "web", "faults": ["estop_sw"]},
 ]
+CLIENT_IDS = [m["type"] + ("-" + m["skill"] if "skill" in m else "")
+              for m in CLIENT_MESSAGES]
 
 
-@pytest.mark.parametrize(
-    "message", CLIENT_MESSAGES, ids=[m["type"] for m in CLIENT_MESSAGES]
-)
+@pytest.mark.parametrize("message", CLIENT_MESSAGES, ids=CLIENT_IDS)
 def test_documented_client_messages_validate(message):
     parsed = client_adapter.validate_python(message)
     assert parsed.type == message["type"]
 
 
-def test_stop_needs_no_seq_cmd_id_or_turn_id_but_tolerates_them():
+def test_drive_for_goal_ttl_is_the_catalog_deadline():
+    # brain computes goal_ttl_ms from goal_deadline_s; the example must agree.
+    args = SKILL_MESSAGE["args"]
+    assert SKILL_MESSAGE["goal_ttl_ms"] == goal_deadline_s(args["duration_s"]) * 1000
+
+
+def test_stop_class_messages_stay_loose():
     # I-22: stop-class messages skip strict parsing, seq, replay, freshness,
     # fault and cooldown checks, and are never answered "rejected".  brain's
-    # restart path sends one on connect, before any turn exists.
-    bare = client_adapter.validate_python(
-        {"v": 1, "type": "stop", "source": "brain"}
-    )
-    assert bare.reason is None and bare.seq is None and bare.cmd_id is None
+    # restart path sends a stop on connect, before any turn exists.
+    bare = client_adapter.validate_python({"v": 1, "type": "stop", "source": "brain"})
+    assert bare.reason is None and bare.seq is None
+    assert bare.cmd_id is None and bare.turn_id is None
     dressed = client_adapter.validate_python(
         {"v": 1, "type": "stop", "source": "brain", "reason": "user",
          "cmd_id": CMD_ID, "turn_id": TURN_ID, "seq": 7}
     )
     assert dressed.seq == 7
+    assert client_adapter.validate_python(
+        {"v": 1, "type": "cancel", "source": "brain"}
+    ).cmd_id is None
+    assert client_adapter.validate_python(
+        {"v": 1, "type": "estop", "source": "web"}
+    ).reason is None
 
 
 def test_stop_is_not_carried_as_a_skill():
-    # ARCHITECTURE 6: brain translates the stop skill into the stop bus message,
-    # so it never has to pass strict parsing to be recognised as a stop.
+    # brain translates the stop skill into the stop bus message, so it never
+    # has to pass strict parsing to be recognised as a stop.
     assert "stop" not in BUS_SKILL_ARGS
+    assert set(BUS_SKILL_ARGS) == {s.value for s in SkillName} - {"stop"}
     with pytest.raises(ValidationError):
-        client_adapter.validate_python(
-            {**CLIENT_MESSAGES[4], "skill": "stop", "args": {}}
-        )
+        client_adapter.validate_python({**SKILL_MESSAGE, "skill": "stop", "args": {}})
+
+
+BUS_ARGS_EXAMPLES = {
+    "drive_for": {"duration_s": 0.1, "power": -0.1},
+    "turn_to": {"heading_deg": 0.0},
+    "say": {"text": "hello"},
+    "describe_scene": {},
+    "find": {"object": "mug", "max_sweeps": 1},
+    "set_face": {"expr": "happy"},
+}
+
+
+@pytest.mark.parametrize("skill", list(BUS_SKILL_ARGS))
+def test_skill_message_args_are_the_matching_bus_model(skill):
+    message = SkillMessage.model_validate(
+        {**SKILL_MESSAGE, "skill": skill, "args": BUS_ARGS_EXAMPLES[skill]}
+    )
+    assert type(message.args) is BUS_SKILL_ARGS[skill]
 
 
 @pytest.mark.parametrize(
-    "patch",
-    [
-        {"skill": "fly"},
-        {"goal_ttl_ms": 5001},                                   # I-8
-        {"goal_ttl_ms": 99},
-        {"source": "hacker"},
-        {"cmd_id": "not-a-ulid"},
-        {"turn_id": CMD_ID.lower()},
-        {"seq": -1},
-        {"issued_mono_ns": -1},
-        {"args": {"distance_m": 1.5, "speed_mps": 0.15}},        # over drive_m
-        {"args": {"distance_m": 0.4, "speed_mps": 0.31}},        # over speed_mps
-        {"args": {"distance_m": 0.4, "speed_mps": 0.0}},         # 0 < v
-        {"args": {"distance_m": 0.4, "speed_mps": float("nan")}},
-        {"args": {"distance_m": 0.4, "speed_mps": float("inf")}},
-        {"args": {"angle_deg": 45.0, "rate_dps": 40.0}},         # turn args on drive
-        {"args": {"distance_m": 0.4, "speed_mps": 0.15, "hidden": 1}},
-        {"obs": {"frame_id": "cam-17", "frame_mono_ns": 1}},
-        {"trace": {"model": "x", "unknown": 1}},
-    ],
+    ("skill", "wrong"),
+    [("drive_for", {"heading_deg": 90.0}),
+     ("turn_to", {"duration_s": 1.0, "power": 0.1}),
+     ("say", {}),
+     ("describe_scene", {"text": "x"}),
+     ("find", {"expr": "happy"}),
+     ("set_face", {"object": "mug", "max_sweeps": 1})],
+    ids=lambda v: v if isinstance(v, str) else "",
+)
+def test_skill_message_args_must_match_the_skill(skill, wrong):
+    with pytest.raises(ValidationError):
+        SkillMessage.model_validate({**SKILL_MESSAGE, "skill": skill, "args": wrong})
+
+
+def _bus_drive(**args):
+    return {"args": {"duration_s": 1.0, "power": 0.2, **args}}
+
+
+def _bus_turn(**args):
+    return {"skill": "turn_to", "args": {"heading_deg": 90.0, **args}}
+
+
+BAD_SKILL_MESSAGES = {
+    "unknown_skill": {"skill": "fly"},
+    "retired_skill": {"skill": "drive", "args": {"distance_m": 0.4, "speed_mps": 0.15}},
+    "ttl_over": {"goal_ttl_ms": 5001},                                  # I-8
+    "ttl_under": {"goal_ttl_ms": 99},
+    "bad_source": {"source": "hacker"},
+    "bad_cmd_id": {"cmd_id": "not-a-ulid"},
+    "lowercase_turn_id": {"turn_id": CMD_ID.lower()},
+    "negative_seq": {"seq": -1},
+    "negative_mono": {"issued_mono_ns": -1},
+    "power_over": _bus_drive(power=0.31),
+    "power_under": _bus_drive(power=-0.31),
+    "power_zero": _bus_drive(power=0.0),
+    "power_nan": _bus_drive(power=math.nan),
+    "power_inf": _bus_drive(power=math.inf),
+    "power_string": _bus_drive(power="0.2"),
+    "power_pct_on_bus": {"args": {"duration_s": 1.0, "power_pct": 20}},
+    "duration_zero": _bus_drive(duration_s=0.0),
+    "duration_over": _bus_drive(duration_s=2.001),
+    "duration_negative": _bus_drive(duration_s=-1.0),
+    "hidden_arg": _bus_drive(hidden=1),
+    "empty_args": {"args": {}},
+    "heading_360": _bus_turn(heading_deg=360.0),
+    "heading_negative": _bus_turn(heading_deg=-0.001),
+    "heading_nan": _bus_turn(heading_deg=math.nan),
+    "timeout_over": _bus_turn(timeout_s=4.001),
+    "timeout_zero": _bus_turn(timeout_s=0.0),
+    "tolerance_under": _bus_turn(tolerance_deg=1.999),
+    "tolerance_over": _bus_turn(tolerance_deg=20.001),
+    "bad_frame_id": {"obs": {"frame_id": "cam-17", "frame_mono_ns": 1}},
+    "unknown_trace_key": {"trace": {"model": "x", "unknown": 1}},
+}
+
+
+@pytest.mark.parametrize(
+    "patch", BAD_SKILL_MESSAGES.values(), ids=list(BAD_SKILL_MESSAGES)
 )
 def test_bad_skill_messages_rejected(patch):
     with pytest.raises(ValidationError):
-        client_adapter.validate_python({**CLIENT_MESSAGES[4], **patch})
+        client_adapter.validate_python({**SKILL_MESSAGE, **patch})
 
 
 @pytest.mark.parametrize(
-    "patch",
-    [
-        {"twist": {"linear_x_mps": 0.31, "angular_z_radps": 0.0}},
-        {"twist": {"linear_x_mps": -0.31, "angular_z_radps": 0.0}},
-        {"twist": {"linear_x_mps": 0.0, "angular_z_radps": 1.048}},
-        {"twist": {"linear_x_mps": 0.0, "angular_z_radps": float("-inf")}},
-        {"twist": {"linear_x_mps": 0.0}},
-        {"twist": {"linear_x_mps": 0.0, "angular_z_radps": 0.0, "z": 1}},
-    ],
+    "twist",
+    [{"lin": 0.30, "ang": 0.30}, {"lin": -0.30, "ang": -0.30}, {"lin": 0.0, "ang": 0.0}],
+    ids=["cap", "neg_cap", "zero"],
 )
-def test_bad_twists_rejected(patch):
+def test_twist_payload_accepts_the_whole_power_range(twist):
+    parsed = TwistPayload.model_validate(twist)
+    assert (parsed.lin, parsed.ang) == (twist["lin"], twist["ang"])
+
+
+BAD_TWISTS = {
+    "lin_over": {"lin": 0.31, "ang": 0.0},
+    "lin_under": {"lin": -0.31, "ang": 0.0},
+    "ang_over": {"lin": 0.0, "ang": 0.31},
+    "ang_under": {"lin": 0.0, "ang": -0.31},
+    "ang_neg_inf": {"lin": 0.0, "ang": -math.inf},
+    "lin_nan": {"lin": math.nan, "ang": 0.0},
+    "missing_ang": {"lin": 0.0},
+    "extra": {"lin": 0.0, "ang": 0.0, "z": 1},
+    "string": {"lin": "0.1", "ang": 0.0},
+    "bool": {"lin": True, "ang": 0.0},
+    "retired_units": {"linear_x_mps": 0.15, "angular_z_radps": 0.35},
+}
+
+
+@pytest.mark.parametrize("twist", BAD_TWISTS.values(), ids=list(BAD_TWISTS))
+def test_bad_twists_rejected(twist):
     # I-8 covers twist as well as skill.
     with pytest.raises(ValidationError):
-        client_adapter.validate_python({**CLIENT_MESSAGES[5], **patch})
+        TwistPayload.model_validate(twist)
+    with pytest.raises(ValidationError):
+        client_adapter.validate_python({**TWIST_MESSAGE, "twist": twist})
 
 
 def test_clear_names_only_clearable_faults():
-    with pytest.raises(ValidationError):
-        client_adapter.validate_python(
-            {"v": 1, "type": "clear", "source": "web", "faults": ["tof_stop"]}
-        )
-    with pytest.raises(ValidationError):
-        client_adapter.validate_python(
-            {"v": 1, "type": "clear", "source": "web", "faults": []}
-        )
-
-
-def test_clearable_faults_are_the_latched_class_plus_the_software_estop():
-    latched = {bit.name.lower() for bit in Fault if LATCHED_FAULTS & bit}
-    assert {f.value for f in ClearableFault} == latched | {"estop_sw"}
+    assert {f.value for f in ClearableFault} == {
+        "estop_sw", "obstacle_latched", "low_battery"
+    }
+    for faults in (["tof_stop"], [], ["heartbeat"]):
+        with pytest.raises(ValidationError):
+            client_adapter.validate_python(
+                {"v": 1, "type": "clear", "source": "web", "faults": faults}
+            )
 
 
 # --------------------------------------------------------------------------
 # robotd bus, robotd -> clients
 # --------------------------------------------------------------------------
 
+LIMITS = {
+    "power_max": 0.30, "power_default": 0.20, "power_min": 0.08,
+    "drive_for_max_s": 2.0, "turn_timeout_max_s": 4.0, "turn_tolerance_deg": 5.0,
+    "turn_kp": 0.004, "goal_ttl_ms_max": 5000, "budget_motion_s": 12,
+    "motion_cooldown_ms": 3000, "twist_power": 0.30, "twist_renew_ms": 200,
+}
+SAFETY = {
+    "obs_max_age_ms": 5000, "heartbeat_ms": 300, "feedback_max_age_ms": 150,
+    "tof_stop_mm": 250, "low_battery_v": 9.9, "require_patched_firmware": True,
+}
+
 WELCOME = {
-    "v": 1, "type": "welcome", "session": "5f3c1a2b", "robotd_version": "0.1.0",
-    "mcu_session": 40010,
-    "limits": {"drive_m": 1.0, "speed_mps": 0.30, "speed_default_mps": 0.20,
-               "turn_deg": 180.0, "rate_dps": 60.0, "accel_mps2": 0.5,
-               "alpha_radps2": 1.0, "frame_ttl_ms": 300, "goal_ttl_ms_max": 5000,
-               "budget_path_m": 1.5, "budget_motion_s": 12,
-               "motion_cooldown_ms": 3000, "motion_idle_disarm_ms": 5000,
-               "twist_linear_mps": 0.30, "twist_angular_radps": 1.047,
-               "twist_renew_ms": 200},
-    "safety": {"obs_max_age_ms": 5000, "link_alive_max_age_ms": 200,
-               "tof_stop_mm": 250, "tof_slow_mm": 600, "slow_zone_w_mrad_s": 500,
-               "tof_timing_budget_ms": 20, "tof_inter_period_ms": 30,
-               "tof_poll_hz": 50, "cliff_baseline_mm": 98, "cliff_delta_mm": 80,
-               "obstacle_escalate_s": 30, "r_pack_mohm": 65},
+    "v": 1, "type": "welcome", "session": "5f3c1a2b", "robotd_version": "0.2.0",
+    "rover_fw": "bot-wr-1", "limits": LIMITS, "safety": SAFETY,
 }
 
 STATE = {
     "v": 1, "type": "state", "t_utc_ns": 1757260800120000000,
     "t_mono_ns": 98765432100,
-    "mcu": {"state": "ARMED_MOVING", "fault": 0, "session": 40010, "age_ms": 18,
-            "last_ack_seq": 3, "loop_late_pct": 0, "rx_drop": 0, "motion": True},
-    "armed": True,
-    "pose": {"frame_id": "odom", "x_m": 1.42, "y_m": -0.30, "yaw_rad": 1.518},
-    "twist": {"linear_x_mps": 0.248, "angular_z_radps": 0.208},
-    "wheels": {"left_ticks": 204411, "right_ticks": 203877, "ticks_per_rev": 2200,
-               "wheel_radius_m": 0.045, "track_m": 0.150},
-    "ranges_m": {"front": 1.204, "cliff": 0.098}, "front_at_max": False,
-    "tof": {"front_l_ok": True, "front_r_ok": True},
-    "bumper": False, "estop_hw": False, "estop_sw": False,
-    "battery": {"pack_v": 11.62, "oc_v": 11.70, "current_a": 0.41, "pct": 62},
-    "rails": {"servo": False},
-    "active": {"cmd_id": CMD_ID, "skill": "drive", "source": "brain",
-               "progress": 0.34, "deadline_in_ms": 3500},
-    "budget": {"path_m": 1.1, "motion_s": 9.0},
+    "rover": {"fw": "bot-wr-1", "hb_ok": True, "stop_flags": 0, "feedback_age_ms": 18,
+              "cmd_left": 0.20, "cmd_right": 0.20, "heading_deg": 87.5,
+              "yaw_rate_dps": 0.0, "roll_deg": 0.4, "pitch_deg": -1.2,
+              "temp_c": 31.5, "clamp_count": 0, "motion": True},
+    "twist": {"lin": 0.20, "ang": 0.0},
+    "front_m": 1.204, "bumper": False, "estop_sw": False,
+    "battery": {"pack_v": 11.62, "pct": 62},
+    "active": {"cmd_id": CMD_ID, "skill": "drive_for", "source": "brain",
+               "progress": 0.34, "deadline_in_ms": 1800},
+    "budget": {"motion_s": 9.0},
     "ready": True, "reason": "",
+}
+
+RESULT_DONE = {
+    "v": 1, "type": "result", "cmd_id": CMD_ID, "seq": 42, "status": "done",
+    "reason": "", "detail": {"duration_ms": 1500}, "t_utc_ns": T_UTC_NS,
+}
+RESULT_TIMEOUT = {
+    **RESULT_DONE, "status": "timeout",
+    "detail": {"turned_deg": 84.0, "heading_error_deg": -6.0},
+}
+RESULT_CLAMPED = {
+    **RESULT_DONE, "status": "accepted", "reason": "power_clamped",
+    "detail": {"power_clamped_to": 0.20},
 }
 
 SERVER_MESSAGES = [
     WELCOME,
     STATE,
-    {"v": 1, "type": "result", "cmd_id": CMD_ID, "seq": 42, "status": "done",
-     "reason": "", "detail": {"traveled_m": 0.40, "duration_ms": 2970,
-                              "odom_delta": {"x_m": 0.40, "y_m": 0.01,
-                                             "yaw_rad": 0.02}},
-     "t_utc_ns": 1757260802230000000},
-    {"v": 1, "type": "event", "kind": "fault_set", "fault": "tof_stop",
-     "detail": {"range_m": 0.231}, "t_utc_ns": 1757260802230000000},
-    {"v": 1, "type": "event", "kind": "mcu_restart",
-     "detail": {"old_session": 40010, "new_session": 51882, "reset_reason": 8},
-     "t_utc_ns": 1757260802230000000},
-    {"v": 1, "type": "error", "code": "bad_frame", "detail": "crc"},
+    RESULT_DONE,
+    RESULT_TIMEOUT,
+    RESULT_CLAMPED,
+    {"v": 1, "type": "event", "kind": "tof_block", "fault": "obstacle_latched",
+     "detail": {"tof_mm": 231}, "t_utc_ns": T_UTC_NS},
+    {"v": 1, "type": "event", "kind": "rover_restart",
+     "detail": {"fw": "bot-wr-1", "hb_ms": 300, "cap": 0.3}, "t_utc_ns": T_UTC_NS},
+    {"v": 1, "type": "event", "kind": "unpatched_firmware",
+     "detail": {"banner": False}, "t_utc_ns": T_UTC_NS},
+    {"v": 1, "type": "error", "code": "bad_json", "detail": "not an object"},
 ]
+SERVER_IDS = [f"{m['type']}-{i}" for i, m in enumerate(SERVER_MESSAGES)]
 
 
-@pytest.mark.parametrize(
-    "message", SERVER_MESSAGES, ids=[m["type"] + "-" + str(i)
-                                     for i, m in enumerate(SERVER_MESSAGES)]
-)
+@pytest.mark.parametrize("message", SERVER_MESSAGES, ids=SERVER_IDS)
 def test_documented_server_messages_validate(message):
     parsed = server_adapter.validate_python(message)
     assert parsed.type == message["type"]
 
 
 def test_welcome_republishes_every_limits_and_safety_key():
-    welcome = WelcomeMessage.model_validate(WELCOME)
-    dumped = welcome.model_dump(mode="json")
-    assert dumped["limits"].keys() == WELCOME["limits"].keys()
-    assert dumped["safety"].keys() == WELCOME["safety"].keys()
+    # A33: a gate asserts against what is running, not against the file.
+    dumped = WelcomeMessage.model_validate(WELCOME).model_dump(mode="json")
+    assert dumped["limits"].keys() == LimitsConfig.model_fields.keys()
+    assert dumped["safety"].keys() == SafetyConfig.model_fields.keys()
+    assert WELCOME["limits"].keys() == LimitsConfig.model_fields.keys()
+    assert WELCOME["safety"].keys() == SafetyConfig.model_fields.keys()
 
 
-def test_state_mcu_state_round_trips_as_its_name():
-    state = StateMessage.model_validate(STATE)
-    assert state.mcu.state is McuState.ARMED_MOVING
-    assert state.model_dump(mode="json")["mcu"]["state"] == "ARMED_MOVING"
-
-
-def test_state_renders_the_two_tof_sentinels_distinctly():
-    # I-16: 65535 is blockage and publishes as null; 65534 is a clear path and
-    # publishes as 6.0 with front_at_max, never as 65.534.
-    stale = {**STATE, "ranges_m": {"front": None, "cliff": 0.098}}
-    assert StateMessage.model_validate(stale).ranges_m.front is None
-    at_max = {**STATE, "ranges_m": {"front": 6.0, "cliff": 0.098},
-              "front_at_max": True}
-    assert StateMessage.model_validate(at_max).front_at_max is True
-
-
-def test_state_with_no_active_command():
-    assert StateMessage.model_validate({**STATE, "active": None}).active is None
+def test_welcome_rover_fw_is_null_for_stock_firmware_or_no_link():
+    welcome = WelcomeMessage.model_validate({**WELCOME, "rover_fw": None})
+    assert welcome.rover_fw is None
+    again = server_adapter.validate_json(server_adapter.dump_json(welcome))
+    assert again == welcome
 
 
 @pytest.mark.parametrize(
     "patch",
-    [
-        {"mcu": {**STATE["mcu"], "state": "SPINNING"}},
-        {"battery": {**STATE["battery"], "pct": 101}},
-        {"active": {**STATE["active"], "progress": 1.5}},
-        {"active": {**STATE["active"], "skill": "stop"}},
-        {"pose": {**STATE["pose"], "x_m": float("nan")}},
-        {"pose": {**STATE["pose"], "frame_id": "map"}},
-        {"ready": "yes"},
-        {"unknown": 1},
-    ],
+    [{"mcu_session": 40010}, {"rover_fw": "x" * 33}, {"session": "5F3C1A2B"},
+     {"limits": {**LIMITS, "speed_mps": 0.3}},
+     {"safety": {**SAFETY, "cliff_delta_mm": 80}}],
+    ids=["retired_mcu_session", "fw_too_long", "uppercase_session",
+         "retired_limit", "retired_safety_key"],
 )
+def test_bad_welcomes_rejected(patch):
+    with pytest.raises(ValidationError):
+        WelcomeMessage.model_validate({**WELCOME, **patch})
+
+
+def test_state_round_trips_through_json():
+    state = StateMessage.model_validate(STATE)
+    again = server_adapter.validate_json(server_adapter.dump_json(state))
+    assert again == state
+    assert again.rover.heading_deg == 87.5
+    assert json.loads(server_adapter.dump_json(state))["front_m"] == 1.204
+
+
+def test_state_front_m_null_is_representable_and_stays_null():
+    # I-16: null is "no reading", which is not a clear path; robotd owns that
+    # rule, the contract only has to carry the distinction.
+    state = StateMessage.model_validate({**STATE, "front_m": None})
+    assert state.front_m is None
+    assert json.loads(server_adapter.dump_json(state))["front_m"] is None
+
+
+def test_state_with_no_active_command_no_firmware_and_no_yaw_rate():
+    state = StateMessage.model_validate(
+        {**STATE, "active": None,
+         "rover": {**STATE["rover"], "fw": None, "yaw_rate_dps": None}}
+    )
+    assert state.active is None
+    assert state.rover.fw is None and state.rover.yaw_rate_dps is None
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("heading_deg", 180.0), ("heading_deg", -179.999), ("stop_flags", 31),
+     ("cmd_left", -0.5), ("cmd_right", 0.5), ("clamp_count", 0xFFFF)],
+)
+def test_state_rover_edges_inside_the_range_are_accepted(field, value):
+    rover = StateMessage.model_validate(
+        {**STATE, "rover": {**STATE["rover"], field: value}}
+    ).rover
+    assert getattr(rover, field) == value
+
+
+def _rover(**patch):
+    return {"rover": {**STATE["rover"], **patch}}
+
+
+BAD_STATES = {
+    "stop_flags_32": _rover(stop_flags=32),
+    "stop_flags_negative": _rover(stop_flags=-1),
+    "stop_flags_float": _rover(stop_flags=1.0),
+    "stop_flags_bool": _rover(stop_flags=True),
+    "heading_minus_180": _rover(heading_deg=-180.0),
+    "heading_over_180": _rover(heading_deg=180.001),
+    "heading_360": _rover(heading_deg=360.0),
+    "heading_nan": _rover(heading_deg=math.nan),
+    "cmd_left_over": _rover(cmd_left=0.51),
+    "cmd_right_under": _rover(cmd_right=-0.51),
+    "clamp_count_over": _rover(clamp_count=0x10000),
+    "clamp_count_negative": _rover(clamp_count=-1),
+    "feedback_age_negative": _rover(feedback_age_ms=-1),
+    "fw_too_long": _rover(fw="x" * 33),
+    "rover_extra": _rover(session=40010),
+    "twist_over": {"twist": {"lin": 0.31, "ang": 0.0}},
+    "front_m_negative": {"front_m": -0.1},
+    "front_m_string": {"front_m": "1.2"},
+    "battery_pct_over": {"battery": {**STATE["battery"], "pct": 101}},
+    "battery_negative": {"battery": {**STATE["battery"], "pack_v": -0.1}},
+    "active_stop": {"active": {**STATE["active"], "skill": "stop"}},
+    "active_twist": {"active": {**STATE["active"], "skill": "twist"}},
+    "active_progress": {"active": {**STATE["active"], "progress": 1.5}},
+    "budget_negative": {"budget": {"motion_s": -0.1}},
+    "budget_retired": {"budget": {"path_m": 1.1, "motion_s": 9.0}},
+    "ready_string": {"ready": "yes"},
+    "retired_pose": {"pose": {"frame_id": "odom", "x_m": 1.4, "yaw_rad": 0.1}},
+    "retired_mcu": {"mcu": {"state": "ARMED_MOVING"}},
+    "retired_ranges": {"ranges_m": {"front": 1.2}},
+    "retired_armed": {"armed": True},
+    "unknown": {"unknown": 1},
+}
+
+
+@pytest.mark.parametrize("patch", BAD_STATES.values(), ids=list(BAD_STATES))
 def test_bad_state_messages_rejected(patch):
     with pytest.raises(ValidationError):
         server_adapter.validate_python({**STATE, **patch})
 
 
 def test_result_reason_is_a_closed_speakable_enum():
+    reasons = {r.value for r in ResultReason}
+    assert {"unpatched_firmware", "heading_unavailable", "feedback_stale",
+            "power_clamped"} <= reasons
+    assert not {"speed_clamped", "mcu_nack"} & reasons
+    for bad in ({"reason": "because"}, {"reason": "speed_clamped"},
+                {"reason": "mcu_nack"}, {"status": "fault"}):
+        with pytest.raises(ValidationError):
+            server_adapter.validate_python({**RESULT_DONE, **bad})
+
+
+@pytest.mark.parametrize(
+    "detail",
+    [{"power_clamped_to": 0.31}, {"power_clamped_to": -0.1}, {"duration_ms": -1},
+     {"traveled_m": 0.4}, {"odom_delta": {"x_m": 0.4}}, {"turned_deg": math.nan}],
+    ids=["clamp_over_cap", "clamp_negative", "duration_negative",
+         "retired_traveled_m", "retired_odom_delta", "nan"],
+)
+def test_bad_result_details_rejected(detail):
     with pytest.raises(ValidationError):
-        server_adapter.validate_python(
-            {**SERVER_MESSAGES[2], "reason": "because"}
-        )
-    with pytest.raises(ValidationError):
-        server_adapter.validate_python({**SERVER_MESSAGES[2], "status": "fault"})
+        server_adapter.validate_python({**RESULT_DONE, "detail": detail})
+
+
+def test_event_kinds_are_the_rover_link_table():
+    assert {k.value for k in EventKind} == {
+        "link_up", "link_lost", "heartbeat_timeout", "heartbeat_recovered",
+        "cap_clamp", "tof_block", "bumper", "low_battery", "unpatched_firmware",
+        "rover_restart", "feedback_stale", "fault_cleared",
+    }
+    for retired in ("fault_set", "mcu_restart", "cliff"):
+        with pytest.raises(ValidationError):
+            server_adapter.validate_python({**SERVER_MESSAGES[5], "kind": retired})
 
 
 def test_event_detail_rejects_non_finite_numbers():
     with pytest.raises(ValidationError):
         server_adapter.validate_python(
-            {**SERVER_MESSAGES[3], "detail": {"range_m": float("nan")}}
+            {**SERVER_MESSAGES[5], "detail": {"tof_mm": math.nan}}
         )
 
 
-def test_event_kinds_cover_every_mcu_event_code():
-    assert {code.name.lower() for code in EventCode} <= {k.value for k in EventKind}
-    assert EventKind.MCU_RESTART.value == "mcu_restart"
-
-
 # --------------------------------------------------------------------------
-# frames.sock (5.3) and brain.sock (5.9)
+# frames.sock (5.3) and brain.sock (5.9) -- unchanged by ADR-0013
 # --------------------------------------------------------------------------
 
 
@@ -447,13 +676,13 @@ def test_documented_frame_header_validates():
          "w": 640, "h": 480, "fmt": "jpeg", "quality": 80, "bytes": 41233,
          "exposure_us": 8000, "gain": 2.4, "lux": 180}
     )
-    assert header.kind == "still" or header.kind == "stream"
+    assert header.kind == "stream"
 
 
 @pytest.mark.parametrize(
     "patch",
     [{"kind": "video"}, {"frame_id": "917"}, {"fmt": "png"}, {"quality": 0},
-     {"w": 0}, {"gain": float("inf")}],
+     {"w": 0}, {"gain": math.inf}],
 )
 def test_bad_frame_headers_rejected(patch):
     base = {"v": 1, "frame_id": "cam-000917", "kind": "stream",
@@ -481,17 +710,15 @@ def test_documented_brain_messages_validate(message):
 
 
 def test_null_confidence_is_representable():
-    # ARCHITECTURE 7: a null confidence counts as authorized, which is what keeps
-    # the whole Mac test plan (stt.backend="text") able to move.
+    # ARCHITECTURE 7: a null confidence counts as authorized, which is what
+    # keeps the whole Mac test plan (stt.backend="text") able to move.
     parsed = brain_client_adapter.validate_python(BRAIN_MESSAGES[0])
     assert parsed.confidence is None
 
 
 def test_brain_source_set_differs_from_the_bus_source_set():
     with pytest.raises(ValidationError):
-        brain_client_adapter.validate_python(
-            {**BRAIN_MESSAGES[1], "source": "brain"}
-        )
+        brain_client_adapter.validate_python({**BRAIN_MESSAGES[1], "source": "brain"})
 
 
 # --------------------------------------------------------------------------
@@ -518,16 +745,11 @@ def test_documented_observations_validate(observation):
 
 @pytest.mark.parametrize(
     "smuggled",
-    [
-        {"skill": "drive"},
-        {"args": {"distance_cm": 100}},
-        {"bearing_deg": 30.0},
-        {"distance_m": 1.2},
-        {"range_cm": 120},
-        {"speech": "go"},
-    ],
+    [{"skill": "drive_for"}, {"args": {"duration_ms": 500, "power_pct": 20}},
+     {"bearing_deg": 30.0}, {"heading_deg": 30}, {"distance_m": 1.2},
+     {"range_cm": 120}, {"speech": "go"}],
 )
-def test_an_observation_cannot_carry_a_skill_or_a_distance(smuggled):
+def test_an_observation_cannot_carry_a_skill_angle_or_distance(smuggled):
     # A13 is structural, not a convention: extra="forbid" is what makes it so.
     for observation in OBSERVATIONS:
         with pytest.raises(ValidationError):
@@ -552,26 +774,27 @@ def test_find_observation_geometry_is_an_integer_permille():
 
 
 # --------------------------------------------------------------------------
-# WorldState (5.6)
+# WorldState (5.6, amended: heading and power cap, no pose)
 # --------------------------------------------------------------------------
 
 WORLD_STATE = {
-    "pose_cm": {"x": 142, "y": -30}, "heading_deg": 87, "battery_pct": 62,
-    "obstacle_ahead": False, "front_range_cm": 120, "front_at_max": False,
-    "bumper": False, "moving": False, "speed_cap_cms": 30,
+    "heading_deg": 87, "battery_pct": 62, "obstacle_ahead": False,
+    "front_range_cm": 120, "bumper": False, "moving": False, "power_cap_pct": 20,
     "last_result": "done",
     "last_scene": "a kitchen, table on the left, doorway ahead",
-    "recently_seen": [{"label": "red mug", "where_deg": 40, "age_s": 94}],
-    "allowed_skills": ["drive", "turn", "stop", "say", "describe_scene", "find",
-                       "set_face"],
-    "motion_budget_left": {"path_cm": 110, "seconds": 9},
+    "recently_seen": [{"label": "red mug", "heading_deg": 40, "age_s": 94}],
+    "allowed_skills": ["drive_for", "turn_to", "stop", "say", "describe_scene",
+                       "find", "set_face"],
+    "motion_budget_left": {"seconds": 9},
 }
 
 
-def test_documented_world_state_validates():
+def test_documented_world_state_validates_and_round_trips():
     world = WorldState.model_validate(WORLD_STATE)
-    assert world.speed_cap_cms == 30
+    assert world.power_cap_pct == 20
     assert world.last_result is ResultStatus.DONE
+    assert WorldState.model_validate_json(world.model_dump_json()) == world
+    assert json.loads(world.model_dump_json()) == WORLD_STATE
 
 
 def test_world_state_field_order_is_stable_for_the_prefix_cache():
@@ -579,240 +802,234 @@ def test_world_state_field_order_is_stable_for_the_prefix_cache():
     assert list(dumped) == list(WORLD_STATE)
 
 
-def test_world_state_carries_no_timestamp_seq_or_session():
+def test_world_state_carries_no_timestamp_seq_session_or_pose():
     # A17: nothing that changes every turn appears before the image.
+    # ADR-0013: no encoder, so no pose.
     fields = set(WorldState.model_fields)
     assert not fields & {"t_utc_ns", "t_mono_ns", "seq", "session", "cmd_id",
-                         "turn_id"}
+                         "turn_id", "pose_cm", "pose", "speed_cap_cms",
+                         "front_at_max"}
 
 
-def test_speed_cap_must_agree_with_the_front_range():
-    # ARCHITECTURE 5.6: 30 is only legal because front_range_cm is above the
-    # 100 cm unlock threshold; the two fields must agree.
-    with pytest.raises(ValidationError):
-        WorldState.model_validate({**WORLD_STATE, "front_range_cm": 40})
-    ok = WorldState.model_validate(
-        {**WORLD_STATE, "front_range_cm": 40, "speed_cap_cms": 20}
+def test_world_state_front_range_null_is_unknown_not_clear():
+    world = WorldState.model_validate({**WORLD_STATE, "front_range_cm": None})
+    assert world.front_range_cm is None
+    assert json.loads(world.model_dump_json())["front_range_cm"] is None
+    # ... and the same for a dropped key.
+    dropped = {k: v for k, v in WORLD_STATE.items() if k != "front_range_cm"}
+    assert WorldState.model_validate(dropped).front_range_cm is None
+
+
+@pytest.mark.parametrize("heading", [0, 359])
+def test_recently_seen_heading_spans_the_compass(heading):
+    world = WorldState.model_validate(
+        {**WORLD_STATE,
+         "recently_seen": [{"label": "mug", "heading_deg": heading, "age_s": 0}]}
     )
-    assert ok.speed_cap_cms == 20
-    at_max = WorldState.model_validate(
-        {**WORLD_STATE, "front_range_cm": 600, "front_at_max": True}
-    )
-    assert at_max.speed_cap_cms == 30
+    assert world.recently_seen[0].heading_deg == heading
 
 
-@pytest.mark.parametrize(
-    "patch",
-    [{"battery_pct": 101}, {"front_range_cm": 6553}, {"heading_deg": 400},
-     {"allowed_skills": ["fly"]}, {"allowed_skills": []},
-     {"pose_cm": {"x": 1.42, "y": -30}}, {"speed_cap_cms": 31},
-     {"last_result": "finished"}, {"motion_budget_left": {"path_cm": -1,
-                                                          "seconds": 9}}],
-)
+def _seen(**patch):
+    return {"recently_seen": [{"label": "red mug", "heading_deg": 40, "age_s": 94,
+                               **patch}]}
+
+
+BAD_WORLD_STATES = {
+    "battery_over": {"battery_pct": 101},
+    "range_over": {"front_range_cm": 401},
+    "range_negative": {"front_range_cm": -1},
+    "range_float": {"front_range_cm": 120.5},
+    "heading_360": {"heading_deg": 360},
+    "heading_negative": {"heading_deg": -1},
+    "heading_float": {"heading_deg": 87.0},
+    "power_cap_under": {"power_cap_pct": 4},
+    "power_cap_over": {"power_cap_pct": 31},
+    "unknown_skill": {"allowed_skills": ["fly"]},
+    "twist_as_skill": {"allowed_skills": ["twist"]},
+    "no_skills": {"allowed_skills": []},
+    "last_result_open": {"last_result": "finished"},
+    "scene_too_long": {"last_scene": "x" * 241},
+    "seen_heading_360": _seen(heading_deg=360),
+    "seen_heading_negative": _seen(heading_deg=-1),
+    "seen_retired_where": {
+        "recently_seen": [{"label": "mug", "where_deg": 40, "age_s": 1}]
+    },
+    "seen_empty_label": _seen(label=""),
+    "seen_too_many": {"recently_seen": [WORLD_STATE["recently_seen"][0]] * 9},
+    "budget_negative": {"motion_budget_left": {"seconds": -1}},
+    "budget_retired_path": {"motion_budget_left": {"path_cm": 110, "seconds": 9}},
+    "retired_pose": {"pose_cm": {"x": 142, "y": -30}},
+    "retired_speed_cap": {"speed_cap_cms": 30},
+    "retired_front_at_max": {"front_at_max": False},
+}
+
+
+@pytest.mark.parametrize("patch", BAD_WORLD_STATES.values(), ids=list(BAD_WORLD_STATES))
 def test_bad_world_states_rejected(patch):
     with pytest.raises(ValidationError):
         WorldState.model_validate({**WORLD_STATE, **patch})
 
 
 # --------------------------------------------------------------------------
-# The skill catalog (ARCHITECTURE 6)
+# The skill catalog (ARCHITECTURE 6 as amended)
 # --------------------------------------------------------------------------
 
 
-def test_catalog_covers_every_model_skill_plus_twist():
-    assert {spec.name for spec in CATALOG} == {s.value for s in SkillName} | {"twist"}
-    assert len(CATALOG) == 8
+def test_catalog_is_the_seven_model_skills_and_twist_is_not_one():
+    assert {spec.name for spec in CATALOG} == {s.value for s in SkillName}
+    assert len(CATALOG) == 7
+    assert TWIST == "twist" and TWIST not in SKILLS
+
+
+def test_skills_index_derives_from_the_catalog():
+    assert {spec.name: spec for spec in CATALOG} == SKILLS
+    assert list(SKILLS) == [spec.name for spec in CATALOG]
 
 
 def test_motion_split_matches_the_validator_table():
-    assert {"drive", "turn", "twist"} == MOTION_SKILLS
-    assert {"say", "describe_scene", "set_face", "find", "stop"} <= NON_MOTION_SKILLS
+    assert {"drive_for", "turn_to", "find"} == MOTION_SKILLS
+    assert {"stop", "say", "describe_scene", "set_face"} == NON_MOTION_SKILLS
+    assert not MOTION_SKILLS & NON_MOTION_SKILLS
+    assert set(SKILLS) == MOTION_SKILLS | NON_MOTION_SKILLS
+    assert all(SKILLS[name].moves for name in MOTION_SKILLS)
 
 
-def test_catalog_bus_args_match_the_skill_message_union():
-    from_catalog = {
-        spec.name: spec.bus_args
-        for spec in CATALOG
-        if spec.bus_args is not None and spec.name != "twist"
-    }
+def test_catalog_bus_args_are_the_skill_message_union():
+    from_catalog = {spec.name: spec.bus_args for spec in CATALOG if spec.bus_args}
     assert from_catalog == BUS_SKILL_ARGS
 
 
-def test_stop_has_no_bus_args_and_twist_has_no_model_args():
+def test_only_stop_lacks_bus_args_and_every_skill_has_model_args():
     assert SKILLS["stop"].bus_args is None
-    assert SKILLS["twist"].model_args is None
-
-
-def test_every_bound_is_satisfied_by_its_own_argument_model():
-    for spec in CATALOG:
-        if spec.bus_args is None:
-            continue
-        fields = set(spec.bus_args.model_fields)
-        for bound in spec.bounds:
-            assert bound.field in fields, (spec.name, bound.field)
+    assert all(spec.bus_args is not None for spec in CATALOG if spec.name != "stop")
+    assert all(spec.model_args is not None for spec in CATALOG)
 
 
 def test_executor_owners_are_the_documented_ones():
-    assert SKILLS["drive"].executor == "robotd"
-    assert SKILLS["turn"].executor == "robotd"
-    assert SKILLS["twist"].executor == "robotd"
-    assert SKILLS["say"].executor == "brain"
-    assert SKILLS["describe_scene"].executor == "brain"
-    assert SKILLS["find"].executor == "brain"
-    assert SKILLS["set_face"].executor == "brain"
+    owners = {spec.name: spec.executor for spec in CATALOG}
+    assert owners == {
+        "drive_for": "robotd", "turn_to": "robotd", "stop": "robotd",
+        "say": "brain", "describe_scene": "brain", "find": "brain",
+        "set_face": "brain",
+    }
+
+
+def test_every_bound_names_a_field_of_its_own_argument_model():
+    for spec in CATALOG:
+        for bound in spec.bounds:
+            assert spec.bus_args is not None, (spec.name, bound.field)
+            assert bound.field in spec.bus_args.model_fields, (spec.name, bound.field)
+    assert {b.field for b in TWIST_BOUNDS} == set(TwistPayload.model_fields)
+
+
+def test_no_bound_is_stated_in_metres():
+    assert {u.value for u in Unit} == {"s", "power", "deg", "count", "chars"}
+
+
+def test_firmware_capped_bounds_are_the_three_power_values():
+    capped = {
+        (spec.name, b.field): b for spec in CATALOG for b in spec.bounds if b.fw_cap
+    }
+    capped |= {("twist", b.field): b for b in TWIST_BOUNDS if b.fw_cap}
+    assert set(capped) == {("drive_for", "power"), ("twist", "lin"), ("twist", "ang")}
+    for bound in capped.values():
+        assert bound.fw_cap == "BOT_POWER_CAP"
+        assert bound.unit is Unit.POWER
+        assert (bound.lo, bound.hi) == (-POWER_CAP, POWER_CAP)
+
+
+# The bounds table and the argument models must say the same thing.
+
+BASE_ARGS = {**BUS_ARGS_EXAMPLES, "twist": {"lin": 0.1, "ang": 0.1}}
+BOUND_MODELS = {spec.name: spec.bus_args for spec in CATALOG if spec.bus_args}
+BOUND_MODELS["twist"] = TwistPayload
+
+EDGE_CASES = [(spec.name, bound) for spec in CATALOG for bound in spec.bounds]
+EDGE_CASES += [("twist", bound) for bound in TWIST_BOUNDS]
+
+
+def _value(bound, magnitude):
+    return "x" * int(magnitude) if bound.unit is Unit.CHARS else magnitude
+
+
+def _validates(skill, bound, magnitude):
+    BOUND_MODELS[skill].model_validate(
+        {**BASE_ARGS[skill], bound.field: _value(bound, magnitude)}
+    )
+
+
+@pytest.mark.parametrize(
+    ("skill", "bound"), EDGE_CASES, ids=[f"{s}.{b.field}" for s, b in EDGE_CASES]
+)
+def test_each_bound_matches_its_argument_model(skill, bound):
+    step = 1 if bound.unit in (Unit.CHARS, Unit.COUNT) else 0.001
+
+    inside_hi = bound.hi - step if bound.hi_exclusive else bound.hi
+    assert bound.contains(inside_hi)
+    _validates(skill, bound, inside_hi)
+
+    inside_lo = bound.lo + step if bound.lo_exclusive else bound.lo
+    if bound.contains(inside_lo) and inside_lo != 0.0:  # 0.0 power is "use stop"
+        _validates(skill, bound, inside_lo)
+
+    for outside in (bound.hi + step, bound.lo - step):
+        assert not bound.contains(outside)
+        if bound.unit is Unit.CHARS and outside < 0:
+            continue
+        with pytest.raises(ValidationError):
+            _validates(skill, bound, outside)
+
+    if bound.hi_exclusive:
+        assert not bound.contains(bound.hi)
+        with pytest.raises(ValidationError):
+            _validates(skill, bound, bound.hi)
+    if bound.lo_exclusive:
+        assert not bound.contains(bound.lo)
+        with pytest.raises(ValidationError):
+            _validates(skill, bound, bound.lo)
 
 
 # --------------------------------------------------------------------------
-# config (5.8) -- A33
+# goal_deadline_s and power_from_pct: the two formulas brain and robotd share
 # --------------------------------------------------------------------------
 
-MINIMAL_TOML = """
-[robot]
-name = "rover"
-[limits]
-speed_mps = 0.30
-turn_deg = 180
-budget_motion_s = 12
-[serial]
-backend = "pty"
-port = "./run/mcu.pty"
-[safety]
-tof_stop_mm = 250
-"""
+
+def test_goal_deadline_is_half_again_plus_half_a_second():
+    assert goal_deadline_s(1.5) == 2.75
+    assert goal_deadline_s(2.0) == 3.5
+    assert goal_deadline_s(0.1) == pytest.approx(0.65)
+    for bad in (0.0, -1.0):
+        with pytest.raises(ValueError):
+            goal_deadline_s(bad)
 
 
-def write_config(tmp_path: Path, text: str = MINIMAL_TOML) -> Path:
-    path = tmp_path / "robot.toml"
-    path.write_text(text)
-    return path
-
-
-def test_config_loads_with_documented_defaults(tmp_path):
-    config = load_config(write_config(tmp_path), env={})
-    assert config.limits.speed_mps == 0.30
-    assert config.limits.turn_deg == 180.0
-    assert config.serial.backend == "pty"
-    assert config.safety.tof_stop_mm == 250
-    assert config.camera.hfov_deg == 83.0
-    assert config.bus.allow_stream == []
-
-
-def test_config_safety_hash_matches_the_boot_banner(tmp_path):
-    config = load_config(write_config(tmp_path), env={})
-    assert config.safety_hash() == 3381018647
-
-
-def test_env_override_applies_and_is_typed(tmp_path):
-    config = load_config(
-        write_config(tmp_path),
-        env={"ROVER__LIMITS__SPEED_MPS": "0.25",
-             "ROVER__BUS__ALLOW_STREAM": '["teleop"]',
-             "ROVER__CAMERA__BACKEND": '"fake"'},
+@given(st.floats(min_value=0.001, max_value=2.0))
+def test_every_drive_for_deadline_fits_the_goal_ttl_bounds(duration_s):
+    # brain sends goal_ttl_ms = round(goal_deadline_s * 1000); robotd checks it
+    # against 100..5000 (T2).  Over drive_for's whole range it must land inside.
+    goal_ttl_ms = round(goal_deadline_s(duration_s) * 1000)
+    message = SkillMessage.model_validate(
+        {**SKILL_MESSAGE, "goal_ttl_ms": goal_ttl_ms,
+         "args": {"duration_s": duration_s, "power": 0.1}}
     )
-    assert config.limits.speed_mps == 0.25
-    assert config.bus.allow_stream == ["teleop"]
-    assert config.camera.backend == "fake"
+    assert message.goal_ttl_ms == goal_ttl_ms
 
 
-def test_override_above_a_ceiling_refuses_to_start(tmp_path):
-    # A33: ROVER__LIMITS__SPEED_MPS=3.0 must not take effect silently, and must
-    # not be clamped either.
-    with pytest.raises(ConfigError) as excinfo:
-        load_config(write_config(tmp_path),
-                    env={"ROVER__LIMITS__SPEED_MPS": "3.0"})
-    assert "ceiling" in str(excinfo.value)
-    assert "limits.speed_mps" in str(excinfo.value)
+def test_power_from_pct_documented_values():
+    assert power_from_pct(30) == 0.30
+    assert power_from_pct(-30) == -0.30
+    assert power_from_pct(20) == 0.20
+    assert power_from_pct(8) == 0.08
+    assert power_from_pct(1) == 0.01
 
 
-def test_file_value_above_a_ceiling_refuses_to_start(tmp_path):
-    path = write_config(tmp_path, MINIMAL_TOML.replace(
-        "budget_motion_s = 12", "budget_motion_s = 60"))
-    with pytest.raises(ConfigError):
-        load_config(path, env={})
-
-
-def test_every_limits_and_safety_key_has_a_ceiling(tmp_path):
-    config = load_config(write_config(tmp_path), env={})
-    for section in ("limits", "safety"):
-        for key in type(getattr(config, section)).model_fields:
-            assert f"{section}.{key}" in CEILINGS, f"{section}.{key}"
-
-
-def test_a_literal_secret_in_the_file_is_refused(tmp_path):
-    path = write_config(tmp_path, MINIMAL_TOML + '\n[box]\napi_key = "sk-live"\n')
-    with pytest.raises(ConfigError) as excinfo:
-        load_config(path, env={})
-    assert "secret" in str(excinfo.value)
-
-
-def test_api_key_env_names_a_variable_and_is_allowed(tmp_path):
-    path = write_config(
-        tmp_path, MINIMAL_TOML + '\n[box]\napi_key_env = "ROVER_BOX_API_KEY"\n'
-    )
-    assert load_config(path, env={}).box.api_key_env == "ROVER_BOX_API_KEY"
-
-
-def test_cmd_gate_must_be_tighter_than_link_alive(tmp_path):
-    path = write_config(
-        tmp_path,
-        MINIMAL_TOML + "\ncmd_gate_max_age_ms = 200\n",
-    )
-    with pytest.raises(ConfigError):
-        load_config(path, env={})
-
-
-def test_renaming_the_robot_without_a_wake_model_is_refused(tmp_path):
-    """5.8 calls [robot] name the wake-word identity.
-
-    A33 logs every applied override at WARN, so a key nothing reads reports
-    that the change took effect while the robot goes on listening for the old
-    name.  The wake model is trained for exactly one name (open item 11), so
-    the two have to agree or startup refuses.
-    """
-    pyopen = '\n[wake]\nbackend = "pyopen"\nmodel = "/data/models/wake/rover.tflite"\n'
-    path = write_config(tmp_path, MINIMAL_TOML + pyopen)
-    assert load_config(path, env={}).robot.name == "rover"
-    with pytest.raises(ConfigError):
-        load_config(path, env={"ROVER__ROBOT__NAME": "scout"})
-
-    # A model named for the robot passes however it is decorated.
-    hey = (
-        '\n[wake]\nbackend = "pyopen"\n'
-        'model = "/data/models/wake/hey_scout_v2.tflite"\n'
-    )
-    scout = write_config(tmp_path, MINIMAL_TOML + hey)
-    assert load_config(scout, env={"ROVER__ROBOT__NAME": "scout"}).robot.name == "scout"
-
-    # Every other wake backend is unaffected: the hotkey has no model at all.
-    hotkey = write_config(tmp_path, MINIMAL_TOML + '\n[wake]\nbackend = "hotkey"\n')
-    assert load_config(hotkey, env={"ROVER__ROBOT__NAME": "scout"}).robot.name == "scout"
-
-
-def test_unknown_section_or_key_is_refused(tmp_path):
-    with pytest.raises(ConfigError):
-        load_config(write_config(tmp_path, MINIMAL_TOML + "\n[nonsense]\nx = 1\n"),
-                    env={})
-    with pytest.raises(ConfigError):
-        load_config(write_config(tmp_path, MINIMAL_TOML + "\nspeed_kph = 5\n"),
-                    env={})
-
-
-def test_malformed_override_name_is_refused(tmp_path):
-    with pytest.raises(ConfigError):
-        load_config(write_config(tmp_path), env={"ROVER__SPEED": "1"})
-
-
-def test_battery_table_must_be_a_table(tmp_path):
-    path = write_config(
-        tmp_path,
-        MINIMAL_TOML + "\n[battery]\nocv_per_cell = [4.2, 3.9]\nsoc_pct = [100]\n",
-    )
-    with pytest.raises(ConfigError):
-        load_config(path, env={})
-
-
-def test_bus_source_names_match_the_message_source_enum():
-    assert set(_SourceName.__args__) == {s.value for s in Source}
+@given(st.one_of(st.integers(min_value=-30, max_value=-1),
+                 st.integers(min_value=1, max_value=30)))
+def test_every_model_power_lands_inside_the_bus_bound(power_pct):
+    power = power_from_pct(power_pct)
+    assert abs(power) <= POWER_CAP
+    assert round(power * 100) == power_pct
+    assert DriveForBusArgs(duration_s=1.0, power=power).power == power
 
 
 # --------------------------------------------------------------------------
@@ -823,14 +1040,15 @@ def test_bus_source_names_match_the_message_source_enum():
 def test_jsonl_appends_and_reads_back(tmp_path):
     path = tmp_path / "logs" / "episode.jsonl"
     with JsonlWriter(path) as writer:
-        writer.write({"x.vel": 0.1, "y.vel": 0.0, "theta.vel": 30.0})
+        writer.write({"left": 0.2, "right": 0.2, "heading_deg": 87.5})
         writer.write(WorldState.model_validate(WORLD_STATE))
     with JsonlWriter(path) as writer:
-        writer.write({"x.vel": 0.0, "y.vel": 0.0, "theta.vel": 0.0})
+        writer.write({"left": 0.0, "right": 0.0, "heading_deg": 87.5})
     rows = list(read_jsonl(path))
     assert len(rows) == 3
-    assert rows[0] == {"x.vel": 0.1, "y.vel": 0.0, "theta.vel": 30.0}
-    assert rows[1]["pose_cm"] == {"x": 142, "y": -30}
+    assert rows[0] == {"left": 0.2, "right": 0.2, "heading_deg": 87.5}
+    assert rows[1]["heading_deg"] == 87
+    assert "pose_cm" not in rows[1]
 
 
 def test_jsonl_refuses_non_finite_numbers(tmp_path):
@@ -868,27 +1086,6 @@ def test_atomic_write_leaves_the_old_file_intact_on_a_bad_record(tmp_path):
 
 
 # --------------------------------------------------------------------------
-# Cross-module consistency
-# --------------------------------------------------------------------------
-
-
-def test_skill_message_args_union_is_exhaustive():
-    for name, model in BUS_SKILL_ARGS.items():
-        example = {
-            "drive": {"distance_m": 0.1, "speed_mps": 0.1},
-            "turn": {"angle_deg": 10.0, "rate_dps": 10.0},
-            "say": {"text": "hello"},
-            "describe_scene": {},
-            "find": {"object": "mug", "max_sweeps": 1},
-            "set_face": {"expr": "happy"},
-        }[name]
-        message = SkillMessage.model_validate(
-            {**CLIENT_MESSAGES[4], "skill": name, "args": example}
-        )
-        assert type(message.args) is model
-
-
-# --------------------------------------------------------------------------
 # The JSON path, which is the one the sockets actually use
 # --------------------------------------------------------------------------
 
@@ -898,8 +1095,8 @@ def test_skill_message_args_union_is_exhaustive():
     [(client_adapter, m) for m in CLIENT_MESSAGES]
     + [(server_adapter, m) for m in SERVER_MESSAGES]
     + [(brain_client_adapter, m) for m in BRAIN_MESSAGES],
-    ids=[f"client-{m['type']}" for m in CLIENT_MESSAGES]
-    + [f"server-{i}-{m['type']}" for i, m in enumerate(SERVER_MESSAGES)]
+    ids=[f"client-{i}" for i in CLIENT_IDS]
+    + [f"server-{i}" for i in SERVER_IDS]
     + [f"brain-{m['type']}" for m in BRAIN_MESSAGES],
 )
 def test_documented_messages_survive_a_json_round_trip(adapter, message):
@@ -910,65 +1107,18 @@ def test_documented_messages_survive_a_json_round_trip(adapter, message):
 
 def test_ndjson_line_with_a_coerced_number_is_rejected():
     # A12 stage two: structured generation guarantees syntax, not values.
-    line = json.dumps({**CLIENT_MESSAGES[4], "goal_ttl_ms": "5000"})
+    line = json.dumps({**SKILL_MESSAGE, "goal_ttl_ms": "2750"})
     with pytest.raises(ValidationError):
         client_adapter.validate_json(line)
 
 
 def test_skill_call_from_the_box_is_validated_as_json_text():
     parsed = skill_call_adapter.validate_json(json.dumps(SKILL_CALLS[0]))
-    assert parsed.args.distance_cm == 40
-    with pytest.raises(ValidationError):
-        skill_call_adapter.validate_json('{"speech":"x","skill":"drive",'
-                                         '"args":{"distance_cm":40,"speed_cms":"15"}}')
-
-
-# --------------------------------------------------------------------------
-# The bounds table and the argument models must say the same thing
-# --------------------------------------------------------------------------
-
-BASE_ARGS = {
-    "drive": {"distance_m": 0.1, "speed_mps": 0.1},
-    "turn": {"angle_deg": 10.0, "rate_dps": 10.0},
-    "say": {"text": "hello"},
-    "describe_scene": {},
-    "find": {"object": "mug", "max_sweeps": 1},
-    "set_face": {"expr": "happy"},
-    "twist": {"linear_x_mps": 0.1, "angular_z_radps": 0.1},
-}
-
-EDGE_CASES = [
-    (spec.name, bound)
-    for spec in CATALOG
-    if spec.bus_args is not None
-    for bound in spec.bounds
-]
-
-
-def _value(bound, magnitude):
-    return "x" * int(magnitude) if bound.unit is Unit.CHARS else magnitude
-
-
-@pytest.mark.parametrize(
-    ("skill", "bound"), EDGE_CASES, ids=[f"{s}.{b.field}" for s, b in EDGE_CASES]
-)
-def test_each_bound_matches_its_argument_model(skill, bound):
-    model = SKILLS[skill].bus_args
-    step = 1 if bound.unit in (Unit.CHARS, Unit.COUNT) else 0.001
-
-    inside = bound.hi if not bound.hi_exclusive else bound.hi - step
-    assert bound.contains(inside)
-    model.model_validate({**BASE_ARGS[skill], bound.field: _value(bound, inside)})
-
-    outside = bound.hi + step
-    assert not bound.contains(outside)
-    with pytest.raises(ValidationError):
-        model.model_validate({**BASE_ARGS[skill], bound.field: _value(bound, outside)})
-
-    below = bound.lo - step
-    assert not bound.contains(below)
-    if bound.unit is not Unit.CHARS or below >= 0:
+    assert parsed.args.duration_ms == 1500 and parsed.args.power_pct == 20
+    for bad in (
+        '{"speech":"x","skill":"drive_for","args":{"duration_ms":1500,"power_pct":"20"}}',
+        '{"speech":"x","skill":"drive_for","args":{"duration_ms":NaN,"power_pct":20}}',
+        '{"speech":"x","skill":"turn_to","args":{"heading_deg":Infinity}}',
+    ):
         with pytest.raises(ValidationError):
-            model.model_validate(
-                {**BASE_ARGS[skill], bound.field: _value(bound, below)}
-            )
+            skill_call_adapter.validate_json(bad)

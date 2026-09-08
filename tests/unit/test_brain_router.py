@@ -1,9 +1,9 @@
 """The local intents, answered without the box.
 
-ARCHITECTURE 4.6: a dead box degrades the rover to these.  So the five the
-document names -- stop, forward, back, left, right -- plus ``say`` must be
-answerable from a regex table, and every number the table produces must already
-be inside the schema's own bounds.
+ARCHITECTURE 4.6: a dead box degrades the rover to these.  The rover is open
+loop, so a local drive is the default power for one second and a local turn is
+an absolute heading: the router does the heading arithmetic the model is told
+to do, wrap included, and every call it mints is already a valid SkillCall.
 """
 
 from __future__ import annotations
@@ -15,11 +15,27 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "packages"))
 
+from rover_brain.prompt import build_world_state  # noqa: E402
 from rover_brain.router import RouterDefaults, route  # noqa: E402
 from rover_contracts.config import LimitsConfig  # noqa: E402
 from rover_contracts.messages import skill_call_adapter  # noqa: E402
+from rover_contracts.worldstate import MotionBudget, WorldState  # noqa: E402
 
 DEFAULTS = RouterDefaults.from_limits(LimitsConfig())
+
+
+def world(heading_deg: int = 87) -> WorldState:
+    return build_world_state(
+        heading_deg=heading_deg,
+        battery_pct=62,
+        obstacle_ahead=False,
+        front_range_cm=120,
+        bumper=False,
+        moving=False,
+        power_cap_pct=20,
+        budget=MotionBudget(seconds=9),
+        allow_motion=True,
+    )
 
 
 @pytest.mark.parametrize(
@@ -27,81 +43,101 @@ DEFAULTS = RouterDefaults.from_limits(LimitsConfig())
     ["stop", "STOP", "stop now", "halt", "whoa", "please stop moving", "freeze"],
 )
 def test_stop_is_answered_locally(text: str) -> None:
-    call = route(text)
+    call = route(text, world())
     assert call is not None and call.skill == "stop"
 
 
 def test_stop_wins_over_every_other_intent_in_the_sentence() -> None:
-    call = route("stop, then go forward")
+    call = route("stop, then go forward", world())
+    assert call is not None and call.skill == "stop"
+    call = route("what do you see? stop!", world())
     assert call is not None and call.skill == "stop"
 
 
 @pytest.mark.parametrize(
-    ("text", "distance_cm"),
-    [
-        ("go forward", 30),
-        ("forward", 30),
-        ("move straight ahead", 30),
-        ("go forward 50 cm", 50),
-        ("forward 50 centimetres", 50),
-        ("drive forward half a metre", 50),
-        ("go forward 1 m", 60),
-        ("go forward twenty", 20),
-        ("go forward 5 metres", 60),
-    ],
+    "text", ["go forward", "forward", "move straight ahead", "go ahead a bit"]
 )
-def test_forward_is_answered_locally(text: str, distance_cm: int) -> None:
-    call = route(text, DEFAULTS)
-    assert call is not None and call.skill == "drive"
-    assert call.args.distance_cm == distance_cm
-    assert call.args.speed_cms == 20  # [limits] speed_default_mps
+def test_forward_is_a_one_second_drive_at_the_default_power(text: str) -> None:
+    call = route(text, world(), DEFAULTS)
+    assert call is not None and call.skill == "drive_for"
+    assert call.args.duration_ms == 1000
+    assert call.args.power_pct == 20  # [limits] power_default 0.20
+    assert call.speech == "Going forward."
+
+
+@pytest.mark.parametrize("text", ["go back", "back up", "reverse", "backwards please"])
+def test_back_is_the_same_drive_with_negative_power(text: str) -> None:
+    call = route(text, world(), DEFAULTS)
+    assert call is not None and call.skill == "drive_for"
+    assert call.args.duration_ms == 1000
+    assert call.args.power_pct == -20
 
 
 @pytest.mark.parametrize(
-    ("text", "distance_cm"),
-    [
-        ("go back", -30),
-        ("back up", -30),
-        ("reverse 20 cm", -20),
-        ("backwards half a meter", -50),
-    ],
+    ("heading", "expected"),
+    [(87, 357), (90, 0), (30, 300), (0, 270), (180, 90)],
 )
-def test_back_is_answered_locally(text: str, distance_cm: int) -> None:
-    call = route(text, DEFAULTS)
-    assert call is not None and call.skill == "drive"
-    assert call.args.distance_cm == distance_cm
+def test_left_is_ninety_degrees_less_wrapped(heading: int, expected: int) -> None:
+    """The model is told: turn left 90 is (heading - 90) mod 360."""
+    call = route("turn left", world(heading), DEFAULTS)
+    assert call is not None and call.skill == "turn_to"
+    assert call.args.heading_deg == expected
+    assert call.speech == "Turning left."
 
 
 @pytest.mark.parametrize(
-    ("text", "angle_deg"),
-    [
-        ("turn left", 90),
-        ("left", 90),
-        ("turn left ninety degrees", 90),
-        ("turn left 45 degrees", 45),
-        ("turn left forty five degrees", 45),
-        ("turn left one eighty", 180),
-        ("turn left 400 degrees", 180),
-    ],
+    ("heading", "expected"),
+    [(87, 177), (270, 0), (300, 30), (359, 89), (0, 90)],
 )
-def test_left_is_counter_clockwise(text: str, angle_deg: int) -> None:
-    call = route(text, DEFAULTS)
-    assert call is not None and call.skill == "turn"
-    assert call.args.angle_deg == angle_deg
+def test_right_is_ninety_degrees_more_wrapped(heading: int, expected: int) -> None:
+    call = route("turn right", world(heading), DEFAULTS)
+    assert call is not None and call.skill == "turn_to"
+    assert call.args.heading_deg == expected
 
 
 @pytest.mark.parametrize(
-    ("text", "angle_deg"),
-    [("turn right", -90), ("right 45 degrees", -45), ("turn right ninety", -90)],
+    ("text", "heading", "expected"),
+    [
+        ("turn around", 87, 267),
+        ("turn around", 180, 0),
+        ("spin around", 270, 90),
+        ("about face", 0, 180),
+        ("make a u-turn", 359, 179),
+    ],
 )
-def test_right_is_clockwise(text: str, angle_deg: int) -> None:
-    call = route(text, DEFAULTS)
-    assert call is not None and call.skill == "turn"
-    assert call.args.angle_deg == angle_deg
+def test_turn_around_is_a_half_turn(text: str, heading: int, expected: int) -> None:
+    call = route(text, world(heading), DEFAULTS)
+    assert call is not None and call.skill == "turn_to"
+    assert call.args.heading_deg == expected
+    assert call.speech == "Turning around."
+
+
+def test_every_local_heading_is_in_the_turn_to_frame() -> None:
+    for heading in range(0, 360, 7):
+        for text in ("turn left", "turn right", "turn around"):
+            call = route(text, world(heading), DEFAULTS)
+            assert call is not None and 0 <= call.args.heading_deg <= 359
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "look",
+        "Look.",
+        "take a look",
+        "look around",
+        "what do you see",
+        "What can you see?",
+    ],
+)
+def test_look_is_describe_scene(text: str) -> None:
+    call = route(text, world())
+    assert call is not None and call.skill == "describe_scene"
+    assert call.speech == "Let me look."
 
 
 def test_say_repeats_the_rest_of_the_sentence() -> None:
-    call = route("say hello there")
+    call = route("say hello there", world())
     assert call is not None and call.skill == "say"
     assert call.args.text == "hello there"
     assert call.speech == ""
@@ -110,21 +146,22 @@ def test_say_repeats_the_rest_of_the_sentence() -> None:
 @pytest.mark.parametrize(
     "text",
     [
-        "what do you see",
         "what is ahead of you",
         "is the mug on the table?",
         "find the red mug",
+        "look for the red mug",
         "look happy",
         "describe the room",
         "",
     ],
 )
 def test_anything_else_goes_to_the_box(text: str) -> None:
-    assert route(text) is None
+    assert route(text, world()) is None
 
 
 def test_a_question_never_drives_even_when_it_names_a_direction() -> None:
-    assert route("how far forward can you go?") is None
+    assert route("how far forward can you go?", world()) is None
+    assert route("can you turn left?", world()) is None
 
 
 def test_every_local_answer_is_a_valid_skill_call() -> None:
@@ -132,28 +169,32 @@ def test_every_local_answer_is_a_valid_skill_call() -> None:
     permission check and executor run on both paths."""
     for text in (
         "stop",
-        "go forward 60 cm",
+        "go forward",
         "back up",
-        "turn left ninety degrees",
+        "turn left",
         "turn right",
+        "turn around",
+        "look",
         "say the kettle is on",
     ):
-        call = route(text, DEFAULTS)
+        call = route(text, world(), DEFAULTS)
         assert call is not None
         assert skill_call_adapter.validate_python(call.model_dump()) == call
 
 
-def test_a_number_the_speaker_shouts_is_clamped_not_rejected() -> None:
-    """Clamped to what the deadline admits at the default speed cap, not to the
-    schema's 100 cm: a router call the validator then refuses `goal_ttl_too_long`
-    is the box-down path answering with a reason string instead of moving."""
-    call = route("go forward 900 cm", DEFAULTS)
-    assert call is not None and call.args.distance_cm == 60
-    call = route("back up 900 cm", DEFAULTS)
-    assert call is not None and call.args.distance_cm == -60
+def test_a_number_in_the_sentence_cannot_widen_anything() -> None:
+    """Open loop: there is no distance to parse, and the router does not take
+    a power or a duration from the transcript either."""
+    call = route("go forward 900 cm at full power for ten seconds", world(), DEFAULTS)
+    assert call is not None and call.skill == "drive_for"
+    assert call.args.duration_ms == 1000 and call.args.power_pct == 20
 
 
-def test_the_default_speed_comes_from_limits_not_a_literal() -> None:
-    slow = RouterDefaults.from_limits(LimitsConfig(speed_default_mps=0.10))
-    call = route("go forward", slow)
-    assert call is not None and call.args.speed_cms == 10
+def test_the_default_power_comes_from_limits_not_a_literal() -> None:
+    slow = RouterDefaults.from_limits(LimitsConfig(power_default=0.10))
+    call = route("go forward", world(), slow)
+    assert call is not None and call.args.power_pct == 10
+    assert RouterDefaults.from_limits(LimitsConfig(power_default=0.30)).power_pct == 30
+    # A power_default that rounds to nothing is still a legal, non-zero drive.
+    tiny = LimitsConfig(power_default=0.004, power_min=0.0)
+    assert RouterDefaults.from_limits(tiny).power_pct == 1

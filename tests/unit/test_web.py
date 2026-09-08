@@ -1,6 +1,6 @@
-"""rover-web: the pages serve, STOP posts the right message, oversized uploads
-are refused, and the app comes up with robotd and brain absent
-(ARCHITECTURE 4.5, I-22)."""
+"""rover-web: the pages serve, STOP posts the right message, the joystick
+becomes a bounded ``TwistPayload(lin, ang)``, oversized uploads are refused,
+and the app comes up with robotd and brain absent (ARCHITECTURE 4.5, I-22)."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from aiohttp import web
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "packages"))
 
-from rover_contracts.config import BusConfig, RobotConfig  # noqa: E402
+from rover_contracts.config import BusConfig, LimitsConfig, RobotConfig  # noqa: E402
 from rover_contracts.messages import (  # noqa: E402
     ClearableFault,
     EstopMessage,
@@ -30,9 +30,11 @@ from rover_contracts.messages import (  # noqa: E402
     brain_client_adapter,
     client_adapter,
 )
+from rover_contracts.wave_proto import StopFlag  # noqa: E402
 from rover_web.app import (  # noqa: E402
     MAX_BODY_BYTES,
     STATIC_DIR,
+    STOP_FLAG_BITS,
     TeleopStream,
     create_app,
 )
@@ -158,6 +160,23 @@ async def test_no_page_loads_an_external_asset():
         assert 'src="//' not in text
 
 
+async def test_the_readout_shows_the_rover_fields_and_no_pose():
+    """Open loop: heading, firmware tag, heartbeat, stop flags, front range,
+    battery and budget seconds; nothing about a pose or wheels remains."""
+    script = (STATIC_DIR / "rover.js").read_text()
+    fields = ("heading_deg", "fw", "hb_ok", "stop_flags", "front_m", "pack_v", "motion_s")
+    for field in fields:
+        assert field in script
+    for page in ("face.html", "teleop.html"):
+        html = (STATIC_DIR / page).read_text()
+        assert 'id="state"' in html
+        assert "stateReadout" in html
+    for path in sorted(STATIC_DIR.iterdir()):
+        text = path.read_text().lower()
+        for retired in ("pose", "wheel", "odom", "mcu.fault", "latched_faults"):
+            assert retired not in text, (path.name, retired)
+
+
 # --------------------------------------------------------------------------
 # the stop authorities
 # --------------------------------------------------------------------------
@@ -203,54 +222,50 @@ async def test_stop_and_clear_also_reach_robotd():
         await robotd.close()
 
 
-async def test_clear_names_the_latched_fault_the_page_asked_for():
-    """I-20's designed event latches WDT_REBOOT, not estop_sw.  With no body
-    form, the page's only recovery control cleared the wrong bit and the rover
-    stayed dead to voice, web and teleop."""
+async def test_clear_names_the_fault_the_page_asked_for():
     with _tmpdir() as tmp:
         robotd = FakePeer(tmp / "robotd.sock")
         await robotd.start()
         async with _serving(_config(tmp)) as session:
             await _wait(lambda: len(robotd.lines) >= 2)
             response = await session.post(
-                "/clear", json={"faults": ["wdt_reboot", "brownout"]}
+                "/clear", json={"faults": ["low_battery", "obstacle_latched"]}
             )
             assert response.status == 200
-            assert (await response.json())["faults"] == ["wdt_reboot", "brownout"]
+            body = await response.json()
+            assert body["faults"] == ["low_battery", "obstacle_latched"]
             await _wait(lambda: len(robotd.lines) >= 3)
             clear = json.loads(robotd.lines[2])
             assert clear["type"] == "clear"
             assert clear["source"] == "web"
-            assert clear["faults"] == ["wdt_reboot", "brownout"]
+            assert clear["faults"] == ["low_battery", "obstacle_latched"]
 
             # An unknown name is a 400, not a silently dropped clear.
-            bad = await session.post("/clear", json={"faults": ["nonsense"]})
+            bad = await session.post("/clear", json={"faults": ["wdt_reboot"]})
             assert bad.status == 400
             empty = await session.post("/clear", json={"faults": []})
             assert empty.status == 400
         await robotd.close()
 
 
-async def test_status_publishes_the_latched_fault_bit_table():
-    """The face page decodes state.mcu.fault with this table rather than
-    restating the 5.1 class in JavaScript."""
-    from rover_contracts.serial_codec import LATCHED_FAULTS, Fault
-
+async def test_status_publishes_the_stop_flag_table_and_the_clearable_names():
+    """The pages decode state.rover.stop_flags with this table rather than
+    restating docs/protocol.md in JavaScript."""
     with _tmpdir() as tmp:
         async with _serving(_config(tmp)) as session:
-            table = (await (await session.get("/status")).json())["latched_faults"]
-    assert table["wdt_reboot"] == int(Fault.WDT_REBOOT)
-    assert table["obstacle_latched"] == int(Fault.OBSTACLE_LATCHED)
-    assert "tof_stop" not in table  # obstacle class: the MCU is the sole clearer
-    assert "ttl" not in table  # advisory
-    assert sum(table.values()) == int(LATCHED_FAULTS)
-    # Every name the panel can offer is a ClearableFault robotd will accept.
-    assert set(table) <= {str(f) for f in ClearableFault}
+            status = await (await session.get("/status")).json()
+    assert status["stop_flags"] == STOP_FLAG_BITS
+    assert status["stop_flags"] == {
+        "heartbeat": 1, "tof": 2, "bumper": 4, "lowbat": 8, "coast": 16,
+    }
+    assert sum(status["stop_flags"].values()) == sum(int(flag) for flag in StopFlag)
+    assert status["clearable"] == [str(fault) for fault in ClearableFault]
+    assert "latched_faults" not in status
 
 
 async def test_stop_button_answers_200_with_robotd_dead():
     """It must report honestly, not fail: the button is an authority, not a
-    dependency, and the page has to say the hardware button is the fallback."""
+    dependency, and the page has to say the inline switch is the fallback."""
     with _tmpdir() as tmp:
         async with _serving(_config(tmp)) as session:
             response = await session.post("/estop")
@@ -339,28 +354,32 @@ class _StubClient:
         return True
 
 
+async def test_the_stick_becomes_lin_and_ang_in_power_units():
+    client = _StubClient()
+    stream = TeleopStream(client, twist_power=0.30, input_max_age_ms=5000)
+    stream.update(0.5, 1.0)
+    stream.tick()
+    twist = client.sent[-1].twist
+    assert (twist.lin, twist.ang) == (0.30, 0.15)
+    stream.update(-1.0, -0.5)
+    stream.tick()
+    twist = client.sent[-1].twist
+    assert (twist.lin, twist.ang) == (-0.15, -0.30)
+    await stream.close()
+
+
 async def test_stale_browser_input_sends_one_zero_then_stops():
     client = _StubClient()
-    stream = TeleopStream(
-        client,
-        linear_mps=0.30,
-        angular_radps=1.047,
-        input_max_age_ms=60,
-        hz=500.0,
-    )
+    stream = TeleopStream(client, twist_power=0.30, input_max_age_ms=60, hz=500.0)
     stream.update(0.5, 1.0)
     assert stream.streaming
     await asyncio.sleep(0.25)
     assert not stream.streaming
 
     first, last = client.sent[0], client.sent[-1]
-    assert (first.twist.linear_x_mps, first.twist.angular_z_radps) == (0.30, 0.5235)
-    assert (last.twist.linear_x_mps, last.twist.angular_z_radps) == (0.0, 0.0)
-    zeros = [
-        m
-        for m in client.sent
-        if m.twist.linear_x_mps == m.twist.angular_z_radps == 0.0
-    ]
+    assert (first.twist.lin, first.twist.ang) == (0.30, 0.15)
+    assert (last.twist.lin, last.twist.ang) == (0.0, 0.0)
+    zeros = [m for m in client.sent if m.twist.lin == m.twist.ang == 0.0]
     assert len(zeros) == 1
     assert [m.seq for m in client.sent] == sorted(m.seq for m in client.sent)
 
@@ -371,14 +390,11 @@ async def test_stale_browser_input_sends_one_zero_then_stops():
 
 async def test_closing_the_socket_is_an_immediate_zero():
     client = _StubClient()
-    stream = TeleopStream(
-        client, linear_mps=0.30, angular_radps=1.047, input_max_age_ms=5000
-    )
+    stream = TeleopStream(client, twist_power=0.30, input_max_age_ms=5000)
     stream.update(1.0, 1.0)
     await stream.close()
     assert not stream.streaming
-    assert client.sent[-1].twist.linear_x_mps == 0.0
-    assert client.sent[-1].twist.angular_z_radps == 0.0
+    assert (client.sent[-1].twist.lin, client.sent[-1].twist.ang) == (0.0, 0.0)
 
 
 async def test_a_browser_cannot_name_an_out_of_bounds_twist():
@@ -395,8 +411,8 @@ async def test_a_browser_cannot_name_an_out_of_bounds_twist():
             twist = client_adapter.validate_json(json.dumps(robotd.typed("twist")[0]))
             assert isinstance(twist, TwistMessage)
             assert twist.source == "teleop"
-            assert twist.twist.linear_x_mps == -0.30
-            assert twist.twist.angular_z_radps == 1.047
+            assert twist.twist.lin == -LimitsConfig().twist_power
+            assert twist.twist.ang == LimitsConfig().twist_power
         await robotd.close()
 
 
@@ -425,7 +441,7 @@ async def test_the_app_starts_with_robotd_and_brain_absent():
             assert status["brain"] is False
             assert status["teleop_allowed"] is False
             assert status["teleop"] is False
-            assert status["latched_faults"]["wdt_reboot"] == 0x20000
+            assert status["stop_flags"]["lowbat"] == int(StopFlag.LOWBAT)
             assert (await session.post("/utter", json={"text": "hello"})).status == 200
 
 
