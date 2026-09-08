@@ -15,6 +15,8 @@ make test
 make sim
 ```
 
+If the checkout sits inside a synced folder (iCloud Drive's Desktop & Documents, Dropbox), keep the interpreter outside it: `export UV_PROJECT_ENVIRONMENT=~/.venvs/bot` before `uv sync`, and every `make` target follows it, putting the bytecode cache there too. iCloud evicts rarely-read files and re-fetches them on demand, and a test that imports the OpenAI SDK then blocks for minutes on a single `.pyc`; it also mints `name 2` duplicates that have already corrupted one git ref here. Moving the repository out of the synced folder is the better fix.
+
 `make sim` starts fakebox, rover-stub, robotd, camera, brain, and web using `config/robot.mac.toml`.
 It stops only the processes it started when you press Ctrl-C.
 In another terminal:

@@ -38,7 +38,7 @@ boundary is drawn, so it is drawn explicitly:
   `piper --output-raw` as a **subprocess** and reads its stdout (A28).
 - Piper is **never a dependency of the published package.** It appears nowhere
   in `pyproject.toml`, in `uv.lock`, or in any wheel this repo produces.
-- Piper is installed by `deploy/install.sh` into **its own virtual environment**
+- Piper is installed by `hosts/pi/deploy/install.sh` into **its own virtual environment**
   at `/opt/rover/.venv-tts`, which `[tts] bin` points at by absolute path.
   Nothing in `/opt/rover/.venv` can see it.
 - On macOS the default is `[tts] backend = "say"`, so a developer machine never
@@ -82,11 +82,11 @@ None of these is distributed by this repository; each is pulled at build time.
 
 | thing | licence | note |
 |---|---|---|
-| ESP-IDF v5.5.5 | Apache-2.0 | `firmware/main/` links it; `firmware/core/` has zero IDF headers and is first-party |
-| `espressif/idf:v5.5.5` image | Apache-2.0 (contents vary) | `make firmware` only |
+| ESP-IDF v5.5.5 and the `espressif/idf:v5.5.5` image | Apache-2.0 | the retired controller under `legacy/firmware-s3/` only; nothing current builds against it |
+| arduino-cli, the `esp32` Arduino core 2.0.17 and the pinned Arduino libraries | GPL-3.0 (arduino-cli), LGPL-2.1 (core), various (see `firmware/build.sh`) | `make firmware` only; pulled at build time, never distributed here |
 | vLLM | Apache-2.0 | `docker/compose.box.yml`, on the box |
 | `wyoming-faster-whisper`, Kokoro-FastAPI | MIT / Apache-2.0 | opt-in speech profile, dark until G3b |
-| `uv` | Apache-2.0 or MIT | installed to a fixed path by `deploy/install.sh` |
+| `uv` | Apache-2.0 or MIT | installed to a fixed path by `hosts/pi/deploy/install.sh` |
 | `esptool` | GPL-2.0-or-later | run via `uvx` at flash time only; never imported, never installed into the runtime environment |
 | apt's `python3-picamera2`, `python3-libcamera`, `python3-simplejpeg` | BSD-2-Clause / LGPL-2.1+ | system packages on the Pi, imported through `--system-site-packages` |
 
@@ -96,7 +96,7 @@ dependency of anything this repository publishes.
 
 ## Research notes
 
-`docs/research/` contains thirteen notes written for this project. They quote
+`docs/research/` contains fourteen notes written for this project. They quote
 and cite third-party pages; the quotes belong to their authors and every one
 carries its source URL. See `docs/research/README.md` for which notes were
 independently verified.

@@ -3,8 +3,14 @@ SHELL := /bin/bash
 .DEFAULT_GOAL := help
 
 UV       ?= uv
-VENV     ?= .venv
+# uv's own variable wins when set, so a checkout under a synced folder (iCloud
+# Drive evicts and re-fetches files, and a venv of 30k small files stalls for
+# minutes) can keep its interpreter somewhere plain: UV_PROJECT_ENVIRONMENT=~/.venvs/bot
+VENV     ?= $(or $(UV_PROJECT_ENVIRONMENT),.venv)
 PY       ?= $(VENV)/bin/python
+# The bytecode cache lives beside the interpreter, never inside the checkout: an
+# evicted __pycache__/*.pyc in a synced tree blocks import for minutes.
+export PYTHONPYCACHEPREFIX ?= $(abspath $(VENV))/pycache
 CONFIG   ?= config/robot.mac.toml
 RUN_DIR  ?= run
 WEB_PORT ?= 8080
