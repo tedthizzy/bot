@@ -1,4 +1,12 @@
-"""The fixed sentence tables of A31.
+"""The three filler tiers of A31, and the fixed completion table.
+
+1. **Acknowledgement** -- a tone, not speech, played the moment an utterance is
+   accepted.  A tone cannot be wrong.
+2. **Waiting line** -- one fixed sentence during PLANNING, started on a delay so
+   that a fast plan never talks over itself, and cancelled the instant the
+   model's first sentence is ready.
+3. **Intent** -- the model's own ``speech``, spoken in SPEAKING_INTENT by the
+   FSM; the skill is not dispatched until it has finished playing.
 
 Completion speech is a table, not a generated sentence, and it is driven by the
 executor's result: nothing here can be spoken before robotd has reported one,
@@ -13,24 +21,35 @@ executor's measurement, not the model's claim.
 
 from __future__ import annotations
 
+import asyncio
+import math
+import struct
 from typing import Final
 
 from rover_contracts.messages import ResultDetail, ResultReason, ResultStatus, SkillName
 from rover_contracts.units import round_half_away
 
+from rover_brain.audio.tts import Tts
+
 __all__ = [
     "APOLOGY",
     "BOX_LOST",
+    "EARCON_HZ",
+    "EARCON_MS",
     "STOPPING",
     "WAITING",
+    "FillerPlayer",
     "completion_sentence",
     "reason_sentence",
+    "tone_pcm",
 ]
+
+# -- the fixed sentences
 
 WAITING: Final = "One moment."
 """Tier two: the waiting line, spoken during PLANNING only if the plan is slow.
-Tier one is a tone (:func:`rover_brain.filler.player.tone_pcm`) and tier three
-is the model's own ``speech``, spoken in SPEAKING_INTENT before dispatch."""
+Tier one is a tone (:func:`tone_pcm`) and tier three is the model's own
+``speech``, spoken in SPEAKING_INTENT before dispatch."""
 
 APOLOGY: Final = "I didn't get that."
 """ARCHITECTURE 7's failure path: box timeout or a second schema failure."""
@@ -114,3 +133,73 @@ def completion_sentence(
 def reason_sentence(reason: ResultReason) -> str:
     """What to say about a refusal this host made itself (A12 stage three)."""
     return _BY_REASON.get(reason, _BY_STATUS[ResultStatus.REJECTED])
+
+
+# -- tiers one and two
+
+EARCON_HZ: Final = (784.0, 1046.5)
+"""Two short notes, G5 then C6: recognisable at 40 mm of speaker and short
+enough that the acknowledgement never delays the box call."""
+
+EARCON_MS: Final = 70
+"""Per note.  140 ms of tone in total."""
+
+_FADE_MS: Final = 5
+"""A linear fade at each end; a square-edged tone clicks on a small driver."""
+
+
+def tone_pcm(
+    frequencies: tuple[float, ...], *, ms: int, rate: int, amplitude: float = 0.25
+) -> bytes:
+    """Signed 16-bit little-endian mono PCM for one earcon.
+
+    Pure: the same arguments give the same bytes, so the tone is testable
+    without an audio device.
+    """
+    if not 0.0 < amplitude <= 1.0:
+        raise ValueError(f"amplitude must be in (0, 1], got {amplitude!r}")
+    samples_per_note = int(rate * ms / 1000)
+    fade = max(1, int(rate * _FADE_MS / 1000))
+    peak = int(amplitude * 32767)
+    out = bytearray()
+    for frequency in frequencies:
+        step = 2.0 * math.pi * frequency / rate
+        for n in range(samples_per_note):
+            envelope = min(1.0, n / fade, (samples_per_note - n) / fade)
+            out += struct.pack("<h", int(peak * envelope * math.sin(step * n)))
+    return bytes(out)
+
+
+class FillerPlayer:
+    """Plays tier one immediately and schedules tier two."""
+
+    def __init__(self, tts: Tts, *, delay_s: float = 0.6, line: str = WAITING) -> None:
+        self._tts = tts
+        self._delay_s = delay_s
+        self._line = line
+        self._task: asyncio.Task[None] | None = None
+
+    async def ack(self) -> None:
+        """Tier one: the acknowledgement tone.  Not speech (A31)."""
+        await self._tts.play_pcm(
+            tone_pcm(EARCON_HZ, ms=EARCON_MS, rate=self._tts.sample_rate),
+            self._tts.sample_rate,
+        )
+
+    def start_waiting(self) -> None:
+        """Arm tier two.  It speaks only if it survives ``delay_s``."""
+        self.stop()
+        self._task = asyncio.create_task(self._wait_then_speak())
+
+    def stop(self) -> None:
+        """Cancel tier two, whether it is still waiting or already speaking."""
+        if self._task is not None and not self._task.done():
+            self._task.cancel()
+        self._task = None
+
+    async def _wait_then_speak(self) -> None:
+        try:
+            await asyncio.sleep(self._delay_s)
+            await self._tts.speak(self._line)
+        except asyncio.CancelledError:
+            pass

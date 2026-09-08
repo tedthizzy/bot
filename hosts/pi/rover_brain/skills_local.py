@@ -28,11 +28,10 @@ from typing import Literal, Protocol
 from rover_contracts.messages import Face, ResultReason, ResultStatus, SkillObs
 from rover_contracts.observations import FindObservation, Observation, SceneObservation
 from rover_contracts.skills import FIND_BUDGET_S
-from rover_contracts.units import bearing_deg_from_center_x
+from rover_contracts.units import bearing_deg_from_center_x, heading_left_of
 
 from rover_brain.audio.tts import Tts
 from rover_brain.box import BoxRejected
-from rover_brain.heading import heading_left_of
 from rover_brain.scene import SceneRing
 
 __all__ = [

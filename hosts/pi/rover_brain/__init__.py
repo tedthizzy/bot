@@ -9,7 +9,6 @@ Module map:
 
 ``audio/``        capture, wake, VAD, STT and TTS, each a real backend plus a
                   dev backend, chosen by ``config/robot.toml`` alone
-``heading``       the one heading frame, 0..359: "left of a heading" stated once
 ``router``        the local intents, answered without the box
 ``prompt``        A17's order: static system, image, world state, utterance
 ``box``           the request, the one appending retry, and strict validation
@@ -18,7 +17,7 @@ Module map:
 ``fsm``           ARCHITECTURE 7, pure: events in, actions out
 ``skills_local``  say, describe_scene, set_face and the bounded find scan
 ``scene``         the bounded ring, rewritten atomically, last-seen not truth
-``filler/``       A31's three tiers and the fixed completion table
+``filler``        A31's three tiers and the fixed completion table
 ``main``          the composition root
 
 Nothing outside ``audio/`` and ``box`` touches a device or a socket.

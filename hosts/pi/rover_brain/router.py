@@ -36,9 +36,8 @@ from rover_contracts.messages import (
     TurnToArgs,
     TurnToCall,
 )
+from rover_contracts.units import heading_left_of
 from rover_contracts.worldstate import WorldState
-
-from rover_brain.heading import heading_left_of
 
 __all__ = ["RouterDefaults", "is_stop", "route"]
 

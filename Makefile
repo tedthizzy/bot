@@ -8,9 +8,13 @@ UV       ?= uv
 # minutes) can keep its interpreter somewhere plain: UV_PROJECT_ENVIRONMENT=~/.venvs/bot
 VENV     ?= $(or $(UV_PROJECT_ENVIRONMENT),.venv)
 PY       ?= $(VENV)/bin/python
-# The bytecode cache lives beside the interpreter, never inside the checkout: an
-# evicted __pycache__/*.pyc in a synced tree blocks import for minutes.
+# Every tool cache lives beside the interpreter, never inside the checkout. A
+# synced folder evicts an unread .pyc and blocks import for minutes, and its
+# "name 2" conflict copies made mypy fail with an internal error until the cache
+# was deleted by hand.
 export PYTHONPYCACHEPREFIX ?= $(abspath $(VENV))/pycache
+export MYPY_CACHE_DIR ?= $(abspath $(VENV))/mypy_cache
+export RUFF_CACHE_DIR ?= $(abspath $(VENV))/ruff_cache
 CONFIG   ?= config/robot.mac.toml
 RUN_DIR  ?= run
 WEB_PORT ?= 8080

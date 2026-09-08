@@ -194,7 +194,7 @@ class Robotd:
         self._last_flags = StopFlag(0)
         self._last_clamp_count: int | None = None
         self._feedback_was_fresh = False
-        self._last_state_ns = 0
+        self._last_state_bucket = -1
         self._last_signature: tuple[Any, ...] | None = None
         self._stopping = False
 
@@ -839,10 +839,11 @@ class Robotd:
             state.ready,
         )
         period_ns = int(1e9 / max(1, self.config.bus.state_hz))
-        if signature == self._last_signature and now - self._last_state_ns < period_ns:
+        bucket = now // period_ns
+        if signature == self._last_signature and bucket == self._last_state_bucket:
             return
         self._last_signature = signature
-        self._last_state_ns = now
+        self._last_state_bucket = bucket
         self.bus.broadcast_state(state)
 
     def _state(self, now: int) -> StateMessage:

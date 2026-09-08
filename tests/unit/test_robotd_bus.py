@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import random
 import shutil
 import socket
 import stat
@@ -24,8 +25,10 @@ import pytest
 from rover_contracts.config import BusConfig, LinkConfig, LogConfig, RobotConfig
 from rover_contracts.ids import new_turn_id
 from rover_contracts.messages import ErrorMessage, ResultStatus, SubscribeTopic
+from rover_contracts.wave_proto import Feedback, StopFlag
 from rover_robotd.bus import BusConnection
 from rover_robotd.clients import ClientSession
+from rover_robotd.log import RobotdLog
 from rover_robotd.main import Robotd
 
 REPO = Path(__file__).resolve().parents[2]
@@ -209,6 +212,62 @@ async def test_a_subscriber_receives_state_that_says_the_link_is_down(
         assert state["battery"] == {"pack_v": 0.0, "pct": 0}
         assert state["budget"]["motion_s"] == 12.0
         assert state["twist"] == {"lin": 0.0, "ang": 0.0}
+
+
+# ---------------------------------------------------------------------------
+# The two decimators (A34): state onto the bus, feedback into the log
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.timeout(30)
+async def test_state_is_published_at_the_configured_rate(tmp_path: Path) -> None:
+    """``[bus] state_hz`` is 10, so two seconds of a still rover is ~20 states.
+
+    Both decimators bucket absolute monotonic time.  Measuring the gap since
+    the last publication instead loses a whole control tick whenever the loop
+    wakes a hair early, which cost about a quarter of the states.
+    """
+    async with daemon(tmp_path) as robotd, client(robotd) as web:
+        await web.hello(source="web", caps=("subscribe",))
+        await web.send(type="subscribe", topics=["state"], state_hz=10)
+        await web.recv_type("state")
+        seen = 0
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            with contextlib.suppress(AssertionError, TimeoutError):
+                await web.recv_type("state", timeout=0.5)
+                seen += 1
+        assert seen >= 19, f"{seen} states in 2 s at 10 Hz, expected about 20"
+
+
+def test_the_feedback_log_keeps_its_decimated_rate_under_jitter(tmp_path: Path) -> None:
+    """Sixty seconds of 50 ms frames, decimated to 5 Hz, is exactly 300 lines.
+
+    The arrivals carry the sub-millisecond jitter a real board gives.  Against
+    an elapsed-gap test that jitter drops every fourth line, because a gap of
+    199.6 ms fails ``>= 200 ms`` and the next frame is 50 ms later.
+    """
+    frame = Feedback(
+        left=0.0,
+        right=0.0,
+        roll_deg=0.0,
+        pitch_deg=0.0,
+        yaw_deg=0.0,
+        temp_c=20.0,
+        bus_v=12.0,
+        hb=True,
+        st=StopFlag(0),
+        tof_mm=1000,
+        bumper=False,
+        clamp_count=0,
+    )
+    rng = random.Random(20260908)
+    logs = RobotdLog(tmp_path / "logs", state_decimate_hz=5)
+    written = sum(
+        logs.feedback(frame, k * 50_000_000 + rng.randrange(600_000)) for k in range(1200)
+    )
+    logs.close()
+    assert written == 300, f"{written} lines from 60 s at 5 Hz, expected 300"
 
 
 # ---------------------------------------------------------------------------

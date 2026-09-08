@@ -24,9 +24,8 @@ from pathlib import Path
 from typing import Final
 
 from rover_contracts.jsonl import atomic_write_jsonl
+from rover_contracts.units import heading_left_of
 from rover_contracts.worldstate import RecentlySeen
-
-from rover_brain.heading import heading_left_of
 
 __all__ = ["CAPACITY", "SceneRing", "Sighting"]
 

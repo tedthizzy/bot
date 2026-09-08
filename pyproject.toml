@@ -61,13 +61,6 @@ dev = [
     "hypothesis>=6.100",
     "ruff>=0.6",
     "mypy>=1.11",
-    # The Makefile falls back to .venv/bin/cmake when no system cmake exists,
-    # so a bare Mac with Xcode CLT and no Homebrew still builds firmware/core/
-    # under host clang -- which is directive 3.  Without these in the lock,
-    # `uv sync --frozen` deletes them and `make test` dies with
-    # ".venv/bin/cmake: No such file or directory".
-    "cmake>=3.27",
-    "ninja>=1.11",
 ]
 
 [build-system]
@@ -85,9 +78,7 @@ build-backend = "setuptools.build_meta"
 where = ["packages", "hosts/pi"]
 
 [tool.setuptools.package-data]
-"*" = ["py.typed"]
 rover_web = ["static/*"]
-rover_brain = ["filler/*.wav"]
 
 [tool.ruff]
 line-length = 90
@@ -101,7 +92,8 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 # packages/ on the path so every component's tests import rover_contracts (and
 # each other) whether or not the workspace has been installed.  This is what
 # lets `make test` work from a bare clone.
-pythonpath = ["packages", "hosts/pi"]
+# tests/gates so the pytest gate wrappers import gatelib under any --import-mode.
+pythonpath = ["packages", "hosts/pi", "tests/gates"]
 testpaths = ["tests"]
 addopts = "-q --strict-markers --strict-config"
 asyncio_mode = "auto"

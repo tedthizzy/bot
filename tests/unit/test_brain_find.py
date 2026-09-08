@@ -20,7 +20,6 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "packages"))
 
 from rover_brain import skills_local  # noqa: E402
-from rover_brain.heading import heading_left_of  # noqa: E402
 from rover_brain.scene import SceneRing  # noqa: E402
 from rover_brain.skills_local import (  # noqa: E402
     MAX_SWEEPS,
@@ -34,7 +33,10 @@ from rover_contracts.observations import (  # noqa: E402
     Observation,
     SceneObservation,
 )
-from rover_contracts.units import bearing_deg_from_center_x  # noqa: E402
+from rover_contracts.units import (  # noqa: E402
+    bearing_deg_from_center_x,
+    heading_left_of,
+)
 
 HFOV = 83.0
 

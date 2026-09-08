@@ -13,9 +13,9 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "packages"))
 
-from rover_brain.heading import heading_left_of  # noqa: E402
 from rover_brain.scene import CAPACITY, SceneRing  # noqa: E402
 from rover_contracts.jsonl import read_jsonl  # noqa: E402
+from rover_contracts.units import heading_left_of  # noqa: E402
 from rover_contracts.worldstate import RecentlySeen  # noqa: E402
 
 

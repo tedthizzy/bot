@@ -28,14 +28,19 @@ Source only, at the commit above:
 
 - `General_Driver/*.ino`, `*.h`, `*.cpp` -> `firmware/General_Driver/`
 - `SCServo/` (the bus-servo library the sketch needs, `*.h`, `*.cpp`,
-  `library.properties`, `examples/`) -> `firmware/libraries/SCServo/`
+  `library.properties`) -> `firmware/libraries/SCServo/`
 - `LICENSE` -> `firmware/LICENSE`
 
 Not vendored: `General_Driver/build/` (prebuilt binaries), `README_footage/`
 (photos), `General_Driver/data/` (sample `wifiConfig.json` / `devConfig.json`
-holding Waveshare's office Wi-Fi credentials), the upstream `README.md`, and
-`SCServo/说明.txt`, a GBK-encoded one-paragraph note whose file name is not
-valid UTF-8.
+holding Waveshare's office Wi-Fi credentials), the upstream `README.md`,
+`SCServo/examples/` (14 Arduino IDE example sketches; SCServo has no `src/`, so
+the 1.0 library format applies and arduino-cli compiles the library root and
+`utility/` only -- the recorded build output
+`firmware/build/arduino/libraries/SCServo/` holds exactly `SCS.cpp.o`,
+`SCSCL.cpp.o`, `SCSerial.cpp.o` and `SMS_STS.cpp.o` -- and the fork drives no
+bus servo), and `SCServo/说明.txt`, a
+GBK-encoded one-paragraph note whose file name is not valid UTF-8.
 
 ## What was changed
 

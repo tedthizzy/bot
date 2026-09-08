@@ -37,7 +37,7 @@ class RobotdLog:
         self.period_ns = int(1e9 / max(1, state_decimate_hz))
         self._writers: dict[str, JsonlWriter] = {}
         self._day: str | None = None
-        self._last_feedback_ns = 0
+        self._last_feedback_bucket = -1
 
     def _writer(self, stream: str) -> JsonlWriter:
         day = time.strftime("%Y%m%d", time.gmtime())
@@ -52,9 +52,10 @@ class RobotdLog:
 
     def feedback(self, feedback: Feedback, arrival_mono_ns: int) -> bool:
         """Record one feedback line, decimated.  Returns whether it was written."""
-        if arrival_mono_ns - self._last_feedback_ns < self.period_ns:
+        bucket = arrival_mono_ns // self.period_ns
+        if bucket == self._last_feedback_bucket:
             return False
-        self._last_feedback_ns = arrival_mono_ns
+        self._last_feedback_bucket = bucket
         record: dict[str, Any] = {
             "stream": "feedback",
             "recv_mono_ns": arrival_mono_ns,

@@ -833,7 +833,7 @@ Evidence: [build.sh](https://github.com/tedthizzy/bot/blob/23267ed/firmware/buil
 
 **F31 — Build/deploy reproducibility and cleanup boundaries need clarification. Source.**
 
-**Current:** Partly corrected: clean/distclean preserve runtime evidence; clean CI obtains only the checksum-pinned ArduinoJson headers needed for native tests. Pi/container dependency resolution is still not fully lock-driven.
+**Current:** Partly corrected: clean/distclean preserve runtime evidence; clean CI obtains only the checksum-pinned ArduinoJson headers needed for native tests. CMake and Ninja have left the development group; the retired controller's host build is reached by checking out the tag `v0-pi-sim`, as `legacy/firmware-s3/README.md` directs. Pi/container dependency resolution is still not fully lock-driven.
 
 **Baseline:**
 CI uses `uv sync --frozen`, but deployment and the development image use `uv pip install -e` rather than installing from the committed lock resolution.
