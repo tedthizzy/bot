@@ -18,9 +18,19 @@ def test_a_fresh_tracker_has_no_sample() -> None:
 
 @pytest.mark.parametrize(
     ("yaw", "expected"),
-    [(0.0, 0.0), (90.0, 90.0), (180.0, 180.0), (-180.0, 180.0), (190.0, -170.0), (-190.0, 170.0), (540.0, 180.0)],
+    [
+        (0.0, 0.0),
+        (90.0, 90.0),
+        (180.0, 180.0),
+        (-180.0, 180.0),
+        (190.0, -170.0),
+        (-190.0, 170.0),
+        (540.0, 180.0),
+    ],
 )
-def test_the_heading_is_wrapped_into_the_half_open_turn(yaw: float, expected: float) -> None:
+def test_the_heading_is_wrapped_into_the_half_open_turn(
+    yaw: float, expected: float
+) -> None:
     tracker = HeadingTracker(1)
     tracker.update(yaw, 0)
     assert tracker.heading_deg == pytest.approx(expected)
@@ -65,7 +75,9 @@ def test_age_is_measured_from_the_arrival_stamp() -> None:
     tracker.update(0.0, 1_000 * MS)
     assert tracker.age_ms(1_000 * MS) == 0.0
     assert tracker.age_ms(1_120 * MS) == pytest.approx(120.0)
-    assert tracker.age_ms(999 * MS) == 0.0, "a clock going backwards is not a negative age"
+    assert tracker.age_ms(999 * MS) == 0.0, (
+        "a clock going backwards is not a negative age"
+    )
 
 
 def test_reset_keeps_the_last_heading_but_forgets_the_continuity() -> None:

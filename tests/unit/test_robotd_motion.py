@@ -1,10 +1,9 @@
-"""The executed-motion path, through the daemon with a controller attached.
+"""Actual Robotd + Unix bus + TCP link; independent board double, no hardware.
 
-Everything below runs the real ``Robotd``: the NDJSON bus, the validator, the
-arbiter, the profile, the setpoint cell and the serial link over a pty, against
-the wheel plant in :mod:`test_robotd_link`'s ``FakeMcu``.  It is the seam the
-unit tests above it cannot reach -- a whole drive from ``accepted`` to ``done``,
-preemption between sources, the client-liveness gap and a recorded episode.
+The double records raw T=1 commands before clamping. Encoder distance, CRC,
+arming and current-based sag compensation belong to the archived S3 system;
+their counterparts are timed power, heading, firmware identity and pack voltage.
+No assertion here claims physical stopping distance.
 """
 
 from __future__ import annotations
@@ -12,834 +11,461 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
-import math
 import os
-import pty
-import shutil
 import signal
-import sys
 import tempfile
 import time
-from collections.abc import AsyncIterator
-from pathlib import Path
 from typing import Any
 
 import pytest
+from rover_contracts.config import BusConfig, LogConfig, RobotConfig
+from rover_robotd import main as robotd_main
+from rover_robotd.episodes import ACTION_KEYS, EpisodeRecorder
+from rover_robotd.main import Robotd
+from test_robotd_link import FakeRover, link_config, speeds_of, until
 
-REPO = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(REPO / "packages"))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-from rover_contracts.config import (  # noqa: E402
-    BusConfig,
-    LogConfig,
-    RobotConfig,
-    SerialConfig,
-)
-from rover_contracts.serial_codec import (  # noqa: E402
-    ArmFrame,
-    CtrlFlag,
-    VelocityFrame,
-)
-from rover_robotd import main as robotd_main  # noqa: E402
-from rover_robotd.episodes import (  # noqa: E402
-    LEKIWI_ACTION_KEYS,
-    EpisodeRecorder,
-)
-from rover_robotd.main import Robotd  # noqa: E402
-from rover_robotd.odom import Pose  # noqa: E402
-from test_robotd_link import CLEAR_FLAGS, FakeMcu  # noqa: E402
-
+pytestmark = pytest.mark.timeout(30)
 TURN = "01J9ZC7K000000000000000000"
+TURN2 = "01J9ZC7K000000000000000001"
 CMD = "01J9ZC7K3QF2M8XR4V6T0YAHBD"
 CMD2 = "01J9ZC7K3QF2M8XR4V6T0YAHBE"
 
-TELEOP_BUS = {
-    "allow_sources": ["brain", "web", "teleop"],
-    "allow_stream": ["teleop"],
-}
-
 
 class Client:
-    """One NDJSON connection that also pings at 5 Hz while it owns a command."""
+    def __init__(self, reader, writer, source):
+        self.reader, self.writer, self.source = reader, writer, source
 
-    def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-        self.reader = reader
-        self.writer = writer
-        self.source = "brain"
-        self._ping: asyncio.Task[None] | None = None
-
-    async def send(self, **message: Any) -> None:
+    async def send(self, **message: Any):
+        if message.get("type") != "subscribe":
+            message.setdefault("source", self.source)
         self.writer.write(json.dumps({"v": 1, **message}).encode() + b"\n")
         await self.writer.drain()
 
-    async def recv_result(self, cmd_id: str, status: str, timeout: float = 8.0):
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            line = await asyncio.wait_for(
-                self.reader.readline(), max(0.1, deadline - time.monotonic())
-            )
-            assert line, "the server closed the connection"
-            message = json.loads(line)
-            if message.get("type") == "result" and message["cmd_id"] == cmd_id:
-                if message["status"] == status:
-                    return message
-                if message["status"] in {"done", "rejected", "aborted", "timeout"}:
-                    raise AssertionError(
-                        f"expected {status!r} for {cmd_id}, got {message}"
-                    )
-        raise AssertionError(f"no {status!r} for {cmd_id} within {timeout} s")
-
-    async def recv_type(self, kind: str, timeout: float = 5.0) -> Any:
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            line = await asyncio.wait_for(
-                self.reader.readline(), max(0.1, deadline - time.monotonic())
-            )
-            assert line, "the server closed the connection"
-            message = json.loads(line)
-            if message.get("type") == kind:
-                return message
-        raise AssertionError(f"no {kind!r} within {timeout} s")
-
-    async def hello(self, source: str = "brain", caps: tuple[str, ...] = ("skill",)):
-        self.source = source
-        await self.send(type="hello", source=source, pid=1234, caps=list(caps))
-        while True:
-            line = await asyncio.wait_for(self.reader.readline(), 3.0)
-            if json.loads(line).get("type") == "welcome":
-                return
-
-    def start_pings(self) -> None:
-        async def loop() -> None:
+    async def receive(self, kind, *, cmd_id=None, status=None):
+        async with asyncio.timeout(6):
             while True:
-                await self.send(type="ping", source=self.source)
-                await asyncio.sleep(0.2)
+                line = await self.reader.readline()
+                assert line, "bus closed before the expected answer"
+                message = json.loads(line)
+                if message.get("type") != kind or (
+                    cmd_id and message.get("cmd_id") != cmd_id
+                ):
+                    continue
+                if status and message["status"] != status:
+                    assert message["status"] not in {
+                        "done",
+                        "rejected",
+                        "aborted",
+                        "timeout",
+                    }, message
+                    continue
+                return message
 
-        self._ping = asyncio.create_task(loop())
+    async def result(self, status, cmd_id=CMD):
+        return await self.receive("result", cmd_id=cmd_id, status=status)
 
-    async def close(self) -> None:
-        if self._ping is not None:
-            self._ping.cancel()
-            await asyncio.gather(self._ping, return_exceptions=True)
-        self.writer.close()
-        with contextlib.suppress(ConnectionError, OSError):
-            await self.writer.wait_closed()
-
-
-@contextlib.asynccontextmanager
-async def rover(
-    logs: Path, **bus: Any
-) -> AsyncIterator[tuple[Robotd, FakeMcu, Path]]:
-    master, slave = pty.openpty()
-    os.set_blocking(master, False)
-    (REPO / "run").mkdir(exist_ok=True)
-    run_dir = Path(tempfile.mkdtemp(dir=REPO / "run", prefix="t"))
-    config = RobotConfig(
-        bus=BusConfig(sock=str(run_dir / "robotd.sock"), **bus),
-        serial=SerialConfig(
-            backend="pty",
-            port=os.ttyname(slave),
-            setpoint_hz=20,
-            reseed_wait_ms=300,
-            open_retry_ms=50,
-        ),
-        log=LogConfig(dir=str(logs)),
-    )
-    mcu = FakeMcu(master, plant=True)
-    mcu.start()
-    robotd = Robotd(config)
-    task = asyncio.create_task(robotd.run())
-    try:
-        await until(
-            lambda: robotd.bus.path.exists() and robotd.link.telemetry is not None
-        )
-        yield robotd, mcu, logs
-    finally:
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
-        await mcu.stop()
-        for fd in (master, slave):
-            with contextlib.suppress(OSError):
-                os.close(fd)
-        shutil.rmtree(run_dir, ignore_errors=True)
+    async def ping(self):
+        while True:
+            await self.send(type="ping")
+            await asyncio.sleep(0.15)
 
 
 @contextlib.asynccontextmanager
-async def client(
-    robotd: Robotd, source: str = "brain", caps: tuple[str, ...] = ("skill",)
-) -> AsyncIterator[Client]:
+async def client(robotd, source="brain", *, pings=True):
     reader, writer = await asyncio.open_unix_connection(str(robotd.bus.path))
-    connection = Client(reader, writer)
+    connection = Client(reader, writer, source)
+    task = None
     try:
-        await connection.hello(source, caps)
+        await connection.send(
+            type="hello", pid=os.getpid(), caps=["skill", "twist", "subscribe"]
+        )
+        await connection.receive("welcome")
+        if pings:
+            task = asyncio.create_task(connection.ping())
         yield connection
     finally:
-        await connection.close()
+        if task:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        writer.close()
+        with contextlib.suppress(ConnectionError, OSError):
+            await writer.wait_closed()
 
 
-async def until(predicate: Any, timeout: float = 8.0) -> None:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if predicate():
-            return
-        await asyncio.sleep(0.005)
-    raise AssertionError("condition not reached within the timeout")
+@contextlib.asynccontextmanager
+async def rover(logs, *, board=None, teleop=False):
+    board = board or FakeRover()
+    port = await board.start_tcp()
+    with tempfile.TemporaryDirectory(prefix="rover-test-", dir="/tmp") as run_dir:
+        bus = BusConfig(
+            sock=f"{run_dir}/bus.sock",
+            source_uids={},
+            allow_sources=["brain", "web", "teleop"] if teleop else ["brain", "web"],
+            allow_stream=["teleop"] if teleop else [],
+        )
+        robotd = Robotd(link_config(port, bus=bus, log=LogConfig(dir=str(logs))))
+        task = asyncio.create_task(robotd.run())
+        try:
+            await until(
+                lambda: robotd.bus.path.exists() and robotd.link.feedback is not None
+            )
+            if not board.stock:
+                await until(lambda: robotd.ready)
+            yield robotd, board
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            await board.stop()
 
 
-def drive_message(
-    *, cmd_id: str = CMD, turn_id: str = TURN, distance: float = 0.15, seq: int = 1
-) -> dict[str, Any]:
-    return {
-        "type": "skill",
-        "source": "brain",
-        "cmd_id": cmd_id,
-        "seq": seq,
-        "turn_id": turn_id,
-        "issued_mono_ns": 1,
-        "goal_ttl_ms": 5000,
-        "skill": "drive",
-        "args": {"distance_m": distance, "speed_mps": 0.15},
-        "obs": {"frame_id": "cam-000001", "frame_mono_ns": time.monotonic_ns()},
-        # brain sets this on every dispatch; a motion skill without it is
-        # refused `unauthorized_utterance` (section 7, I-21).
-        "trace": {"authorized_motion": True},
-    }
-
-
-# ---------------------------------------------------------------------------
-# A drive, end to end
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.timeout(60)
-def test_a_drive_runs_from_accepted_to_done(tmp_path: Path) -> None:
-    async def scenario() -> None:
-        async with (
-            rover(tmp_path / "logs") as (robotd, mcu, _logs),
-            client(robotd) as brain,
-        ):
-                brain.start_pings()
-                await brain.send(type="turn", source="brain", turn_id=TURN)
-                await brain.send(**drive_message(distance=0.15))
-                await brain.recv_result(CMD, "accepted")
-                assert robotd.link.armed, "the arm policy must have sent A"
-                done = await brain.recv_result(CMD, "done")
-                assert done["detail"]["traveled_m"] == pytest.approx(0.15, abs=0.03)
-                assert done["detail"]["duration_ms"] > 0
-                assert done["detail"]["odom_delta"]["x_m"] == pytest.approx(
-                    0.15, abs=0.03
-                )
-                moving = [f for f in mcu.velocities if f.v_mm_s > 0]
-                assert moving, "a drive must put velocity on the wire"
-                assert max(f.v_mm_s for f in moving) <= 150
-                await until(lambda: mcu.velocities[-1].v_mm_s == 0, timeout=2.0)
-                assert robotd.budget.spent(TURN)[0] == pytest.approx(0.15, abs=0.05)
-
-    asyncio.run(scenario())
-
-
-@pytest.mark.timeout(60)
-def test_a_drive_ramps_rather_than_stepping_to_its_cruise_speed(
-    tmp_path: Path,
-) -> None:
-    async def scenario() -> None:
-        async with (
-            rover(tmp_path / "logs") as (robotd, mcu, _logs),
-            client(robotd) as brain,
-        ):
-                brain.start_pings()
-                await brain.send(type="turn", source="brain", turn_id=TURN)
-                await brain.send(**drive_message(distance=0.30))
-                await brain.recv_result(CMD, "accepted")
-                await brain.recv_result(CMD, "done")
-                first = [f.v_mm_s for f in mcu.velocities if f.v_mm_s > 0][:3]
-                assert first, "no motion reached the wire"
-                assert first[0] < 150, "the first setpoint must be on the ramp"
-                assert sorted(first) == first
-
-    asyncio.run(scenario())
-
-
-@pytest.mark.timeout(60)
-def test_a_turn_reports_the_angle_it_turned(tmp_path: Path) -> None:
-    async def scenario() -> None:
-        async with (
-            rover(tmp_path / "logs") as (robotd, mcu, _logs),
-            client(robotd) as brain,
-        ):
-                brain.start_pings()
-                await brain.send(type="turn", source="brain", turn_id=TURN)
-                await brain.send(
-                    type="skill",
-                    source="brain",
-                    cmd_id=CMD,
-                    seq=1,
-                    turn_id=TURN,
-                    issued_mono_ns=1,
-                    goal_ttl_ms=5000,
-                    skill="turn",
-                    args={"angle_deg": 45.0, "rate_dps": 45.0},
-                    obs={
-                        "frame_id": "cam-000001",
-                        "frame_mono_ns": time.monotonic_ns(),
-                    },
-                    trace={"authorized_motion": True},
-                )
-                await brain.recv_result(CMD, "accepted")
-                done = await brain.recv_result(CMD, "done")
-                assert done["detail"]["turned_deg"] == pytest.approx(45.0, abs=2.0)
-                assert all(f.v_mm_s == 0 for f in mcu.velocities)
-                assert any(f.w_mrad_s > 0 for f in mcu.velocities)
-
-    asyncio.run(scenario())
-
-
-# ---------------------------------------------------------------------------
-# Preemption and stopping
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.timeout(60)
-def test_a_stop_aborts_the_active_drive_and_zeroes_the_wire(tmp_path: Path) -> None:
-    async def scenario() -> None:
-        async with (
-            rover(tmp_path / "logs") as (robotd, mcu, _logs),
-            client(robotd) as brain,
-        ):
-                brain.start_pings()
-                await brain.send(type="turn", source="brain", turn_id=TURN)
-                await brain.send(**drive_message(distance=0.40))
-                await brain.recv_result(CMD, "accepted")
-                await until(lambda: any(f.v_mm_s > 0 for f in mcu.velocities))
-                await brain.send(type="stop", source="brain", reason="stop_word")
-                aborted = await brain.recv_result(CMD, "aborted")
-                assert aborted["detail"]["traveled_m"] < 0.40
-                await asyncio.sleep(0.1)  # let anything already on the wire arrive
-                boundary = len(mcu.velocities)
-                await asyncio.sleep(0.3)
-                assert all(f.v_mm_s == 0 for f in mcu.velocities[boundary:])
-                assert robotd.arbiter.active is None
-
-    asyncio.run(scenario())
-
-
-@pytest.mark.timeout(60)
-def test_a_teleop_twist_preempts_a_brain_drive(tmp_path: Path) -> None:
-    """An accepted twist preempts an active skill, the loser preempted."""
-
-    async def scenario() -> None:
-        async with (
-            rover(tmp_path / "logs", **TELEOP_BUS) as (robotd, mcu, _logs),
-            client(robotd) as brain,
-            client(robotd, "teleop", ("twist",)) as teleop,
-        ):
-                brain.start_pings()
-                teleop.start_pings()
-                await brain.send(type="turn", source="brain", turn_id=TURN)
-                await brain.send(**drive_message(distance=0.40))
-                await brain.recv_result(CMD, "accepted")
-                await until(lambda: any(f.v_mm_s > 0 for f in mcu.velocities))
-                await teleop.send(
-                    type="twist",
-                    source="teleop",
-                    cmd_id=CMD2,
-                    seq=1,
-                    twist={"linear_x_mps": -0.10, "angular_z_radps": 0.0},
-                )
-                preempted = await brain.recv_result(CMD, "preempted")
-                assert preempted["cmd_id"] == CMD
-                await until(lambda: any(f.v_mm_s < 0 for f in mcu.velocities))
-
-    asyncio.run(scenario())
-
-
-@pytest.mark.timeout(60)
-def test_a_twist_stream_ends_after_the_renewal_window(tmp_path: Path) -> None:
-    async def scenario() -> None:
-        async with (
-            rover(tmp_path / "logs", **TELEOP_BUS) as (robotd, mcu, _logs),
-            client(robotd, "teleop", ("twist",)) as teleop,
-        ):
-                teleop.start_pings()
-                await teleop.send(
-                    type="twist",
-                    source="teleop",
-                    cmd_id=CMD,
-                    seq=1,
-                    twist={"linear_x_mps": 0.10, "angular_z_radps": 0.0},
-                )
-                await teleop.recv_result(CMD, "accepted")
-                await until(lambda: any(f.v_mm_s > 0 for f in mcu.velocities))
-                await teleop.recv_result(CMD, "done", timeout=3.0)
-                assert robotd.arbiter.active is None
-                await asyncio.sleep(0.1)  # let anything already on the wire arrive
-                boundary = len(mcu.velocities)
-                await asyncio.sleep(0.2)
-                assert all(f.v_mm_s == 0 for f in mcu.velocities[boundary:])
-
-    asyncio.run(scenario())
-
-
-@pytest.mark.timeout(60)
-def test_a_client_that_stops_pinging_loses_its_command(tmp_path: Path) -> None:
-    """The 400 ms gap is what covers ``kill -STOP`` on brain, where no EOF
-    ever arrives (I-14)."""
-
-    async def scenario() -> None:
-        async with (
-            rover(tmp_path / "logs") as (robotd, mcu, _logs),
-            client(robotd) as brain,
-        ):
-                await brain.send(type="turn", source="brain", turn_id=TURN)
-                await brain.send(**drive_message(distance=0.40))
-                await brain.recv_result(CMD, "accepted")
-                aborted = await brain.recv_result(CMD, "aborted", timeout=3.0)
-                assert aborted["reason"] == "not_ready"
-                await asyncio.sleep(0.1)  # let anything already on the wire arrive
-                boundary = len(mcu.velocities)
-                await asyncio.sleep(0.2)
-                assert all(f.v_mm_s == 0 for f in mcu.velocities[boundary:])
-
-    asyncio.run(scenario())
-
-
-@pytest.mark.timeout(60)
-def test_an_estop_mid_drive_aborts_disarms_and_blocks_a_replay(
-    tmp_path: Path,
-) -> None:
-    async def scenario() -> None:
-        async with (
-            rover(tmp_path / "logs") as (robotd, mcu, _logs),
-            client(robotd) as brain,
-            client(robotd, "web", ("skill",)) as web,
-        ):
-                brain.start_pings()
-                await brain.send(type="turn", source="brain", turn_id=TURN)
-                await brain.send(**drive_message(distance=0.40))
-                await brain.recv_result(CMD, "accepted")
-                await until(lambda: any(f.v_mm_s > 0 for f in mcu.velocities))
-                await web.send(type="estop", source="web", reason="user")
-                aborted = await brain.recv_result(CMD, "aborted")
-                assert aborted["reason"] == "estop_active"
-                await until(lambda: not robotd.link.armed)
-                await brain.send(
-                    **drive_message(cmd_id=CMD2, turn_id=robotd.turns.current, seq=2)
-                )
-                rejected = await brain.recv_result(CMD2, "rejected")
-                assert rejected["reason"] == "estop_active"
-
-    asyncio.run(scenario())
-
-
-@pytest.mark.timeout(60)
-def test_a_cancel_naming_another_command_leaves_the_active_one_alone(
-    tmp_path: Path,
-) -> None:
-    async def scenario() -> None:
-        async with (
-            rover(tmp_path / "logs") as (robotd, mcu, _logs),
-            client(robotd) as brain,
-        ):
-            brain.start_pings()
-            await brain.send(type="turn", source="brain", turn_id=TURN)
-            await brain.send(**drive_message(distance=0.40))
-            await brain.recv_result(CMD, "accepted")
-            await until(lambda: any(f.v_mm_s > 0 for f in mcu.velocities))
-            await brain.send(type="cancel", source="brain", cmd_id=CMD2)
-            await asyncio.sleep(0.3)
-            assert robotd.arbiter.active is not None
-            assert robotd.arbiter.active.cmd_id == CMD
-            assert mcu.velocities[-1].v_mm_s > 0
-            await brain.send(type="cancel", source="brain", cmd_id=CMD)
-            await brain.recv_result(CMD, "aborted")
-
-    asyncio.run(scenario())
-
-
-# ---------------------------------------------------------------------------
-# Episodes (A34)
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.timeout(60)
-def test_a_teleop_stream_records_a_lekiwi_keyed_episode(tmp_path: Path) -> None:
-    async def scenario() -> None:
-        logs = tmp_path / "logs"
-        async with (
-            rover(logs, **TELEOP_BUS) as (robotd, _mcu, _logs),
-            client(robotd, "teleop", ("twist",)) as teleop,
-        ):
-                teleop.start_pings()
-                for seq in range(1, 12):
-                    await teleop.send(
-                        type="twist",
-                        source="teleop",
-                        cmd_id=CMD,
-                        seq=seq,
-                        twist={"linear_x_mps": 0.10, "angular_z_radps": 0.35},
-                    )
-                    await asyncio.sleep(0.05)
-                await until(lambda: robotd.episodes.index > 3)
-                await teleop.recv_result(CMD, "done", timeout=3.0)
-
-        files = sorted((logs / "episodes").glob("*.jsonl"))
-        assert files, "a teleop stream must record an episode"
-        rows = [json.loads(line) for line in files[0].read_text().splitlines()]
-        assert rows
-        for row in rows:
-            assert tuple(row["action"]) == LEKIWI_ACTION_KEYS
-            assert row["action"]["y.vel"] == 0.0
-            assert set(row["observation"]) >= {"left_ticks", "right_ticks", "mcu_us"}
-        assert rows[-1]["action"]["x.vel"] == pytest.approx(0.10)
-        assert rows[-1]["action"]["theta.vel"] == pytest.approx(20.05, abs=0.1)
-        assert [row["index"] for row in rows] == list(range(len(rows)))
-
-    asyncio.run(scenario())
-
-
-# ---------------------------------------------------------------------------
-# Published state and logs
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.timeout(60)
-def test_state_reports_the_controller_and_the_active_command(tmp_path: Path) -> None:
-    async def scenario() -> None:
-        async with rover(tmp_path / "logs") as (robotd, _mcu, _logs):
-            state = robotd._state(robotd.clock())  # noqa: SLF001 - the published shape
-            assert state.ready is True
-            assert state.mcu.session == 40010
-            assert state.ranges_m.front == pytest.approx(1.204)
-            assert state.front_at_max is False
-            assert state.tof.front_l_ok and state.tof.front_r_ok
-            assert state.battery.pack_v == pytest.approx(11.62)
-            assert 0 <= state.battery.pct <= 100
-            assert state.bumper is False and state.estop_hw is False
-
-    asyncio.run(scenario())
-
-
-@pytest.mark.timeout(60)
-def test_the_telemetry_log_carries_raw_ticks_and_mcu_microseconds(
-    tmp_path: Path,
-) -> None:
-    """Principle 7: logs are datasets, so a pose is recomputable offline."""
-
-    async def scenario() -> None:
-        logs = tmp_path / "logs"
-        async with rover(logs) as (_robotd, _mcu, _logs):
-            await asyncio.sleep(0.6)
-        files = sorted(logs.glob("telemetry-*.jsonl"))
-        assert files
-        row = json.loads(files[0].read_text().splitlines()[0])
-        assert {"left_ticks", "right_ticks", "mcu_us", "recv_mono_ns"} <= set(row)
-
-    asyncio.run(scenario())
-
-
-def test_the_fake_controller_never_sees_a_frame_above_the_cap() -> None:
-    """A guard on the fixture itself: I-8 is only meaningful if the harness
-    would notice an over-cap frame."""
-    frame = VelocityFrame(
-        seq=1, session=40010, v_mm_s=300, w_mrad_s=1047, frame_ttl_ms=300, flags=0
+def drive_message(*, cmd_id=CMD, turn_id=TURN, seq=1, duration=0.6, power=0.2):
+    now = time.monotonic_ns()
+    return dict(
+        type="skill",
+        cmd_id=cmd_id,
+        seq=seq,
+        turn_id=turn_id,
+        issued_mono_ns=now,
+        goal_ttl_ms=5000,
+        skill="drive_for",
+        args=dict(duration_s=duration, power=power),
+        obs=dict(frame_id="cam-000001", frame_mono_ns=now),
+        trace=dict(authorized_motion=True),
     )
-    assert abs(frame.v_mm_s) <= 300 and abs(frame.w_mrad_s) <= 1047
 
 
-# ---------------------------------------------------------------------------
-# The arm policy, the published state and the result detail
-# ---------------------------------------------------------------------------
+async def start(brain, board, **args):
+    await brain.send(type="turn", turn_id=TURN)
+    await brain.send(**drive_message(**args))
+    await brain.result("accepted")
+    await until(lambda: any(left or right for left, right in speeds_of(board)))
 
 
-@pytest.mark.timeout(60)
-def test_an_uncalibrated_controller_is_refused_rather_than_armed(
-    tmp_path: Path,
-) -> None:
-    """4.1: with ctrl_flags b6 clear the MCU accepts A and then silently zeroes
-    every forward v.  robotd must refuse to arm instead, so the user gets an
-    attributable not_ready rather than a progress timeout on a drive that was
-    never going to execute."""
+async def assert_quiet(board):
+    # Allow one 50 ms period plus transport delivery, then require real zeros.
+    await asyncio.sleep(0.1)
+    boundary = len(speeds_of(board))
+    await asyncio.sleep(0.2)
+    frames = speeds_of(board)[boundary:]
+    assert frames and all(pair == (0, 0) for pair in frames), frames
 
-    async def scenario() -> None:
-        async with (
-            rover(tmp_path / "logs") as (robotd, mcu, _logs),
-            client(robotd) as brain,
-        ):
-            mcu.ctrl_flags = int(CLEAR_FLAGS) & ~int(CtrlFlag.CAL_VALID)
-            await until(
-                lambda: robotd.link.telemetry is not None
-                and not robotd.link.telemetry.ctrl_flags & int(CtrlFlag.CAL_VALID)
-            )
-            brain.start_pings()
-            await brain.send(type="turn", source="brain", turn_id=TURN)
-            await brain.send(**drive_message())
-            answer = await brain.recv_result(CMD, "rejected")
+
+async def test_drive_completes_ramps_and_charges_only_streamed_motion(tmp_path):
+    async with rover(tmp_path) as (robotd, board), client(robotd) as brain:
+        await start(brain, board)
+        assert robotd._state(robotd.clock()).active.cmd_id == CMD
+        done = await brain.result("done")
+        assert 550 <= done["detail"]["duration_ms"] <= 900
+        moving = [left for left, right in speeds_of(board) if left > 0 and left == right]
+        assert moving and 0 < moving[0] < 0.2
+        assert max(moving) == pytest.approx(0.2)
+        assert 0.4 <= robotd.budget.spent(TURN) <= 0.7
+        await assert_quiet(board)
+
+
+@pytest.mark.parametrize("initial,target,swept", [(0, 45, 45), (170, 260, 90)])
+async def test_turn_reports_swept_heading_including_wrap(
+    tmp_path, initial, target, swept
+):
+    board = FakeRover()
+    board.yaw_deg = initial
+    async with rover(tmp_path, board=board) as (robotd, board), client(robotd) as brain:
+        message = drive_message()
+        message.update(
+            skill="turn_to", args=dict(heading_deg=float(target), timeout_s=4.0)
+        )
+        await brain.send(type="turn", turn_id=TURN)
+        await brain.send(**message)
+        await brain.result("accepted")
+        done = await brain.result("done")
+        assert done["detail"]["turned_deg"] == pytest.approx(swept, abs=6)
+        assert abs(done["detail"]["heading_error_deg"]) <= 5
+        assert any(left < 0 < right for left, right in speeds_of(board))
+        assert all(left == -right for left, right in speeds_of(board))
+
+
+def test_local_left_intent_reaches_positive_left_motor_profile():
+    from rover_brain.router import route
+    from rover_brain.validate import bus_args_for
+    from rover_contracts.worldstate import WorldState
+    from rover_robotd.profiles import TurnToProfile
+
+    world = WorldState(
+        heading_deg=0,
+        battery_pct=80,
+        obstacle_ahead=False,
+        bumper=False,
+        moving=False,
+        power_cap_pct=20,
+        allowed_skills=["turn_to"],
+        motion_budget_left={"seconds": 12},
+    )
+    call = route("turn left", world)
+    args = bus_args_for(call, RobotConfig().limits)
+    assert args.heading_deg == 90
+    limits = RobotConfig().limits
+    profile = TurnToProfile(
+        args.heading_deg,
+        tolerance_deg=limits.turn_tolerance_deg,
+        kp=limits.turn_kp,
+        power_min=limits.power_min,
+        power_max=limits.power_max,
+    )
+    profile.observe(0, 1)
+    left, right = profile.command()
+    assert left < 0 < right
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        "stop",
+        "estop",
+        "cancel",
+        "turn",
+        "silence",
+        "disconnect",
+        "reboot",
+        "stale_feedback",
+    ],
+)
+async def test_motion_faults_stop_raw_wire_and_never_resume(tmp_path, action):
+    async with (
+        rover(tmp_path) as (robotd, board),
+        client(robotd, pings=action != "silence") as brain,
+    ):
+        await start(brain, board, duration=2.0)
+        if action == "turn":
+            await brain.send(type="turn", turn_id=TURN2)
+        elif action == "disconnect":
+            board.disconnect()
+        elif action == "reboot":
+            board.reboot()
+        elif action == "stale_feedback":
+            board.feedback_enabled = False
+        elif action != "silence":
+            await brain.send(type=action, cmd_id=CMD, reason={"malformed": True})
+        answer = await brain.result("preempted" if action == "turn" else "aborted")
+        if action == "silence":
             assert answer["reason"] == "not_ready"
-            assert not robotd.link.armed
-            assert not [f for f in mcu.received if isinstance(f, ArmFrame)]
-
-            # And it arms as soon as the controller reports the baseline.
-            mcu.ctrl_flags = int(CLEAR_FLAGS)
-            await until(
-                lambda: robotd.link.telemetry is not None
-                and bool(robotd.link.telemetry.ctrl_flags & int(CtrlFlag.CAL_VALID))
-            )
-            await brain.send(**drive_message(cmd_id=CMD2, seq=2))
-            await brain.recv_result(CMD2, "accepted")
-            assert robotd.link.armed
-
-    asyncio.run(scenario())
-
-
-@pytest.mark.timeout(60)
-def test_the_published_oc_v_is_sag_compensated(tmp_path: Path) -> None:
-    """A25 evaluates the ladder on V_oc, so the field named oc_v carries the
-    compensation: publishing pack_v under that name understates the pack by
-    ~0.26 V at 4 A, exactly the sag the estimate exists to remove."""
-
-    async def scenario() -> None:
-        async with (
-            rover(tmp_path / "logs") as (robotd, mcu, _logs),
-            client(robotd, caps=("subscribe",)) as web,
-        ):
-            mcu.vbat_mv = 11360
-            mcu.imotor_ma = 4000
-            await web.send(type="subscribe", topics=["state"], state_hz=10)
-            state = await web.recv_type("state", timeout=5.0)
-            while state["battery"]["pack_v"] != pytest.approx(11.36, abs=0.001):
-                state = await web.recv_type("state", timeout=5.0)
-            r_pack = robotd.config.safety.r_pack_mohm
-            assert state["battery"]["oc_v"] == pytest.approx(
-                11.36 + 4.0 * r_pack / 1000.0, abs=1e-6
-            )
-            assert state["battery"]["oc_v"] > state["battery"]["pack_v"]
-
-    asyncio.run(scenario())
-
-
-@pytest.mark.timeout(60)
-def test_the_state_publishes_the_budget_the_ledger_enforces(tmp_path: Path) -> None:
-    """I-15 has one ledger.  brain reads this field instead of keeping a second
-    accounting that charges goal deadlines for non-motion skills."""
-
-    async def scenario() -> None:
-        async with (
-            rover(tmp_path / "logs") as (robotd, mcu, _logs),
-            client(robotd, caps=("subscribe",)) as web,
-        ):
-            await web.send(type="subscribe", topics=["state"], state_hz=10)
-            state = await web.recv_type("state", timeout=5.0)
-            limits = robotd.config.limits
-            assert state["budget"]["path_m"] == pytest.approx(limits.budget_path_m)
-            assert state["budget"]["motion_s"] == pytest.approx(limits.budget_motion_s)
-
-            robotd.turns.adopt(TURN)
-            robotd.budget.charge(TURN, 0.4, 3.0)
-            state = await web.recv_type("state", timeout=5.0)
-            while state["budget"]["path_m"] == pytest.approx(limits.budget_path_m):
-                state = await web.recv_type("state", timeout=5.0)
-            assert state["budget"]["path_m"] == pytest.approx(
-                limits.budget_path_m - 0.4
-            )
-            assert state["budget"]["motion_s"] == pytest.approx(
-                limits.budget_motion_s - 3.0
-            )
-
-    asyncio.run(scenario())
-
-
-@pytest.mark.timeout(60)
-def test_a_turn_across_the_heading_wrap_reports_the_swept_angle(
-    tmp_path: Path,
-) -> None:
-    """Both headings are folded into (-pi, +pi], so their raw difference is not
-    the swept angle across the boundary: a +90 deg turn from 3.0 rad reported
-    -270 deg, contradicting turned_deg in the same result."""
-
-    async def scenario() -> None:
-        async with (
-            rover(tmp_path / "logs") as (robotd, mcu, _logs),
-            client(robotd) as brain,
-        ):
-            brain.start_pings()
-            robotd.odom.pose = Pose(x_m=0.0, y_m=0.0, yaw_rad=3.0)
-            await brain.send(type="turn", source="brain", turn_id=TURN)
+        elif action == "stale_feedback":
+            assert answer["reason"] == "feedback_stale"
+            board.feedback_enabled = True
+        if action in {"disconnect", "reboot", "stale_feedback"}:
+            await until(lambda: robotd.ready)
+        assert robotd.arbiter.active is None
+        await assert_quiet(board)
+        if action == "estop":
+            assert robotd.estop_path.exists()
+            restarted = Robotd(robotd.config)
+            assert restarted.estop_sw
+            restarted.logs.close()
             await brain.send(
-                type="skill", source="brain", cmd_id=CMD, seq=1, turn_id=TURN,
-                issued_mono_ns=1, goal_ttl_ms=5000, skill="turn",
-                args={"angle_deg": 90.0, "rate_dps": 60.0},
-                obs={"frame_id": "cam-000001", "frame_mono_ns": time.monotonic_ns()},
-                trace={"authorized_motion": True},
+                **drive_message(cmd_id=CMD2, seq=2, turn_id=robotd.turns.current)
             )
-            await brain.recv_result(CMD, "accepted")
-            done = await brain.recv_result(CMD, "done")
-            swept = math.degrees(done["detail"]["odom_delta"]["yaw_rad"])
-            assert swept == pytest.approx(done["detail"]["turned_deg"], abs=2.0)
-            assert 80.0 < swept < 100.0
-
-    asyncio.run(scenario())
+            assert (await brain.result("rejected", CMD2))["reason"] == "estop_active"
 
 
-@pytest.mark.timeout(60)
-def test_a_parse_rejection_reaches_a_sender_that_did_not_subscribe(
-    tmp_path: Path,
-) -> None:
-    """docs/deviations robotd #7: a command's own result always reaches its
-    sender.  rover-web's teleop client greets with `hello` alone."""
+async def test_cancel_other_command_does_not_cancel_active_motion(tmp_path):
+    async with rover(tmp_path) as (robotd, board), client(robotd) as brain:
+        await start(brain, board, duration=1.0)
+        await brain.send(type="cancel", cmd_id=CMD2)
+        await asyncio.sleep(0.15)
+        assert robotd.arbiter.active.cmd_id == CMD
+        assert speeds_of(board)[-1][0] > 0
+        await brain.send(type="cancel", cmd_id=CMD)
+        await brain.result("aborted")
+        await assert_quiet(board)
 
-    async def scenario() -> None:
-        async with (
-            rover(tmp_path / "logs", **TELEOP_BUS) as (robotd, _mcu, _logs),
-            client(robotd, source="teleop", caps=("twist",)) as teleop,
-        ):
+
+@pytest.mark.parametrize(
+    "fault,reason",
+    [
+        ("replay", "duplicate_cmd"),
+        ("stale_turn", "stale_turn"),
+        ("stale_obs", "obs_stale"),
+        ("unauthorized", "unauthorized_utterance"),
+        ("oversized", "bad_args"),
+    ],
+)
+async def test_rejected_motion_has_positive_control_and_no_wire_output(
+    tmp_path, fault, reason
+):
+    async with rover(tmp_path) as (robotd, board), client(robotd) as brain:
+        await start(brain, board)
+        await brain.result("done")
+        message = drive_message(cmd_id=CMD2, seq=2)
+        if fault == "replay":
+            message["cmd_id"] = CMD
+        elif fault == "stale_turn":
+            await brain.send(type="turn", turn_id=TURN2)
+        elif fault == "stale_obs":
+            message["obs"]["frame_mono_ns"] -= 6_000_000_000
+        elif fault == "unauthorized":
+            message["trace"]["authorized_motion"] = False
+        else:
+            message["args"]["power"] = 1.0
+        await brain.send(**message)
+        rejected = await brain.result("rejected", message["cmd_id"])
+        assert rejected["reason"] == reason
+        await assert_quiet(board)
+
+
+async def test_stock_firmware_is_refused_without_nonzero_command(tmp_path):
+    async with (
+        rover(tmp_path, board=FakeRover(stock=True)) as (robotd, board),
+        client(robotd) as brain,
+    ):
+        await brain.send(type="turn", turn_id=TURN)
+        await brain.send(**drive_message())
+        assert (await brain.result("rejected"))["reason"] == "unpatched_firmware"
+        await assert_quiet(board)
+
+
+async def test_teleop_preempts_then_expires_and_records_power_episode(tmp_path):
+    async with (
+        rover(tmp_path, teleop=True) as (robotd, board),
+        client(robotd) as brain,
+        client(robotd, "teleop") as teleop,
+    ):
+        await start(brain, board, duration=2.0)
+        for seq in range(1, 7):
             await teleop.send(
-                type="skill", source="teleop", cmd_id=CMD, seq=1, turn_id=TURN,
-                issued_mono_ns=1, goal_ttl_ms=5000, skill="teleport",
-                args={"distance_m": 1.0},
+                type="twist", cmd_id=CMD2, seq=seq, twist={"lin": -0.1, "ang": 0.05}
             )
-            answer = await teleop.recv_result(CMD, "rejected")
-            assert answer["reason"] in {"unknown_skill", "bad_args"}
+            await asyncio.sleep(0.05)
+        await brain.result("preempted")
+        await teleop.result("done", CMD2)
+        assert any(left < 0 and right < 0 for left, right in speeds_of(board))
+        await assert_quiet(board)
+    rows = [
+        json.loads(line)
+        for line in next((tmp_path / "episodes").glob("*.jsonl")).read_text().splitlines()
+    ]
+    assert len(rows) >= 3
+    assert [row["index"] for row in rows] == list(range(len(rows)))
+    for row in rows:
+        assert tuple(row["action"]) == ACTION_KEYS
+        assert row["action"]["left.power"] == pytest.approx(-0.15)
+        assert row["action"]["right.power"] == pytest.approx(-0.05)
+        assert {"heading_deg", "left.applied", "right.applied", "bus_v"} <= row[
+            "observation"
+        ].keys()
 
-    asyncio.run(scenario())
+
+async def test_state_and_logs_report_current_feedback_and_shared_budget(tmp_path):
+    async with rover(tmp_path) as (robotd, board), client(robotd, "web") as web:
+        await web.send(type="subscribe", topics=["state"], state_hz=10)
+        board.bus_v, board.tof_mm, board.clamp_count = 11.36, 1204, 37
+        robotd.turns.adopt(TURN)
+        robotd.budget.charge(TURN, 3)
+        async with asyncio.timeout(3):
+            while True:
+                state = await web.receive("state")
+                if state["rover"]["clamp_count"] == 37:
+                    break
+        assert state["ready"]
+        assert state["rover"]["fw"] == "bot-wr-1"
+        assert state["front_m"] == pytest.approx(1.204)
+        assert state["battery"]["pack_v"] == pytest.approx(11.36)
+        assert 0 <= state["battery"]["pct"] <= 100
+        assert state["budget"]["motion_s"] == robotd.budget.remaining(TURN)
+        await asyncio.sleep(0.25)
+    row = json.loads(next(tmp_path.glob("feedback-*.jsonl")).read_text().splitlines()[0])
+    assert {
+        "left",
+        "right",
+        "yaw_deg",
+        "bus_v",
+        "recv_mono_ns",
+        "clamp_count",
+    } <= row.keys()
 
 
-@pytest.mark.timeout(60)
-def test_recording_a_step_never_fsyncs_on_the_control_loop(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """4.2 forbids the control loop to block on anything, and that loop also
-    owns the setpoint cell and the 20 Hz V writer.  On the Pi the log directory
-    is the SD card, where one fsync stalls into the hundreds of milliseconds
-    during a card garbage-collection cycle -- past the 300 ms frame TTL, which
-    brakes the wheels mid-teleop for no reason the operator can see."""
-    calls: list[int] = []
-    real_fsync = os.fsync
+async def test_unknown_feedback_does_not_break_state_and_low_battery_fails_closed(
+    tmp_path,
+):
+    async with rover(tmp_path) as (robotd, board), client(robotd, "web") as web:
+        await web.send(type="subscribe", topics=["state"], state_hz=10)
+        board._send({"T": 987654, "future": True})
+        board.lowbat = True
+        async with asyncio.timeout(3):
+            while True:
+                state = await web.receive("state")
+                if state["reason"] == "faulted":
+                    break
+        assert not state["ready"] and state["rover"]["stop_flags"] & 8
 
-    def counting_fsync(fd: int) -> None:
-        calls.append(fd)
-        real_fsync(fd)
 
-    monkeypatch.setattr(os, "fsync", counting_fsync)
+async def test_parse_rejection_reaches_unsubscribed_sender_and_connection_survives(
+    tmp_path,
+):
+    async with rover(tmp_path) as (robotd, board), client(robotd) as brain:
+        for args in (
+            {"power": "fast"},
+            {"duration_s": -1, "power": 0.2},
+            {"duration_s": 1, "power": 1e300},
+        ):
+            message = drive_message()
+            message["args"] = args
+            await brain.send(**message)
+            assert (await brain.result("rejected"))["reason"] == "bad_args"
+        await start(brain, board)
+        await brain.result("done")
+        assert all(
+            abs(value) <= robotd.config.limits.power_max
+            for pair in speeds_of(board)
+            for value in pair
+        )
+        assert board.clamp_count == 0, "board clamping must not hide a host violation"
+
+
+def test_recording_does_not_fsync_until_episode_closes(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(os, "fsync", calls.append)
     recorder = EpisodeRecorder(directory=tmp_path)
-    recorder.start()
+    episode = recorder.start()
     for index in range(20):
         recorder.record(
             t_mono_ns=index,
-            linear_x_mps=0.1,
-            angular_z_radps=0.0,
-            pose=Pose(),
-            left_ticks=index,
-            right_ticks=index,
-            mcu_us=index,
+            left=0.1,
+            right=0.1,
+            heading_deg=0,
+            yaw_rate_dps=None,
+            feedback=None,
             source="teleop",
         )
-    assert calls == [], "the recorder must not fsync from the control loop"
-
-    # Durability is taken once, when the episode closes.
-    episode_id = recorder.stop()
-    assert episode_id is not None
+    assert calls == []
+    recorder.stop()
     assert len(calls) == 1
-    lines = (tmp_path / "episodes" / f"{episode_id}.jsonl").read_text().splitlines()
-    assert len(lines) == 20
-    assert list(json.loads(lines[0])["action"]) == list(LEKIWI_ACTION_KEYS)
+    assert (
+        len((tmp_path / "episodes" / f"{episode}.jsonl").read_text().splitlines()) == 20
+    )
 
 
-@pytest.mark.timeout(30)
-def test_sigterm_unwinds_robotd_instead_of_killing_it(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """systemd stops a unit with SIGTERM.
-
-    With no handler the interpreter dies where it stands: ``Robotd.run``'s
-    finally never runs, so the shutdown ``S``+``D`` of 4.2 are never written,
-    ``RobotdLog`` is not closed and an open teleop episode is never fsynced.
-    The registered callback is invoked directly rather than raising a real
-    signal -- a regression that dropped the handler would otherwise kill the
-    whole test run instead of failing one case.
-    """
-    unwound: list[str] = []
+async def test_sigterm_unwinds_robotd(monkeypatch):
+    unwound, handlers = [], {}
 
     class StubRobotd:
-        def __init__(self, config: RobotConfig) -> None:
-            self.config = config
+        def __init__(self, config):
+            pass
 
-        async def run(self) -> None:
+        async def run(self):
             try:
                 await asyncio.Event().wait()
             finally:
-                unwound.append("aclose")
+                unwound.append(True)
 
     monkeypatch.setattr(robotd_main, "Robotd", StubRobotd)
-
-    async def scenario() -> None:
-        loop = asyncio.get_running_loop()
-        handlers: dict[int, Any] = {}
-        original = loop.add_signal_handler
-
-        def spy(signum: int, callback: Any, *args: Any) -> None:
-            handlers[signum] = callback
-            original(signum, callback, *args)
-
-        monkeypatch.setattr(loop, "add_signal_handler", spy)
-        task = asyncio.create_task(robotd_main.serve(RobotConfig()))
-        await asyncio.sleep(0.05)
-        assert signal.SIGTERM in handlers
-        assert signal.SIGINT in handlers
-        handlers[signal.SIGTERM]()
-        await asyncio.wait_for(task, 5.0)
-
-    asyncio.run(scenario())
-    assert unwound == ["aclose"]
-
-
-@pytest.mark.timeout(60)
-def test_state_publishes_the_mcus_own_rx_drop_counter(tmp_path: Path) -> None:
-    """``state.mcu.rx_drop`` is ``T.rx_drop``.
-
-    It was filled from robotd's own host-side count of malformed *up*-direction
-    lines while every other field of ``mcu`` came from the ``T`` frame, so a
-    noisy Pi->MCU link -- the direction ``LINK_CRC`` latches on -- climbed on
-    the wire and stayed 0 for roverctl, the web status strip and the event log.
-    """
-
-    async def scenario() -> None:
-        async with (
-            rover(tmp_path) as (robotd, mcu, _),
-            client(robotd, "web", ("subscribe",)) as web,
-        ):
-            await web.send(type="subscribe", topics=["state"], state_hz=10)
-            mcu.rx_drop = 37
-            state = await web.recv_type("state", timeout=5.0)
-            while state["mcu"]["rx_drop"] != 37:
-                state = await web.recv_type("state", timeout=5.0)
-            assert state["mcu"]["rx_drop"] == 37
-
-    asyncio.run(scenario())
-
-
-@pytest.mark.timeout(60)
-def test_an_out_of_enum_mcu_state_does_not_stop_state_publication(
-    tmp_path: Path,
-) -> None:
-    """One CRC-valid frame with a seventh state used to raise inside
-    ``_publish_state``: robotd then stopped publishing ``state`` while still
-    driving, and brain's half-duplex gate reads ``moving`` off the last state
-    it received."""
-
-    async def scenario() -> None:
-        async with (
-            rover(tmp_path) as (robotd, mcu, _),
-            client(robotd, "web", ("subscribe",)) as web,
-        ):
-            await web.send(type="subscribe", topics=["state"], state_hz=10)
-            await web.recv_type("state", timeout=5.0)
-            mcu.state = 200  # type: ignore[assignment]
-            state = await web.recv_type("state", timeout=5.0)
-            while state["mcu"]["state"] != "FAULT":
-                state = await web.recv_type("state", timeout=5.0)
-            # Unknown fails toward not-ready: an unreadable controller must not
-            # read as armable.
-            assert state["ready"] is False
-
-    asyncio.run(scenario())
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(
+        loop,
+        "add_signal_handler",
+        lambda signum, callback: handlers.update({signum: callback}),
+    )
+    task = asyncio.create_task(robotd_main.serve(RobotConfig()))
+    await until(lambda: signal.SIGTERM in handlers)
+    assert signal.SIGINT in handlers
+    handlers[signal.SIGTERM]()
+    await asyncio.wait_for(task, 2)
+    assert unwound == [True]

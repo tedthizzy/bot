@@ -402,16 +402,16 @@ def test_a_reverse_power_clamps_with_its_sign() -> None:
 
 
 def test_a_power_at_or_below_the_default_is_untouched() -> None:
-    verdict = _accept(
-        Validator(config()), drive(args={"duration_s": 1.0, "power": 0.20})
-    )
+    verdict = _accept(Validator(config()), drive(args={"duration_s": 1.0, "power": 0.20}))
     assert verdict.power_clamped_to is None
 
 
 def test_a_power_above_the_configured_maximum_is_out_of_bounds() -> None:
     """``power_max`` may sit below the catalog's 0.30; above it is a refusal,
     not a clamp."""
-    tight = Validator(config(limits={"power_max": 0.25, "power_default": 0.20}))
+    tight = Validator(
+        config(limits={"power_max": 0.25, "power_default": 0.20, "twist_power": 0.25})
+    )
     rejection = _reject(tight, drive(args={"duration_s": 1.0, "power": 0.28}))
     assert rejection.reason is ResultReason.OUT_OF_BOUNDS
     assert "power_max" in rejection.detail
@@ -428,11 +428,9 @@ def test_forward_is_blocked_but_reverse_and_turning_pass(flag: StopFlag) -> None
     ctx = context(stop_flags=int(flag))
     forward = _reject(validator, drive(), ctx=ctx)
     assert forward.reason is ResultReason.OBSTACLE
-    reverse = _accept(
-        validator, drive(args={"duration_s": 1.0, "power": -0.15}), ctx=ctx
-    )
+    reverse = _accept(validator, drive(args={"duration_s": 1.0, "power": -0.15}), ctx=ctx)
     assert reverse.moves
-    assert isinstance(_accept(validator, turn(), ctx=ctx), AcceptedSkill)
+    assert isinstance(_accept(validator, turn(cmd_id=CMD2), ctx=ctx), AcceptedSkill)
 
 
 def test_low_battery_refuses_every_motion_including_reverse_and_turning() -> None:
@@ -491,7 +489,7 @@ def test_a_turn_is_refused_only_once_the_budget_is_spent() -> None:
     assert isinstance(
         _accept(validator, turn(), ctx=context(remaining_motion_s=0.3)), AcceptedSkill
     )
-    rejection = _reject(validator, turn(), ctx=context(remaining_motion_s=0.0))
+    rejection = _reject(validator, turn(cmd_id=CMD2), ctx=context(remaining_motion_s=0.0))
     assert rejection.reason is ResultReason.BUDGET_EXCEEDED
 
 
@@ -649,7 +647,9 @@ def test_a_connection_bound_as_brain_may_not_send_teleop_twists() -> None:
 
 def test_a_forward_twist_is_refused_under_a_forward_block() -> None:
     verdict = Validator(config(bus=TELEOP_BUS)).check_twist(
-        twist(), session(Source.TELEOP, ("twist",)), context(stop_flags=int(StopFlag.BUMPER))
+        twist(),
+        session(Source.TELEOP, ("twist",)),
+        context(stop_flags=int(StopFlag.BUMPER)),
     )
     assert isinstance(verdict, Rejection)
     assert verdict.reason is ResultReason.OBSTACLE

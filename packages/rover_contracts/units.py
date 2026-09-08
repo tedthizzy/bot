@@ -1,7 +1,7 @@
 """The unit boundary.
 
 A11: every bounded numeric the model emits is an integer -- whole degrees for a
-heading, whole percent of full scale for a power, whole milliseconds for a
+heading, hundredths of a Waveshare power unit, whole milliseconds for a
 duration.  The rover is open loop, so the only continuous quantity anything
 integrates is heading, and every wrap of an angle happens here so no other
 module does bare arithmetic on one.
@@ -19,6 +19,7 @@ __all__ = [
     "bearing_deg_from_center_x",
     "deg_to_rad",
     "heading_error_deg",
+    "heading_left_of",
     "rad_to_deg",
     "round_half_away",
     "wrap_deg_180",
@@ -58,7 +59,9 @@ def wrap_deg_180(deg: float) -> float:
 
 def wrap_deg_360(deg: float) -> float:
     """Into [0, 360), the range ``turn_to`` and the WorldState use."""
-    return _finite(deg, "deg") % 360.0
+    wrapped = _finite(deg, "deg") % 360.0
+    # A tiny negative float can round its remainder up to exactly 360.
+    return 0.0 if wrapped == 360.0 else wrapped
 
 
 def heading_error_deg(target_deg: float, current_deg: float) -> float:
@@ -68,6 +71,15 @@ def heading_error_deg(target_deg: float, current_deg: float) -> float:
     target = _finite(target_deg, "target_deg")
     current = _finite(current_deg, "current_deg")
     return wrap_deg_180(target - current)
+
+
+def heading_left_of(heading_deg: float, left_deg: float) -> int:
+    """Absolute host heading after a leftward rotation; negative turns right.
+
+    Host headings increase counter-clockwise. Convert hardware yaw into this
+    frame once at the link boundary, never independently in callers.
+    """
+    return round_half_away(wrap_deg_360(heading_deg + left_deg)) % 360
 
 
 def bearing_deg_from_center_x(center_x_permille: int, hfov_deg: float) -> float:

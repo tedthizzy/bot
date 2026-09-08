@@ -17,7 +17,7 @@ import logging
 import tomllib
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Final, Literal
+from typing import Any, Final, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -185,16 +185,21 @@ class BusConfig(_Section):
     brain_sock: str = "/run/rover/brain.sock"
     state_hz: int = Field(default=10, gt=0, le=50)
     allow_sources: list[_SourceName] = Field(
-        default_factory=lambda: ["brain", "web"]
+        default_factory=lambda: cast(list[_SourceName], ["brain", "web"])
     )
     allow_stream: list[_SourceName] = Field(default_factory=list)
-    clear_sources: list[_SourceName] = Field(default_factory=lambda: ["web"])
+    clear_sources: list[_SourceName] = Field(
+        default_factory=lambda: cast(list[_SourceName], ["web"])
+    )
     source_uids: dict[_SourceName, str] = Field(
-        default_factory=lambda: {
-            "brain": "rover-brain",
-            "web": "rover-web",
-            "teleop": "rover-web",
-        }
+        default_factory=lambda: cast(
+            dict[_SourceName, str],
+            {
+                "brain": "rover-brain",
+                "web": "rover-web",
+                "teleop": "rover-web",
+            },
+        )
     )
     teleop_input_max_age_ms: int = Field(default=250, gt=0)
     client_ping_hz: int = Field(default=5, gt=0)
@@ -323,9 +328,7 @@ class BatteryConfig(_Section):
     ocv_per_cell: list[float] = Field(
         default_factory=lambda: [4.20, 4.00, 3.85, 3.70, 3.60, 3.50, 3.30, 3.20]
     )
-    soc_pct: list[int] = Field(
-        default_factory=lambda: [100, 85, 70, 50, 35, 20, 8, 0]
-    )
+    soc_pct: list[int] = Field(default_factory=lambda: [100, 85, 70, 50, 35, 20, 8, 0])
 
     @model_validator(mode="after")
     def _table_is_a_table(self) -> BatteryConfig:
@@ -400,7 +403,6 @@ class RobotConfig(_Section):
         return self
 
 
-
 def _identity(text: str) -> str:
     """Letters and digits only, folded: ``hey_rover-2`` and ``Rover`` compare."""
     return "".join(ch for ch in text.lower() if ch.isalnum())
@@ -441,9 +443,7 @@ def _apply_env_overrides(
         rest = name[len(ENV_PREFIX) :]
         section, sep, key = rest.partition("__")
         if not sep or not section or not key or "__" in key:
-            raise ConfigError(
-                f"{name} is not of the form {ENV_PREFIX}SECTION__KEY"
-            )
+            raise ConfigError(f"{name} is not of the form {ENV_PREFIX}SECTION__KEY")
         section, key = section.lower(), key.lower()
         value = _coerce(env[name])
         data.setdefault(section, {})[key] = value

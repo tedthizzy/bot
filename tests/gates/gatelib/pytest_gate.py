@@ -31,9 +31,12 @@ def run_gate(script: str, *args: str, timeout: float = 600.0) -> None:
     """Run one gate script and turn its exit code into a pytest outcome."""
     path = REPO / "tests" / "gates" / script
     env = dict(os.environ)
-    packages = str(REPO / "packages")
     env["PYTHONPATH"] = os.pathsep.join(
-        [packages, *(p for p in env.get("PYTHONPATH", "").split(os.pathsep) if p)]
+        [
+            str(REPO / "packages"),
+            str(REPO / "hosts" / "pi"),
+            *(p for p in env.get("PYTHONPATH", "").split(os.pathsep) if p),
+        ]
     )
     try:
         result = subprocess.run(

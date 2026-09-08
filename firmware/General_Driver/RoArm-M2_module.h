@@ -160,7 +160,7 @@ void waitMove2Goal(byte InputID, s16 goalPosition, s16 offSet){
       break;
     }
     getFeedback(InputID, true);
-    delay(10);
+    bot_delayMillis(10);
   }
 }
 
@@ -231,7 +231,7 @@ void RoArmM2_moveInit() {
   waitMove2Goal(SHOULDER_DRIVING_SERVO_ID, ARM_SERVO_MIDDLE_POS, 30);
 
   // wait for the jitter to go away.
-  delay(1200);
+  bot_delayMillis(1200);
 
   // set the position as the middle of the SHOULDER_DRIVEN_SERVO.
   if(InfoPrint == 1){Serial.println("Set this pos as the middle pos for SHOULDER_DRIVEN_SERVO.");}
@@ -240,7 +240,7 @@ void RoArmM2_moveInit() {
   // SHOULDER_DRIVEN_SERVO starts producing torque.
   if(InfoPrint == 1){Serial.println("SHOULDER_DRIVEN_SERVO starts producing torque.");}
   servoTorqueCtrl(SHOULDER_DRIVEN_SERVO_ID, 1);
-  delay(10);
+  bot_delayMillis(10);
 
   // move ELBOW_SERVO to middle position.
   if(InfoPrint == 1){Serial.println("Moving ELBOW_SERVO to middle position.");}
@@ -250,7 +250,7 @@ void RoArmM2_moveInit() {
   if(InfoPrint == 1){Serial.println("Moving GRIPPER_SERVO to middle position.");}
   st.WritePosEx(GRIPPER_SERVO_ID, ARM_SERVO_MIDDLE_POS, ARM_SERVO_INIT_SPEED, ARM_SERVO_INIT_ACC);
 
-  delay(1000);
+  bot_delayMillis(1000);
 }
 
 
@@ -419,16 +419,16 @@ void setNewAxisX(double angleInput) {
   RoArmM2_baseJointCtrlRad(1, 0, 500, 20);
   waitMove2Goal(BASE_SERVO_ID, goalPos[0], 20);
 
-  delay(1000);
+  bot_delayMillis(1000);
 
   RoArmM2_baseJointCtrlRad(1, -radInput, 500, 20);
   waitMove2Goal(BASE_SERVO_ID, goalPos[0], 20);
 
-  delay(1000);
+  bot_delayMillis(1000);
 
   setMiddlePos(BASE_SERVO_ID);
 
-  delay(5);
+  bot_delayMillis(5);
 }
 
 
@@ -845,7 +845,7 @@ void RoArmM2_movePosGoalfromLast(float spdInput){
       bufferLastT = bufferT;
     }
     RoArmM2_goalPosMove();
-    delay(2);
+    bot_delayMillis(2);
   }
   RoArmM2_baseCoordinateCtrl(goalX, goalY, goalZ, goalT);
   RoArmM2_goalPosMove();
@@ -914,7 +914,8 @@ void getCirclePointYZ(double cx, double cy, double r, double t) {
 
 // delay cmd.
 void RoArmM2_delayMillis(int inputTime) {
-  delay(inputTime);
+  // bot: retain the pause, but keep heartbeat, sensors and urgent stops live.
+  if (inputTime > 0) bot_delayMillis((uint32_t)inputTime);
 }
 
 

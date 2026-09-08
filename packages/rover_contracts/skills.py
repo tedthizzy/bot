@@ -17,6 +17,7 @@ name are the ones the firmware fork also enforces in its own units;
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Final
@@ -41,6 +42,7 @@ __all__ = [
     "Bound",
     "CATALOG",
     "ExecutorOwner",
+    "FIND_BUDGET_S",
     "MOTION_SKILLS",
     "NON_MOTION_SKILLS",
     "SKILLS",
@@ -51,21 +53,32 @@ __all__ = [
     "power_from_pct",
 ]
 
+FIND_BUDGET_S: Final = 60.0
+"""Whole-operation deadline for a local find, including every adapter await."""
 
-def goal_deadline_s(duration_s: float) -> float:
-    """T2's deadline for a motion skill: the skill's own duration, half again,
-    plus the same half second the original formula carried.  Lives here and not
-    in robotd because brain computes the ``goal_ttl_ms`` robotd then checks
-    against T2, and two implementations of one formula disagree by a float ulp.
+
+def goal_deadline_s(
+    duration_s: float, *, skill: SkillName = SkillName.DRIVE_FOR
+) -> float:
+    """Shared T2 calculation; each host still enforces the result independently.
+
+    Drives allow half their duration plus 0.5 seconds for completion. A turn's
+    timeout already is its complete deadline, not an estimated drive duration.
     """
-    if duration_s <= 0.0:
+    if not math.isfinite(duration_s) or duration_s <= 0.0:
         raise ValueError(f"duration must be positive, got {duration_s!r}")
-    return duration_s * 1.5 + 0.5
+    if skill == SkillName.DRIVE_FOR:
+        return duration_s * 1.5 + 0.5
+    if skill == SkillName.TURN_TO:
+        return duration_s
+    raise ValueError(f"{skill} has no motor deadline")
 
 
 def power_from_pct(power_pct: int) -> float:
-    """The model's ``power_pct`` (percent of Waveshare full scale) as the bus
-    ``power`` (Waveshare units, full scale 0.5).  30 -> 0.30."""
+    """Legacy ``power_pct`` means hundredths of a Waveshare power unit.
+
+    Preserve 30 -> 0.30. Full scale is 0.5, so 30 is 60% duty, not 30% duty.
+    """
     return round(power_pct / 100.0, 3)
 
 

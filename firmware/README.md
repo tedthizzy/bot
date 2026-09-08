@@ -1,8 +1,8 @@
 # Firmware: Waveshare `ugv_base_general` with safety patches
 
 This directory is a fork of Waveshare's `ugv_base_general` Arduino firmware for
-the WAVE ROVER's General Driver for Robots board (ESP32-WROOM-32UE), plus eight
-patches that make it safe to drive from an unattended host. The result
+the WAVE ROVER's General Driver for Robots board (ESP32-WROOM-32UE), plus nine
+patches for bounded host control and independent actuator checks. The result
 announces itself as `bot-wr-1` and implements `docs/protocol.md`; the reasoning
 is `docs/adr/0013-wave-rover-open-loop.md`.
 
@@ -18,9 +18,11 @@ line.
 
 | path | what |
 | --- | --- |
-| `General_Driver/` | the sketch: upstream sources plus `bot_config.h` (every added constant) and `bot_safety.h` (stop flags, ToF, bumper, battery latch, banner) |
+| `General_Driver/` | the sketch: upstream sources plus `bot_config.h` (constants), `bot_safety.h` (sensor flags and banner), `bot_runtime.h` (bounded intake), and `bot_serial_ctrl.h` (serial dispatch and cooperative waits) |
 | `libraries/SCServo/` | Waveshare's bus-servo library, vendored because it is not in the Library Manager |
-| `patches/` | the eight patches as unified diffs, in apply order, with `patches/README.md` |
+| `patches/` | the nine patches as unified diffs, in apply order, with `patches/README.md` |
+| `tests/` | native regression checks against the production motor and serial/wait headers, using a fake clock and GPIO |
+| `arduinojson.sh` | shared ArduinoJson version, official archive URL and checksum for target/native builds |
 | `build.sh`, `Dockerfile` | reproducible compile in Docker (arduino-cli, esp32 core 2.0.17) |
 | `flash.sh` | write the images over USB with esptool on the host |
 | `UPSTREAM.md` | upstream URL, commit, date, licence, what was vendored |
@@ -36,8 +38,72 @@ line.
 6. Stop flags from a front VL53L1X, a bumper and the INA219 pack voltage.
 7. Power cap 0.30 on every path, forward block, low-battery refusal, coast flag.
 8. Feedback fields `hb st tf bp cc`, `L`/`R` in host units, `T:1006` banner.
+9. Bounded serial intake, direct motor stops in every chassis mode, and safety
+   servicing during vendor waits and file/mission loops.
 
 What each one changes and which safety property it serves: `patches/README.md`.
+
+## Serial work and vendor waits
+
+Incoming lines are limited to 512 bytes before LF. An oversized line is discarded
+through its newline; its prefix is never executed. Each poll consumes at most
+128 bytes and one complete line, so a continuous stream cannot monopolize the
+main loop. CRLF is accepted; CR counts toward the limit.
+
+`T:111` keeps its requested pause, but services heartbeat, sensors, and serial
+stops in one-millisecond slices. Existing arm/gimbal/NVS waits use the same helper.
+File and mission loops also service safety between iterations. During a wait,
+up to four other commands queue in order. Further commands are dropped and counted
+in `bot_serialInput.dropped`; there is no new acknowledgement protocol. `T:115`
+and zero requests through `T:1`, `T:11`, or `T:13` stop immediately, end the current
+wait, and cancel older queued commands so they cannot restart motion. Stop parsing
+uses a separate JSON document and cannot overwrite an executing vendor command.
+Deferred wheel commands expire at their receipt time plus the heartbeat window;
+dispatch cannot renew that window. Nonmotion commands retain their queue order.
+
+`T:900` still changes the chassis/module mode. A chassis-mode change first clears
+the previous physical motor output. A module-only change retains the existing
+behaviour. Heartbeat expiration and zero-speed commands clear PWM and PID state
+directly, including when encoder/PID execution is disabled.
+
+These are cooperative checks, not a separate hardware watchdog. A single blocking
+sensor, filesystem, servo-library, or serial write can still delay the next check.
+The native tests do not bound those hardware calls. Verify worst-case stop latency
+on the board; do not infer it from the simulator or the compile result.
+
+## Native regression checks (no Docker or ESP32 toolchain)
+
+```sh
+bash firmware/tests/run.sh --setup  # download and verify ArduinoJson only
+bash firmware/tests/run.sh          # compile/run with the host C++ compiler
+```
+
+The setup downloads the official 490,951-byte ArduinoJson 6.21.5 archive and
+verifies its SHA-256 before extracting it. `arduinojson.sh` holds the shared pin
+used by this runner and `build.sh`. The archive URL and checksum come from the
+[Arduino Library Manager index](https://downloads.arduino.cc/libraries/library_index.json.gz).
+Setup needs `curl`, `shasum`, and `unzip`. The tests need a C++17 compiler with
+AddressSanitizer and UndefinedBehaviorSanitizer. macOS CI prepares this dependency
+explicitly; it does not install Docker, arduino-cli, or the ESP32 core.
+
+Only the ignored `firmware/.cache/user/libraries/ArduinoJson` directory is
+populated. Set `BOT_ARDUINO_CACHE` for a separate cache. An existing full Arduino
+build cache works too. Normal tests never download dependencies and fail if the
+pinned headers are missing or mismatched. Setup refuses to overwrite an
+incompatible existing library; use an empty cache or move that library aside.
+The runner creates and removes its own temporary test binary.
+
+The test includes the production motor and serial/wait headers. GPIO writes,
+time, UART bytes, encoder/PID types, and the sensor polling hook are substituted.
+Checks cover the 300 ms motor stop in inactive PID mode, mode-change and zero
+stops, coast outputs, raw-PWM caps, sensor flags, a 3-second cooperative wait,
+urgent stops during waits, JSON isolation, deferred motion expiry and ordering, nested
+intake with a partial line, queue saturation, oversized 200 kB input, bounded
+per-poll work, and clock wrap.
+
+These checks do not emulate the complete vendor command handler, sensor drivers,
+FreeRTOS, or real motor timing. `build.sh` remains the ESP32 compile check.
+Physical heartbeat latency, sensor bus faults, and the inline STOP need the board.
 
 ## Compile-time switches (`General_Driver/bot_config.h`)
 
@@ -79,14 +145,18 @@ with `/work` = `firmware/`. Output in `firmware/build/`:
 `General_Driver.ino.partitions.bin`, `boot_app0.bin` (copied from the core),
 plus the `.elf` and `.map`.
 
-Reference build (esp32 2.0.17, huge_app, DIO):
+Reference build before patch 9 (esp32 2.0.17, huge_app, DIO):
 
 ```text
 Sketch uses 885001 bytes (28%) of program storage space. Maximum is 3145728 bytes.
 Global variables use 47760 bytes (14%) of dynamic memory, leaving 279920 bytes for local variables. Maximum is 327680 bytes.
 ```
 
-With the default 4 MB partition table (`FQBN=esp32:esp32:esp32:FlashMode=dio
+The patch-9 build uses 887533 bytes of program storage and 50332 bytes of globals
+with the same huge_app/DIO target. Its native regression checks pass under
+ASan/UBSan. It has not been flashed.
+
+The pre-patch-9 sources with the default 4 MB partition table (`FQBN=esp32:esp32:esp32:FlashMode=dio
 ./firmware/build.sh`) the same sources give:
 
 ```text
@@ -113,7 +183,8 @@ Why esp32 core 2.0.17: the code uses the 2.x LEDC API (`ledcSetup`,
 `ledcAttachPin`), which 3.x removed. Waveshare documents 2.0.11; 2.0.17 is the
 last 2.x and has the same API.
 
-Library pins (`build.sh`): ArduinoJson 6.21.5 (the sketch uses the v6 API),
+Library pins (`build.sh`, with ArduinoJson shared through `arduinojson.sh`):
+ArduinoJson 6.21.5 (the sketch uses the v6 API),
 INA219_WE 1.3.8 (1.4.0 renamed its enums, `BIT_MODE_9` became
 `INA219_BIT_MODE_9`, and upstream `battery_ctrl.h` uses the old names -- pinning
 keeps the vendored file untouched), Adafruit SSD1306 2.5.17, Adafruit GFX
@@ -227,7 +298,7 @@ have no power without the pack anyway.
   hardware. `BOT_TOF_REQUIRED` stays 0 until they are.
 - The `/dev/tty.usbserial-*` name is the CP2102's usual one on macOS 12 and
   later; check with `ls /dev/tty.*`.
-- `tests/unit/test_caps_match.py` (mentioned in `packages/rover_contracts/skills.py`)
-  did not exist when this was written; `bot_config.h` keeps every define on one
-  line with a plain literal so a regex test can read `BOT_POWER_CAP` and
-  `BOT_HEARTBEAT_MS`.
+- `tests/unit/test_caps_match.py` checks the host's cap, heartbeat, and sensor
+  defaults against `bot_config.h`. `bash firmware/tests/run.sh` exercises the
+  production motor/serial/wait functions with mocked hardware. Neither check
+  establishes real motor or sensor timing.

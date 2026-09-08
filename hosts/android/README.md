@@ -2,7 +2,7 @@
 
 The phone is the planned second host of ADR-0013: it must pass the same gates
 as the Pi before it replaces the Pi. Until the Pi stack passes G4 on hardware
-(`docs/gates.md`, the `[hw]` items in `PLAN.md`) this directory is a skeleton
+(`docs/gates.md`, the hardware gaps in `debloat.md`) this directory is a skeleton
 and nothing more is added to it.
 
 ## What this is

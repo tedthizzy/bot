@@ -1,0 +1,27 @@
+# Keep local state out of the services image. Keep source and test fixtures.
+.git
+**/.venv
+**/.venv-*
+**/__pycache__
+**/*.pyc
+**/*.egg-info
+**/.*_cache
+**/.hypothesis
+**/.cache
+**/build
+**/build-debug
+**/*.o
+**/*.a
+**/hf-cache
+**/whisper-data
+run
+data
+logs
+config/robot.toml
+**/.env
+**/.env.*
+!**/.env.example
+rasberrypi.md
+raspberrypi.md
+**/*.local.md
+**/.DS_Store

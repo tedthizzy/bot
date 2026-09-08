@@ -32,8 +32,12 @@ from typing import Final
 from pydantic import ValidationError
 from rover_contracts.jsonl import to_json_line
 from rover_contracts.messages import (
+    BrainCancelMessage,
     BrainClientMessage,
     BrainServerMessage,
+    BrainSkillRequest,
+    ResultMessage,
+    UtteranceSource,
     brain_client_adapter,
 )
 
@@ -58,6 +62,7 @@ class _Client:
         self._queue: deque[bytes] = deque()
         self._wake = asyncio.Event()
         self._closed = False
+        self.requests: dict[str, UtteranceSource] = {}
 
     def send(self, line: bytes) -> None:
         if self._closed:
@@ -161,6 +166,8 @@ class BrainBus:
         """Fan a ``face`` or ``fsm`` message out to every client."""
         line = to_json_line(message).encode("utf-8")
         for client in self._clients:
+            if isinstance(message, ResultMessage):
+                client.requests.pop(message.cmd_id, None)
             client.send(line)
 
     # -- serving ------------------------------------------------------------
@@ -172,15 +179,19 @@ class BrainBus:
         self._clients.add(client)
         pump = asyncio.create_task(client.pump())
         try:
-            await self._read_lines(reader)
+            await self._read_lines(reader, client)
         finally:
+            for request_id, source in client.requests.items():
+                self._on_message(BrainCancelMessage(source=source, request_id=request_id))
             client.close()
             pump.cancel()
             self._clients.discard(client)
             with contextlib.suppress(ConnectionError, OSError):
                 await writer.wait_closed()
 
-    async def _read_lines(self, reader: asyncio.StreamReader) -> None:
+    async def _read_lines(
+        self, reader: asyncio.StreamReader, client: _Client | None = None
+    ) -> None:
         while True:
             try:
                 line = await reader.readline()
@@ -200,4 +211,6 @@ class BrainBus:
                 count = exc.error_count() if isinstance(exc, ValidationError) else 1
                 log.warning("brain.sock: undecodable line, %d errors", count)
                 continue
+            if client is not None and isinstance(message, BrainSkillRequest):
+                client.requests[message.request_id] = message.source
             self._on_message(message)

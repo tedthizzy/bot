@@ -118,3 +118,12 @@ python_version = "3.11"
 mypy_path = "packages:hosts/pi"
 strict = true
 warn_unused_ignores = true
+
+# These backends are optional speech extras or Pi apt packages, absent from
+# the portable development environment. First-party modules remain strict.
+[[tool.mypy.overrides]]
+module = [
+    "numpy", "numpy.*", "sherpa_onnx", "sherpa_onnx.*", "sounddevice",
+    "pyopen_wakeword", "picamera2", "picamera2.*", "simplejpeg",
+]
+ignore_missing_imports = true

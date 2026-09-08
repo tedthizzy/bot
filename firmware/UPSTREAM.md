@@ -40,8 +40,9 @@ valid UTF-8.
 ## What was changed
 
 Nothing in the vendored files beyond the patches listed in
-`patches/README.md`. Each patch is a unified diff against the pristine copy;
-`patches/README.md` says how to re-derive the tree from them. Two files are
-new: `General_Driver/bot_config.h` (every constant the fork adds) and
-`General_Driver/bot_safety.h` (stop flags, time-of-flight, bumper, battery
-latch, banner).
+`patches/README.md`. The ordered unified diffs reconstruct the fork from upstream;
+`patches/README.md` says how to re-derive the tree from them. Four sketch headers
+are new: `General_Driver/bot_config.h` (constants),
+`General_Driver/bot_safety.h` (sensor flags and banner),
+`General_Driver/bot_runtime.h` (bounded serial storage), and
+`General_Driver/bot_serial_ctrl.h` (serial dispatch and cooperative waits).

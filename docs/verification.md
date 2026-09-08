@@ -1,50 +1,30 @@
-# Verification — what was run, and what it proved
+# Verification
 
-Two records live here. The first is for the current design, the WAVE ROVER
-chassis of ADR-0013. The second is the v0 record for the retired ESP32-S3
-controller, kept because the invariants were born there and their numbers did
-not change.
+Current software evidence and remaining gaps live in
+[debloat.md](../debloat.md).
+The [gate map](gates.md) connects retained scenarios to current tests.
 
-## v1.1 — WAVE ROVER (ADR-0013)
+## WAVE ROVER status
 
-Filled in by the integration run; until then the table below states where each
-invariant is now enforced and which gate case proves it. **M** = green against
-`rover-stub` on the MacBook; **R** = by code review; **H** = needs the rover.
+The migration now has executable unit, boundary and simulated fault checks.
+Native C++ tests exercise production firmware headers with a fake clock and GPIO.
+The Arduino fork compiles, and its ordered patches reproduce the pinned source.
+Neither native tests nor the Python stub execute the assembled robot.
 
-| # | invariant, as re-mapped | enforced by | test | status |
-| --- | --- | --- | --- | --- |
-| I-1 | Motion requires a speed command within the firmware's 300 ms heartbeat | firmware fork `BOT_HEARTBEAT_MS`; robotd streams at 20 Hz from the goal loop | G2-a: stop the stream, `hb` drops and applied speed is 0 within 300 ms + one period | M + H |
-| I-2 | A line that is not a well-formed speed command does not renew the heartbeat; garbage is dropped and counted | firmware's JSON parser (only `T:1/11/13` renew); robotd `Dropped` counter | G2-b: garbage and oversize lines, `hb` still drops on schedule | M |
-| I-3 | Controller boots with motors off; no motion until the host streams | firmware `movtionPinInit`, boot mission disabled, radios compiled out | G2-c: first feedback after power-on has `L=R=0`; banner present | M + H |
-| I-4 | The compiled cap cannot be raised by any command; every path is clamped | firmware `BOT_POWER_CAP` in `leftCtrl`/`rightCtrl`; robotd `power_max` ceiling; `test_caps_match` | G2-d: `L 0.9` → applied 0.30, `cc` increments; `T:136 500` ignored | M + H |
-| I-5 | Time-of-flight or bumper blocks forward at the controller; reverse and rotation remain | firmware stop flags 2 and 4; robotd refuses forward `drive_for` on those flags | G4-a: `--tof-mm 200`, forward refused, reverse and `turn_to` accepted | M + H |
-| I-6 | The inline switch removes drive power and needs nothing from software | wiring | G2-e: press with robotd streaming; motors dead; robotd reports link or heartbeat loss | H |
-| I-7 | Low battery refuses all motion | firmware flag 8 at `BOT_LOWBAT_V`, 10 s debounce; robotd `faulted` | G2-f: `--vbat 9.5` → every motion rejected | M + H |
-| I-8 | robotd rejects unknown skills, out-of-bounds, non-finite, extra fields, oversize TTL, stale seq — for `twist` too | robotd validator on the new catalog | G4-b fuzz, 500 cases, zero reach the link | M |
-| I-9 | Model output reaches the controller only as a validated skill; no model numeric is forwarded unclamped | brain stage two + robotd stage three; `power_pct` → `power` clamp | G4-c over every G1 record | M |
-| I-10 | A wheel stall is bounded by the instruction's time budget, not detected | there is no encoder; `budget_motion_s` and `drive_for_max_s` bound the damage | G4-i; G2-g on hardware records what a held wheel draws | M + H (meaning changed) |
-| I-11 | A late model response cannot start motion | brain `turn_id`, robotd `stale_turn` | G4-e | M |
-| I-12 | A repeated `cmd_id` cannot execute motion twice | robotd replay window | G4-f | M |
-| I-13 | Link reconnect never replays motion; bring-up re-runs and starts idle | robotd link reopen: zeros, banner wait, no goal resume | G4-g: kill and restart the stub mid-drive | M + H |
-| I-14 | Killing or freezing any one process stops the wheels within 300 ms + spin-down | no keep-alive thread in robotd; the firmware heartbeat | G4-h: `SIGSTOP` robotd, `hb` drops, applied speed 0 | M + H |
-| I-15 | Per-instruction budget: at most 12 s of motion per utterance | robotd `budget.py` in motion seconds | G4-i | M (meaning changed: no distance) |
-| I-16 | Stale or absent sensors are blockage, not clear path | `front_m = None` never unlocks; firmware `BOT_TOF_REQUIRED` when set | G4-j | M |
-| I-17 | No host timestamp is compared against the controller clock | the protocol carries none | review of `hosts/pi/rover_robotd` | R |
-| I-18 | Only robotd writes the port; the controller is the fork, not stock | udev 0660 group `rover`; robotd refuses without banner and fork fields | G2-h: `--stock` → `unpatched_firmware`, no motion; `fuser` on the Pi | M + H |
-| I-19 | Box-link loss cancels an in-flight brain goal within 3 s; teleop unaffected | brain `_watch_box` | G4-k | M |
-| I-20 | A hung controller stops being driven | robotd T0: feedback older than 150 ms → zeros, goal aborted | G4-l: `--freeze-after` | M (meaning changed: the host detects the hang; the controller has no watchdog of ours) |
-| I-21 | An injected instruction inside the camera frame produces no motion | G1 adversarial rows; brain treats seen text as data | G1-e | M |
-| I-22 | Stop-class accepted from any allow-listed source in every state | robotd arbiter | G4-m | M |
-| I-23 | An observation older than `obs_max_age_ms` cannot authorize motion | robotd validator | G4-n | M |
-| I-24 | Driver inputs are low from reset through the end of setup | Waveshare `movtionPinInit` runs before radios and servos; boot mission off | review of `firmware/patches/`; G2-c on hardware | R + H |
+The earlier WAVE table's blanket `M` labels were not measured evidence and have
+been withdrawn. In particular, simulation does not prove all-process stop timing,
+model-image injection resistance, reset output levels, sensor failure behavior,
+battery hysteresis, stalled-wheel current or physical power isolation.
+The stub simplifies battery behavior. Firmware still uses cooperative checks,
+so a blocking hardware call can delay them. Physical qualification remains open.
 
-Changed in meaning: I-10 (no stall detection without encoders; the time budget
-bounds it), I-15 (seconds only), I-20 (the host's staleness check replaces the
-controller's watchdog), I-6 (an inline switch replaces the relay coil, and
-whether the Pi stays powered depends on how the switch is wired — see
-`docs/wiring.md`).
+The 24 historical invariant identifiers remain useful references.
+ADR-0013 changes their meaning where the topology changed: no encoder distance,
+no CRC/session wire contract, no custom relay or encoder stall detector.
+Use named current checks and their explicit limits rather than transferring old
+passing counts to this chassis.
 
-Weaker than v0, stated plainly: no checksum and no session on the wire.
+The transcript below is retained unchanged as historical evidence.
 
 ---
 

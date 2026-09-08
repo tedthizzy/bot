@@ -1,8 +1,9 @@
 # Decision records
 
-`ARCHITECTURE.md` is **frozen at v1.** Every number, field name, threshold and
-file path in it is a contract that nine components are being written against
-concurrently. It is not edited in place.
+`ARCHITECTURE.md` is frozen at the original v1 design.
+[0013](0013-wave-rover-open-loop.md) amends it for WAVE ROVER.
+Use [debloat.md](../../debloat.md) for the current implementation and evidence;
+the older records below preserve the rationale for the superseded design.
 
 **The governance rule.** A change to the architecture happens through a new
 decision record in this directory, and only through one. A record that proposes
@@ -27,7 +28,7 @@ is a log of implementation notes. This directory is for changing the contract.
 
 ## The records
 
-These twelve document the reversals `ARCHITECTURE.md` made against its own
+The first twelve document the reversals `ARCHITECTURE.md` made against its own
 inputs: the design brief, spec v1, critique v2, recommendations v3, and the
 thirteen research notes. Each one overruled something a prior document said, and
 each is a place a reader will otherwise ask "why not the obvious thing?".
@@ -46,3 +47,4 @@ each is a place a reader will otherwise ask "why not the obvious thing?".
 | [0010](0010-config-ceilings-refuse.md) | a value over a safety ceiling refuses startup | A33 | the chair's `robot.yaml` |
 | [0011](0011-no-docker-on-the-pi.md) | Docker on the Mac, never on the Pi | A36 | — |
 | [0012](0012-gate-sizing.md) | 450 G1 requests, 8 `find` sweeps | A14, A38 | the brief, ml_serving's 6 |
+| [0013](0013-wave-rover-open-loop.md) | WAVE ROVER, timed power and IMU heading; Pi first, Android later | motion, protocol, hardware and host assumptions | custom ESP32-S3 drivetrain and encoder odometry |

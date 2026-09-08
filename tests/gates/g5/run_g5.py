@@ -31,6 +31,7 @@ _HERE = Path(__file__).resolve()
 sys.path[:0] = [str(_HERE.parents[3] / "packages"), str(_HERE.parents[1])]
 
 from gatelib.bus import BusClient  # noqa: E402
+from gatelib.checks import pytest_case  # noqa: E402
 from gatelib.env import REPO, load_robot_config, socket_alive  # noqa: E402
 from gatelib.runner import GateRun, Status, base_parser, metrics_path_for  # noqa: E402
 from rover_contracts import (  # noqa: E402
@@ -163,8 +164,9 @@ def sub_stop_word(gate: GateRun, config: object) -> None:
             message = robotd.read(0.5)
             if message is None:
                 break
-            if message.get("type") == "state" and not (message.get("mcu") or {}).get(
-                "motion"
+            if (
+                message.get("type") == "state"
+                and (message.get("rover") or {}).get("motion") is False
             ):
                 stopped = time.monotonic()
                 break
@@ -174,10 +176,10 @@ def sub_stop_word(gate: GateRun, config: object) -> None:
             "stop utterance to a stationary MCU, reported and not gated",
             Status.PASS,
             f"{(stopped - sent) * 1000:.0f} ms from utterance to a state with "
-            "mcu.motion false. Text in, not speech: the spoken path adds wake, VAD "
+            "rover.motion false. Text in, not speech: the spoken path adds wake, VAD "
             "and STT, and A29 counts none of it"
             if stopped
-            else "no state with mcu.motion false arrived within 3 s",
+            else "no state with rover.motion false arrived within 3 s",
             stop_latency_ms=round((stopped - sent) * 1000, 1) if stopped else None,
         )
 
@@ -208,20 +210,36 @@ def main() -> int:
     if gate.selected("find"):
         sub_find_sectors(gate, args, config)
     if gate.selected("stopword"):
-        sub_stop_word(gate, config)
+        if args.hardware:
+            sub_stop_word(gate, config)
+        else:
+            pytest_case(
+                gate,
+                "stopword",
+                "A29",
+                "local stop routing (not microphone recognition)",
+                "tests/unit/test_brain_router.py",
+                "-k",
+                "stop",
+            )
     if gate.selected("filler"):
-        gate.skip(
+        pytest_case(
+            gate,
             "filler",
             "A31",
-            "the filler stops the instant the model's first sentence is ready",
-            "a running brain with audio, since the criterion is an audible overlap",
+            "filler cancellation transitions; audible overlap remains a bench check",
+            "tests/unit/test_brain_fsm.py",
+            "-k",
+            "transcript_starts_planning or intent_sentence or stop_cancels",
         )
     if gate.selected("memory"):
-        gate.skip(
+        pytest_case(
+            gate,
             "memory",
             "A31",
-            "the scene ring answers 'where did you see the mug'",
-            "a running brain that has already seen a mug",
+            "scene ring storage and world-state context (not model recall quality)",
+            "tests/unit/test_brain_scene.py",
+            "tests/unit/test_brain_world.py",
         )
     return gate.summary()
 

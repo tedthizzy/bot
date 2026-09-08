@@ -216,8 +216,7 @@ class OpenAITransport:
     """
 
     def __init__(self, config: BoxConfig) -> None:
-        import httpx
-        from openai import AsyncOpenAI
+        from openai import AsyncOpenAI, Timeout
 
         # The key is named by [box] api_key_env and never written to a file;
         # vLLM ignores it, but the client requires a non-empty string.
@@ -226,7 +225,7 @@ class OpenAITransport:
             base_url=config.url,
             api_key=key,
             max_retries=0,
-            timeout=httpx.Timeout(config.timeout_s, connect=config.connect_s),
+            timeout=Timeout(config.timeout_s, connect=config.connect_s),
         )
 
     async def stream(self, payload: Mapping[str, Any]) -> AsyncIterator[ChatChunk]:

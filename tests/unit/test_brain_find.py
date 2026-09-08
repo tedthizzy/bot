@@ -68,10 +68,14 @@ class FakeStills:
 class FakeMotion:
     def __init__(self, script: list[tuple[ResultStatus, ResultReason]] | None = None):
         self.turns: list[int] = []
+        self.observations: list[Still] = []
         self._script = list(script or [])
 
-    async def turn_to(self, heading_deg: int) -> tuple[ResultStatus, ResultReason]:
+    async def turn_to(
+        self, heading_deg: int, *, observation: Still
+    ) -> tuple[ResultStatus, ResultReason]:
         self.turns.append(heading_deg)
+        self.observations.append(observation)
         if self._script:
             return self._script.pop(0)
         return ResultStatus.DONE, ResultReason.NONE
@@ -168,7 +172,10 @@ async def test_a_fruitless_scan_stops_at_eight_captures() -> None:
     assert stills.calls == MAX_SWEEPS
     # One turn_to between captures, and none after the last: eight captures
     # 45 degrees apart span 360 degrees with an 83 degree field of view.
-    assert motion.turns == [315, 270, 225, 180, 135, 90, 45]
+    assert motion.turns == [45, 90, 135, 180, 225, 270, 315]
+    assert [frame.frame_id for frame in motion.observations] == [
+        f"cam-{n:06d}" for n in range(1, 8)
+    ]
     assert len(motion.turns) == MAX_SWEEPS - 1
 
 
@@ -180,7 +187,7 @@ async def test_the_sweep_headings_are_laid_out_from_the_starting_heading() -> No
     assert motion.turns == [
         heading_left_of(100.0, SWEEP_DEG * step) for step in range(1, MAX_SWEEPS)
     ]
-    assert motion.turns == [55, 10, 325, 280, 235, 190, 145]
+    assert motion.turns == [145, 190, 235, 280, 325, 10, 55]
     assert all(isinstance(h, int) and 0 <= h <= 359 for h in motion.turns)
 
 
@@ -249,6 +256,32 @@ async def test_the_scan_is_cancellable() -> None:
     assert motion.turns == []
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blocked_adapter", ["capture", "observation", "turn"])
+async def test_the_whole_find_deadline_cancels_an_inflight_adapter(
+    monkeypatch, blocked_adapter
+) -> None:
+    skills, stills, motion, *_ = build(FakeVision([absent()] * 8))
+    cancelled = asyncio.Event()
+
+    async def blocked(*args, **kwargs):
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    monkeypatch.setattr(skills_local, "FIND_BUDGET_S", 0.01)
+    adapter, method = {
+        "capture": (stills, "still"),
+        "observation": (skills._box, "observe"),
+        "turn": (motion, "turn_to"),
+    }[blocked_adapter]
+    monkeypatch.setattr(adapter, method, blocked)
+    with pytest.raises(TimeoutError):
+        await skills.find("red mug", MAX_SWEEPS)
+    assert cancelled.is_set()
+
+
 # -- what it does when it finds something ------------------------------------
 
 
@@ -260,7 +293,7 @@ async def test_the_centring_turn_is_a_pure_function_of_the_permille_and_hfov() -
     assert outcome.found is True
     bearing = bearing_deg_from_center_x(610, HFOV)
     assert bearing == pytest.approx(-9.13)  # + is left, so 610 is to the right
-    assert motion.turns == [heading_left_of(0.0, bearing)] == [9]
+    assert motion.turns == [heading_left_of(0.0, bearing)] == [351]
     assert stills.calls == 2  # capture, turn, re-capture
     assert len(motion.turns) == 1  # already centred on the second look
 
@@ -271,7 +304,7 @@ async def test_centring_is_relative_to_the_heading_now() -> None:
     skills, _, motion, *_ = build(vision, heading=87.0)
     await skills.find("red mug", MAX_SWEEPS)
     bearing = bearing_deg_from_center_x(390, HFOV)  # +9.13, to the left
-    assert motion.turns == [heading_left_of(87.0, bearing)] == [78]
+    assert motion.turns == [heading_left_of(87.0, bearing)] == [96]
 
 
 @pytest.mark.asyncio
@@ -281,6 +314,23 @@ async def test_it_recentres_once_and_then_stops() -> None:
     await skills.find("red mug", MAX_SWEEPS)
     assert stills.calls == 2
     assert len(motion.turns) == 2  # the centring turn, then one correction
+    assert [frame.frame_id for frame in motion.observations] == [
+        "cam-000001",
+        "cam-000002",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_the_second_centring_turn_preserves_its_failure_reason() -> None:
+    motion = FakeMotion(
+        [
+            (ResultStatus.DONE, ResultReason.NONE),
+            (ResultStatus.REJECTED, ResultReason.RATE_LIMITED),
+        ]
+    )
+    skills, *_ = build(FakeVision([seen(610), seen(610)]), motion)
+    outcome = await skills.find("red mug", MAX_SWEEPS)
+    assert outcome.found and outcome.reason is ResultReason.RATE_LIMITED
 
 
 @pytest.mark.asyncio

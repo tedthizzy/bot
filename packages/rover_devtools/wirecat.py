@@ -10,9 +10,9 @@ TCP port; the bytes are identical.
 
 Decoding is entirely ``rover_contracts.wave_proto.decode_line``: this module
 renders and counts, it never re-implements the grammar.  It is read-only by
-default -- the fd itself is ``O_RDONLY``, because I-18 says only robotd writes
-the port -- and ``--request`` is the one opt-in that transmits: feedback on and
-a banner request, once, refused while anything is listening on the robotd bus.
+default. Even a read-only serial reader consumes feedback intended for robotd,
+so serial access is refused while its bus is live. ``--request`` additionally
+transmits feedback-on and a banner request; capture-file replay stays available.
 """
 
 from __future__ import annotations
@@ -27,6 +27,7 @@ import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import cast
 
 from rover_contracts.wave_proto import (
     LINE_MAX_BYTES,
@@ -210,7 +211,8 @@ def _socket_is_live(path: str) -> bool:
 def _flags(flags: StopFlag | None) -> str:
     if flags is None:
         return "-"
-    names = "|".join(flag.name.lower() for flag in StopFlag if flags & flag)
+    # Iteration yields named members; only an arbitrary combined mask can lack a name.
+    names = "|".join(cast(str, flag.name).lower() for flag in StopFlag if flags & flag)
     return f"0x{int(flags):X}[{names or '-'}]"
 
 
@@ -300,28 +302,35 @@ def main(argv: Sequence[str] | None = None) -> int:
         description="Decode the rover link live (docs/protocol.md).",
     )
     parser.add_argument(
-        "device", nargs="?",
+        "device",
+        nargs="?",
         help="/dev/serial0, the pty path rover-stub printed, or a capture file",
     )
     parser.add_argument("--tcp", metavar="HOST:PORT", help="read a rover-stub --tcp port")
     parser.add_argument("--baud", type=int, default=115200)
     parser.add_argument(
-        "--only", default="", metavar="KINDS",
+        "--only",
+        default="",
+        metavar="KINDS",
         help="show only these kinds, comma-separated: " + ",".join(KINDS),
     )
     parser.add_argument(
-        "--exclude", default="", metavar="KINDS",
+        "--exclude",
+        default="",
+        metavar="KINDS",
         help="hide these kinds, e.g. --exclude feedback for the 20 Hz stream",
     )
     parser.add_argument("--count", type=int, default=0, help="stop after N shown lines")
     parser.add_argument("--seconds", type=float, default=0.0, help="stop after N s")
     parser.add_argument("--raw", action="store_true", help="also print the line bytes")
     parser.add_argument(
-        "--config", metavar="PATH",
+        "--config",
+        metavar="PATH",
         help="the [safety] heartbeat_ms a banner is compared with",
     )
     parser.add_argument(
-        "--request", action="store_true",
+        "--request",
+        action="store_true",
         help="send feedback-on and a banner request once. This WRITES to the "
         "link: never use it while robotd is running (I-18)",
     )
@@ -339,14 +348,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     where = args.tcp or args.device
     print(f"wirecat: [safety] heartbeat_ms={heartbeat_ms} from {origin}; reading {where}")
 
-    # --request is the one path that transmits, so it is guarded: a live
-    # listener on the bus means robotd owns the link, and a second writer's
-    # feedback or echo setting is robotd's problem the moment it lands.
-    if args.request and _socket_is_live(config.bus.sock):
+    # Serial reads consume robotd's feedback and raw mode changes its tty.
+    serial_device = args.device is not None and Path(args.device).is_char_device()
+    if (args.request or serial_device) and _socket_is_live(config.bus.sock):
         print(
             f"wirecat: {config.bus.sock} has a listener, so robotd owns {where}. "
-            "Only robotd writes the port (I-18); --request would be a second "
-            "writer. Stop rover-robotd, or drop --request to watch read-only.",
+            "Only robotd writes the port (I-18), and another serial reader "
+            "would consume its feedback. Stop rover-robotd first, or use roverctl watch.",
             file=sys.stderr,
         )
         return 2

@@ -1,16 +1,14 @@
 {
-  "pose_cm": {"x": 210, "y": 65},
-  "heading_deg": -12,
+  "heading_deg": 348,
   "battery_pct": 41,
   "obstacle_ahead": true,
   "front_range_cm": 24,
-  "front_at_max": false,
   "bumper": false,
   "moving": false,
-  "speed_cap_cms": 20,
+  "power_cap_pct": 20,
   "last_result": "aborted",
   "last_scene": "a wall directly ahead, clutter on the floor to the right",
-  "recently_seen": [{"label": "doorway", "where_deg": -35, "age_s": 12}],
-  "allowed_skills": ["drive", "turn", "stop", "say", "describe_scene", "find", "set_face"],
-  "motion_budget_left": {"path_cm": 60, "seconds": 5}
+  "recently_seen": [{"label": "doorway", "heading_deg": 325, "age_s": 12}],
+  "allowed_skills": ["drive_for", "turn_to", "stop", "say", "describe_scene", "find", "set_face"],
+  "motion_budget_left": {"seconds": 5}
 }

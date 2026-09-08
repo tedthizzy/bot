@@ -100,20 +100,32 @@ class Dependency:
 
 
 DEFAULT_IMPORTS: tuple[Dependency, ...] = (
-    Dependency("rover_contracts", "every wire format", True,
-               "uv pip install -e ."),
+    Dependency("rover_contracts", "every wire format", True, "uv pip install -e ."),
     Dependency("pydantic", "A12 stage two, strict validation", True, "uv sync"),
     Dependency("serial_asyncio_fast", "pinned by ARCHITECTURE 12", False, "uv sync"),
     Dependency("openai", "brain's box client", False, "uv sync"),
     Dependency("aiohttp", "rover-web", False, "uv sync"),
-    Dependency("picamera2", "rover-cam, Pi only", False,
-               "Pi only: sudo apt install -y --no-install-recommends python3-picamera2"),
-    Dependency("sounddevice", "the audio owner thread, speech extra", False,
-               "uv pip install -e '.[speech]' (needs libportaudio2 on the Pi)"),
-    Dependency("sherpa_onnx", "STT and Silero VAD, speech extra", False,
-               "uv pip install -e '.[speech]'"),
-    Dependency("numpy", "the audio ring, speech extra", False,
-               "uv pip install -e '.[speech]'"),
+    Dependency(
+        "picamera2",
+        "rover-cam, Pi only",
+        False,
+        "Pi only: sudo apt install -y --no-install-recommends python3-picamera2",
+    ),
+    Dependency(
+        "sounddevice",
+        "the audio owner thread, speech extra",
+        False,
+        "uv pip install -e '.[speech]' (needs libportaudio2 on the Pi)",
+    ),
+    Dependency(
+        "sherpa_onnx",
+        "STT and Silero VAD, speech extra",
+        False,
+        "uv pip install -e '.[speech]'",
+    ),
+    Dependency(
+        "numpy", "the audio ring, speech extra", False, "uv pip install -e '.[speech]'"
+    ),
 )
 
 
@@ -128,7 +140,9 @@ def _python() -> Check:
         return Check("python", OK, f"{version} at {sys.executable}")
     wanted = ".".join(str(part) for part in MIN_PYTHON)
     return Check(
-        "python", FAIL, f"{version} at {sys.executable}",
+        "python",
+        FAIL,
+        f"{version} at {sys.executable}",
         f"the rover needs Python >= {wanted}; run the tools from the venv",
     )
 
@@ -137,7 +151,9 @@ def _venv() -> Check:
     if sys.prefix != sys.base_prefix:
         return Check("venv", OK, sys.prefix)
     return Check(
-        "venv", WARN, f"running against the base interpreter {sys.prefix}",
+        "venv",
+        WARN,
+        f"running against the base interpreter {sys.prefix}",
         "uv venv --python /usr/bin/python3 --system-site-packages .venv, then "
         "use .venv/bin/python",
     )
@@ -168,11 +184,14 @@ def stub_check() -> Check:
         spec = None
     if spec is not None:
         return Check(
-            "rover-stub", OK,
+            "rover-stub",
+            OK,
             f"module {spec.origin} (python -m rover_devtools.rover_stub --pty)",
         )
     return Check(
-        "rover-stub", WARN, "neither the console script nor the module is present",
+        "rover-stub",
+        WARN,
+        "neither the console script nor the module is present",
         "uv sync, or uv pip install -e . -- then rover-stub --pty",
     )
 
@@ -218,8 +237,10 @@ def link_check(config: RobotConfig) -> Check:
             sock.connect((link.tcp_host, link.tcp_port))
         except OSError as exc:
             return Check(
-                "link", WARN, f"tcp {where} does not accept: {exc}",
-                f"rover-stub --tcp {link.tcp_port}, or set [link] backend = \"serial\"",
+                "link",
+                WARN,
+                f"tcp {where} does not accept: {exc}",
+                f'rover-stub --tcp {link.tcp_port}, or set [link] backend = "serial"',
             )
         finally:
             sock.close()
@@ -232,7 +253,9 @@ def link_check(config: RobotConfig) -> Check:
     info = os.stat(port)
     if not stat.S_ISCHR(info.st_mode):
         return Check(
-            "link", WARN, f"{port} is not a character device",
+            "link",
+            WARN,
+            f"{port} is not a character device",
             "point [link] port at the UART or at the pty rover-stub printed",
         )
     readable = os.access(port, os.R_OK | os.W_OK)
@@ -243,7 +266,9 @@ def link_check(config: RobotConfig) -> Check:
     )
     if not readable:
         return Check(
-            "link", FAIL, detail,
+            "link",
+            FAIL,
+            detail,
             "add your user to the device's group (dialout on a Pi), then log in again",
         )
     return Check("link", OK, detail)
@@ -272,12 +297,15 @@ def link_timing(link: LinkConfig, safety: SafetyConfig) -> Check:
         )
     if problems:
         return Check(
-            "link timing", FAIL, "; ".join(problems),
+            "link timing",
+            FAIL,
+            "; ".join(problems),
             "keep feedback_interval_ms < feedback_max_age_ms < heartbeat_ms and "
             "command_hz >= 3000 / heartbeat_ms",
         )
     return Check(
-        "link timing", OK,
+        "link timing",
+        OK,
         f"{link.command_hz} Hz = {period_ms:.0f} ms/command, x3 = {period_ms * 3:.0f} "
         f"<= heartbeat {safety.heartbeat_ms} ms; feedback {link.feedback_interval_ms} "
         f"< max_age {safety.feedback_max_age_ms} < heartbeat {safety.heartbeat_ms}",
@@ -291,7 +319,8 @@ def fork_constants(text: str) -> dict[str, float]:
     for name in _FORK_CONSTANTS:
         match = re.search(
             rf"^\s*#\s*define\s+{name}\s+\(?\s*([-+]?\d+(?:\.\d+)?)\s*[fFuUlL]*\s*\)?",
-            text, re.MULTILINE,
+            text,
+            re.MULTILINE,
         )
         if match:
             found[name] = float(match.group(1))
@@ -316,8 +345,10 @@ def fork_check(config: RobotConfig, header: Path | None = None) -> Check:
     fix = "the fork under firmware/ is being written; docs/protocol.md is its contract"
     if not header.parent.is_dir():
         return Check(
-            "firmware fork", WARN,
-            f"firmware fork not present ({header.parent} does not exist)", fix,
+            "firmware fork",
+            WARN,
+            f"firmware fork not present ({header.parent} does not exist)",
+            fix,
         )
     if not header.is_file():
         return Check(
@@ -327,7 +358,9 @@ def fork_check(config: RobotConfig, header: Path | None = None) -> Check:
     missing = [name for name in _FORK_CONSTANTS if name not in values]
     if missing:
         return Check(
-            "firmware fork", FAIL, f"{header} does not define {', '.join(missing)}",
+            "firmware fork",
+            FAIL,
+            f"{header} does not define {', '.join(missing)}",
             "add #define BOT_HEARTBEAT_MS 300 and #define BOT_POWER_CAP 0.30f to "
             "the header",
         )
@@ -339,7 +372,9 @@ def fork_check(config: RobotConfig, header: Path | None = None) -> Check:
     )
     if hb != wanted_hb or abs(cap - POWER_CAP) > 1e-6:
         return Check(
-            "firmware fork", FAIL, detail,
+            "firmware fork",
+            FAIL,
+            detail,
             "the host and the fork must agree: rebuild the fork or fix [safety] "
             "heartbeat_ms; robotd refuses motion until the banner matches",
         )
@@ -369,7 +404,9 @@ def _socket_check(key: str, path_text: str) -> Check:
         sock.connect(str(path))
     except OSError as exc:
         return Check(
-            name, WARN, f"{path} exists but does not accept: {exc}",
+            name,
+            WARN,
+            f"{path} exists but does not accept: {exc}",
             f"{unit} is not running; the stale socket is harmless",
         )
     finally:
@@ -380,14 +417,16 @@ def _socket_check(key: str, path_text: str) -> Check:
 
 def _box_check(config: RobotConfig, probe: bool) -> list[Check]:
     url = config.box.url.rstrip("/") + "/models"
-    key_set = bool(os.environ.get(config.box.api_key_env))
+    key = os.environ.get(config.box.api_key_env)
+    key_set = bool(key)
     checks = [
         Check(
             "box api key",
             OK if key_set else WARN,
             f"${config.box.api_key_env} is {'set' if key_set else 'unset'}",
-            "" if key_set else
-            f"export {config.box.api_key_env}=... if the box needs one; "
+            ""
+            if key_set
+            else f"export {config.box.api_key_env}=... if the box needs one; "
             "fakebox and an open vLLM do not",
         )
     ]
@@ -395,12 +434,17 @@ def _box_check(config: RobotConfig, probe: bool) -> list[Check]:
         checks.append(Check("box", WARN, f"{config.box.url} not probed", "drop --no-box"))
         return checks
     try:
-        with urllib.request.urlopen(url, timeout=2.0) as response:  # noqa: S310
+        request = urllib.request.Request(
+            url, headers={"Authorization": f"Bearer {key}"} if key else {}
+        )
+        with urllib.request.urlopen(request, timeout=2.0) as response:  # noqa: S310
             body = json.loads(response.read())
     except (urllib.error.URLError, OSError, ValueError) as exc:
         checks.append(
             Check(
-                "box", WARN, f"{url} unreachable: {exc}",
+                "box",
+                WARN,
+                f"{url} unreachable: {exc}",
                 "python -m rover_devtools.fakebox --port "
                 f"{_port_of(config.box.url)}, or docker compose -f "
                 "docker/compose.box.yml up -d vllm",
@@ -411,10 +455,12 @@ def _box_check(config: RobotConfig, probe: bool) -> list[Check]:
     wanted = config.box.model
     checks.append(
         Check(
-            "box", OK if wanted in served else WARN,
+            "box",
+            OK if wanted in served else WARN,
             f"{url} serves {served or 'nothing'}",
-            "" if wanted in served else
-            f"[box] model is {wanted!r}; set --served-model-name to match",
+            ""
+            if wanted in served
+            else f"[box] model is {wanted!r}; set --served-model-name to match",
         )
     )
     checks.append(_box_caps(config))
@@ -432,12 +478,18 @@ def _box_caps(config: RobotConfig) -> Check:
             try:
                 caps = json.loads(candidate.read_text())
             except ValueError as exc:
-                return Check("box caps", FAIL, f"{candidate} is not JSON: {exc}",
-                             "re-run python -m rover_brain.box_probe")
+                return Check(
+                    "box caps",
+                    FAIL,
+                    f"{candidate} is not JSON: {exc}",
+                    "re-run python -m rover_brain.box_probe",
+                )
             summary = " ".join(f"{k}={v}" for k, v in sorted(caps.items()))
             return Check("box caps", OK, f"{candidate}: {summary}")
     return Check(
-        "box caps", WARN, "no box_caps.json",
+        "box caps",
+        WARN,
+        "no box_caps.json",
         "python -m rover_brain.box_probe --url $ROVER__BOX__URL (deploy step 2)",
     )
 
@@ -450,17 +502,26 @@ def _storage_check(label: str, path_text: str) -> Check:
     free_gib = shutil.disk_usage(existing).free / 2**30
     if not path.is_dir():
         return Check(
-            f"storage {label}", WARN, f"{path} does not exist ({free_gib:.1f} GiB free "
-            f"on {existing})",
+            f"storage {label}",
+            WARN,
+            f"{path} does not exist ({free_gib:.1f} GiB free on {existing})",
             f"install -d -o rover -g rover {path}, or point [{label}] at a Mac path "
             "-- `make sim` must never write /data",
         )
     if not os.access(path, os.W_OK):
-        return Check(f"storage {label}", FAIL, f"{path} is not writable",
-                     f"chown -R rover:rover {path}")
+        return Check(
+            f"storage {label}",
+            FAIL,
+            f"{path} is not writable",
+            f"chown -R rover:rover {path}",
+        )
     status = OK if free_gib >= 1.0 else WARN
-    return Check(f"storage {label}", status, f"{path} writable, {free_gib:.1f} GiB free",
-                 "" if status == OK else "free some space before the next soak")
+    return Check(
+        f"storage {label}",
+        status,
+        f"{path} writable, {free_gib:.1f} GiB free",
+        "" if status == OK else "free some space before the next soak",
+    )
 
 
 def _group_check() -> Check:
@@ -470,13 +531,16 @@ def _group_check() -> Check:
         group = grp.getgrnam("rover")
     except KeyError:
         return Check(
-            "group rover", WARN, "no group rover on this host",
+            "group rover",
+            WARN,
+            "no group rover on this host",
             "Pi only: deploy/install.sh creates rover:rover and the per-unit users",
         )
     user = os.environ.get("USER", "")
     member = user in group.gr_mem or os.getgid() == group.gr_gid
     return Check(
-        "group rover", OK if member else WARN,
+        "group rover",
+        OK if member else WARN,
         f"gid {group.gr_gid}, members {', '.join(group.gr_mem) or 'none'}",
         "" if member else f"sudo usermod -aG rover {user}; then log in again",
     )
@@ -503,32 +567,29 @@ def run_checks(
     try:
         config, origin = load_config_or_default(config_path)
         link = config.link
-        where = (
-            f"{link.tcp_host}:{link.tcp_port}" if link.backend == "tcp" else link.port
-        )
+        where = f"{link.tcp_host}:{link.tcp_port}" if link.backend == "tcp" else link.port
         config_check = Check(
             "config", OK, f"{origin}; link.backend={link.backend} port={where}"
         )
     except (OSError, ValueError) as exc:
         config, origin = RobotConfig(), "built-in defaults (config did not load)"
         config_check = Check(
-            "config", FAIL, str(exc),
+            "config",
+            FAIL,
+            str(exc),
             "fix config/robot.toml, or pass --config; a value over a compiled "
             "ceiling refuses startup and is never clamped (A33)",
         )
 
     checks = [_python(), _venv(), config_check]
     checks += [
-        _import_check(dep)
-        for dep in (DEFAULT_IMPORTS if imports is None else imports)
+        _import_check(dep) for dep in (DEFAULT_IMPORTS if imports is None else imports)
     ]
     checks.append(stub_check())
     checks.append(link_check(config))
     checks.append(link_timing(config.link, config.safety))
     checks.append(fork_check(config, fork_header))
-    checks += [
-        _socket_check(key, getattr(config.bus, key)) for key in _SOCKET_OWNERS
-    ]
+    checks += [_socket_check(key, getattr(config.bus, key)) for key in _SOCKET_OWNERS]
     checks += _box_check(config, probe_box)
     checks.append(_storage_check("log", config.log.dir))
     checks.append(_storage_check("stt", config.stt.model_dir))
@@ -561,9 +622,7 @@ def report(config: RobotConfig, origin: str, checks: Sequence[Check]) -> str:
     for check in checks:
         counts[check.status] += 1
     lines += ["", f"effective limits: {_limits_line(config)}", ""]
-    lines.append(
-        f"{counts[OK]} ok, {counts[WARN]} warn, {counts[FAIL]} fail"
-    )
+    lines.append(f"{counts[OK]} ok, {counts[WARN]} warn, {counts[FAIL]} fail")
     first = next(
         (c for c in checks if c.status == FAIL and c.fix),
         next((c for c in checks if c.status == WARN and c.fix), None),
@@ -579,9 +638,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         description="Report what is present, what is missing, and what to do next.",
     )
     parser.add_argument("--config", metavar="PATH")
-    parser.add_argument(
-        "--no-box", action="store_true", help="skip the box HTTP probe"
-    )
+    parser.add_argument("--no-box", action="store_true", help="skip the box HTTP probe")
     parser.add_argument("--json", action="store_true", help="machine-readable output")
     args = parser.parse_args(argv)
 

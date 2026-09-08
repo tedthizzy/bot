@@ -35,8 +35,8 @@ help:
 	@echo "  schema-check  fail if box/schema/*.json has drifted"
 	@echo "  kotlin        regenerate the Android data classes from the contracts"
 	@echo "  gates         fast gate subset (G2 patch verification, G4 fuzz and races)"
-	@echo "  gates-sim     boots the six sim processes, runs the gates, tears down"
-	@echo "  gates-full    every gate that runs without hardware"
+	@echo "  gates-sim     alias for gates-full; all test services are isolated"
+	@echo "  gates-full    software gates and end-to-end simulation; hardware skips stay visible"
 	@echo "  gates-pi      the G3 soak; only meaningful on the Pi (G3_SOAK_S=1800)"
 	@echo "  gate-g1       model + validator gate; BOX=real to use the real box"
 	@echo "  firmware      compile the Waveshare fork in the arduino-cli container"
@@ -46,7 +46,7 @@ help:
 	@echo "  secrets       scan the tree for anything that must not be published"
 	@echo "  deps-check    assert robotd's runtime closure has no ML package"
 	@echo "  doctor        resolved config, limits, devices, sockets, firmware fork"
-	@echo "  clean         remove caches, run/ and build output"
+	@echo "  clean         remove caches and firmware build output; keep runtime data"
 
 venv: $(PY)
 $(PY):
@@ -59,7 +59,7 @@ test: venv
 
 lint: venv
 	$(PY) -m ruff check .
-	@for f in $$(find hosts/pi/deploy firmware -name '*.sh' 2>/dev/null); do bash -n "$$f" || exit 1; done
+	@while IFS= read -r f; do bash -n "$$f"; done < <(rg --files --hidden hosts/pi/deploy firmware -g '*.sh')
 	@echo "shell syntax ok"
 
 format: venv
@@ -186,42 +186,26 @@ wait
 endef
 export SIM_SH
 
-define GATES_SIM_SH
-eval "$$SIM_BOOT"
-echo
-echo "running the gates against the simulated rover"
-set +e
-$(PY) -m pytest tests/gates -m gate $(GATES_SIM_ARGS)
-status=$$?
-set -e
-exit $$status
-endef
-export GATES_SIM_SH
-
 sim: venv
 	@bash -c "$$SIM_SH"
 dev: sim
 
 # --- gates --------------------------------------------------------------------
 
-run_gate = @if [ -d "$(1)" ]; then $(PY) -m pytest "$(1)" -m gate $(2); \
-	   else echo "skip: $(1) not present yet"; fi
-
 gates: venv
-	$(call run_gate,tests/gates,-k "g2 or g4")
+	$(PY) -m pytest tests/gates -m gate -k "g2 or g4"
 
-gates-sim: venv
-	@bash -c "$$GATES_SIM_SH"
+gates-sim: gates-full
 
 gates-full: venv
-	$(call run_gate,tests/gates)
+	$(PY) -m pytest tests/gates $(GATES_SIM_ARGS)
 
 G3_SOAK_S ?= 1800
 gates-pi: venv
 	$(PY) tests/gates/g3/run_g3.py --duration $(G3_SOAK_S) --hardware
 
 gate-g1: venv
-	$(call run_gate,tests/gates/g1)
+	$(PY) -m pytest tests/gates/test_gates.py -m gate -k g1
 
 # --- firmware (Waveshare fork, Arduino) ---------------------------------------
 
@@ -261,8 +245,9 @@ doctor: venv
 	$(PY) -m rover_devtools.doctor --config $(DOCTOR_CONFIG)
 
 clean:
-	rm -rf $(RUN_DIR) .pytest_cache .ruff_cache .mypy_cache .hypothesis firmware/build
-	find . -name __pycache__ -type d -prune -exec rm -rf {} +
+	rm -rf .pytest_cache .ruff_cache .mypy_cache .hypothesis firmware/build
+	find packages hosts/pi tests -name __pycache__ -type d -prune -exec rm -rf {} +
 
 distclean: clean
-	rm -rf $(VENV) data
+	@test "$(VENV)" = .venv || { echo "distclean only removes the default .venv"; exit 2; }
+	rm -rf .venv

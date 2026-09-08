@@ -12,6 +12,7 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$HERE/arduinojson.sh"
 IMAGE="${BOT_ARDUINO_IMAGE:-bot-arduino-cli:1.5.1}"      # built from firmware/Dockerfile
 CACHE="${BOT_ARDUINO_CACHE:-$HERE/.cache}"
 # ESP32 Dev Module, DIO like the factory image, Huge APP partition table (3 MB
@@ -30,7 +31,7 @@ ESP32_INDEX_URL="https://espressif.github.io/arduino-esp32/package_esp32_index.j
 # INA219_WE stays on 1.3.8 because 1.4.0 renamed its enums (BIT_MODE_9 ->
 # INA219_BIT_MODE_9) and the vendored battery_ctrl.h uses the old names.
 LIBS=(
-  "ArduinoJson@6.21.5"
+  "ArduinoJson@$ARDUINOJSON_VERSION"
   "Adafruit SSD1306@2.5.17"
   "Adafruit GFX Library@1.12.6"
   "Adafruit BusIO@1.17.4"
@@ -47,7 +48,8 @@ mkdir -p "$CACHE/data" "$CACHE/downloads" "$CACHE/user" "$CACHE/home" "$HERE/bui
 
 if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
   echo "== building $IMAGE from $HERE/Dockerfile"
-  docker build -t "$IMAGE" "$HERE"
+  # This toolchain image needs only its Dockerfile, not the sketch or cache.
+  docker build -t "$IMAGE" - < "$HERE/Dockerfile"
 fi
 
 run() {

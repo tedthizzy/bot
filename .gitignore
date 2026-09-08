@@ -30,6 +30,9 @@ logs/gates/*.jsonl
 
 # Local machine config: box URL, calibration, anything site-specific
 config/robot.toml
+.env
+.env.*
+!.env.example
 
 # Local host investigation notes (contain home network details) — never publish
 rasberrypi.md

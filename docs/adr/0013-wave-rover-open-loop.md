@@ -75,9 +75,9 @@ per-instruction time budget is what bounds a drive that goes nowhere.
 
 ## Invariants
 
-The 24 invariants keep their numbers. `docs/verification.md` carries the
-re-mapping of each one to its new enforcement point and test, and marks the
-ones whose meaning changed.
+The 24 invariants keep their numbers. `docs/gates.md` maps retained scenarios
+to current checks and their limits. `debloat.md` records executed evidence;
+`docs/verification.md` retains the historical transcript and changed meanings.
 
 ## What is retired
 

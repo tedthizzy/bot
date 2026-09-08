@@ -43,16 +43,16 @@ def ring(**kwargs: object) -> tuple[SceneRing, Clock]:
 @pytest.mark.parametrize(
     ("heading", "left", "expected"),
     [
-        (87, 90, 357),  # turn left 90 is (heading - 90) mod 360
-        (87, -90, 177),  # and right is +90
-        (0, 40, 320),
-        (10, 30, 340),
-        (350, -20, 10),
+        (87, 90, 177),  # positive-left host frame
+        (87, -90, 357),
+        (0, 40, 40),
+        (10, 30, 40),
+        (350, -20, 330),
         (180, 180, 0),
         (0, 0, 0),
         (359.6, 0, 0),  # rounds to 360, which is 0
         (100.5, 0, 101),  # half away from zero, not banker's
-        (0, -9.13, 9),
+        (0, -9.13, 351),
     ],
 )
 def test_left_of_a_heading_is_the_turn_to_frame(
@@ -92,7 +92,7 @@ def test_seeing_something_again_moves_it_rather_than_duplicating_it() -> None:
     scene.remember("red mug", heading_deg=0.0, bearing_deg=20.0)
     entries = scene.recently_seen()
     assert [entry.label for entry in entries] == ["red mug", "doorway"]
-    assert entries[0].heading_deg == 340
+    assert entries[0].heading_deg == 20
     assert entries[0].age_s == 0
 
 
@@ -104,22 +104,22 @@ def test_age_is_measured_on_the_monotonic_clock() -> None:
 
 
 def test_a_sighting_is_an_absolute_heading_the_robot_can_turn_to() -> None:
-    """Bearing + is left, and left is a smaller heading: an object 40 degrees
-    to the left while facing 87 sits at heading 47, whatever the robot does
+    """Bearing + is left, and left is a larger heading: an object 40 degrees
+    to the left while facing 87 sits at heading 127, whatever the robot does
     afterwards."""
     scene, _ = ring()
     scene.remember("red mug", heading_deg=87.0, bearing_deg=40.0)
-    assert scene.recently_seen()[0].heading_deg == 47
+    assert scene.recently_seen()[0].heading_deg == 127
     scene.remember("doorway", heading_deg=87.0, bearing_deg=-10.0)
-    assert scene.recently_seen()[0].heading_deg == 97
+    assert scene.recently_seen()[0].heading_deg == 77
 
 
 def test_headings_wrap_into_the_turn_to_range() -> None:
     scene, _ = ring()
     scene.remember("doorway", heading_deg=10.0, bearing_deg=30.0)
-    assert scene.recently_seen()[0].heading_deg == 340
+    assert scene.recently_seen()[0].heading_deg == 40
     scene.remember("window", heading_deg=350.0, bearing_deg=-20.0)
-    assert scene.recently_seen()[0].heading_deg == 10
+    assert scene.recently_seen()[0].heading_deg == 330
 
 
 def test_entries_are_what_the_worldstate_carries() -> None:
@@ -158,7 +158,7 @@ def test_the_file_is_rewritten_whole_every_time(tmp_path: Path) -> None:
     records = list(read_jsonl(path))
     assert records[0] == {"kind": "scene", "description": "a kitchen"}
     assert [r["label"] for r in records[1:]] == ["red mug", "doorway"]
-    assert [r["heading_deg"] for r in records[1:]] == [320, 10]
+    assert [r["heading_deg"] for r in records[1:]] == [40, 350]
     assert not list(path.parent.glob("*.tmp"))
 
     scene.remember("red mug", heading_deg=0.0, bearing_deg=0.0)

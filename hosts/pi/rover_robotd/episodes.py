@@ -89,7 +89,9 @@ class EpisodeRecorder:
             "right.applied": feedback.right if feedback is not None else None,
             "front_m": (
                 feedback.tof_mm / 1000.0
-                if feedback is not None and feedback.tof_valid
+                if feedback is not None
+                and feedback.tof_mm is not None
+                and feedback.tof_valid
                 else None
             ),
             "bumper": bool(feedback.bumper) if feedback is not None else None,

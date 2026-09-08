@@ -54,7 +54,7 @@ SOAK_UTTERANCES = (
     "what do you see",
     "turn left ninety degrees",
     "say hello",
-    "drive forward twenty centimeters",
+    "drive forward for one second",
     "describe the room",
 )
 """One turn each, cycled: a vision call, a motion profile, speech, a short drive."""
@@ -230,10 +230,10 @@ def soak(
 
         if robotd is not None:
             for state in robotd.states(0.2):
-                mcu = state.get("mcu") or {}
-                if isinstance(mcu.get("age_ms"), int):
-                    ages.append(mcu["age_ms"])
-                now_armed = state.get("armed")
+                feedback = state.get("rover") or {}
+                if isinstance(feedback.get("feedback_age_ms"), int):
+                    ages.append(feedback["feedback_age_ms"])
+                now_armed = state.get("ready")
                 if armed is not None and now_armed != armed:
                     arm_cycles += 1
                 armed = now_armed
@@ -252,8 +252,7 @@ def soak(
         deadline = time.monotonic() + 5.0
         while time.monotonic() < deadline:
             still = any(
-                (state.get("mcu") or {}).get("motion")
-                for state in robotd.states(0.3)
+                (state.get("rover") or {}).get("motion") for state in robotd.states(0.3)
             )
             if not still:
                 break
@@ -321,29 +320,25 @@ def score_soak(gate: GateRun, result: dict[str, Any], config: Any) -> None:
             ages_sorted = sorted(ages)
             p99 = ages_sorted[min(len(ages_sorted) - 1, int(0.99 * len(ages_sorted)))]
             gate.check(
-                p99 < config.safety.link_alive_max_age_ms,
+                p99 < config.safety.feedback_max_age_ms,
                 "a-link",
                 "T0",
-                "telemetry age stays inside link_alive_max_age_ms",
+                "feedback age stays inside feedback_max_age_ms",
                 f"{len(ages)} samples, p99 {p99} ms "
-                f"(< {config.safety.link_alive_max_age_ms})",
+                f"(< {config.safety.feedback_max_age_ms})",
                 mcu_age_p99_ms=p99,
                 samples=len(ages),
             )
-        gate.record(
+        gate.skip(
             "a-relay",
             "A24",
-            "arm/disarm cycles per hour, the upper bound on relay actuations",
-            Status.PASS if result["arm_cycles_per_hour"] < 10 else Status.FAIL,
-            f"{result['arm_cycles_per_hour']}/hour over {result['elapsed_s']} s. "
-            "MOTOR_EN must not follow arm state (4.1), so the real relay count is "
-            "lower; confirm by ear or scope",
-            arm_cycles=result["arm_cycles"],
-            arm_cycles_per_hour=result["arm_cycles_per_hour"],
+            "physical motor-power isolation; retired S3 arm state is not a relay counter",
+            "WAVE wiring evidence; readiness changes do not measure relay actuations",
+            readiness_changes=result["arm_cycles"],
         )
     else:
         for sub, name in (
-            ("a-link", "telemetry age stays inside link_alive_max_age_ms"),
+            ("a-link", "feedback age stays inside feedback_max_age_ms"),
             ("a-relay", "arm/disarm cycles per hour"),
         ):
             gate.skip(sub, "T0", name, f"a running robotd on {config.bus.sock}")
@@ -622,7 +617,7 @@ HARDWARE_ONLY = (
 
 def sub_fuser(gate: GateRun, config: Any) -> None:
     """I-18: only robotd writes the port."""
-    port = config.serial.port
+    port = config.link.port
     if not (is_pi() and Path(port).exists() and have_binary("fuser")):
         gate.skip(
             "a-fuser",
@@ -664,6 +659,15 @@ def main() -> int:
         mode="pi" if is_pi() else "mac",
     )
     print(f"config: {source}   soak: {args.duration:.0f} s   pi: {is_pi()}")
+
+    if not args.hardware:
+        gate.skip(
+            "bench",
+            "G3",
+            "live camera/speech/motion soak and audio bakeoff",
+            "--hardware bench run; default gates never drive an existing service",
+        )
+        return gate.summary()
 
     if gate.selected("a"):
         result = soak(gate, config, args.duration, args.sample_every)

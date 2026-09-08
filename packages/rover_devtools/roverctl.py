@@ -23,10 +23,11 @@ import os
 import socket
 import sys
 import time
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import suppress
 from pathlib import Path
 from types import TracebackType
-from typing import Any, Generic, TypeVar
+from typing import Any, Generic, TypeVar, cast
 
 from pydantic import BaseModel, TypeAdapter, ValidationError
 from rover_contracts.config import LimitsConfig, RobotConfig
@@ -34,18 +35,27 @@ from rover_contracts.ids import new_cmd_id, new_turn_id
 from rover_contracts.jsonl import to_json_line
 from rover_contracts.messages import (
     BUS_SKILL_ARGS,
+    BrainCancelMessage,
+    BrainSkillRequest,
     BusCap,
+    CancelMessage,
     ClearableFault,
     ClearMessage,
     ErrorMessage,
     EstopMessage,
     EventMessage,
     FaceMessage,
+    FrameHeader,
+    FrameKind,
     HelloMessage,
+    PingMessage,
     ResultMessage,
     ResultStatus,
     ServerMessage,
     SkillMessage,
+    SkillName,
+    SkillObs,
+    SkillTrace,
     Source,
     StateMessage,
     StopMessage,
@@ -57,6 +67,7 @@ from rover_contracts.messages import (
     WelcomeMessage,
     brain_server_adapter,
     server_adapter,
+    skill_call_adapter,
 )
 from rover_contracts.skills import goal_deadline_s
 from rover_contracts.wave_proto import StopFlag
@@ -88,6 +99,7 @@ class BusClient(Generic[_M]):
         self._adapter = adapter
         self._sock: socket.socket | None = None
         self._buf = bytearray()
+        self._eof = False
 
     def connect(self, timeout: float = 2.0) -> BusClient[_M]:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -120,23 +132,38 @@ class BusClient(Generic[_M]):
             except TimeoutError:
                 return None
             if not chunk:
+                self._eof = True
                 return None
             self._buf += chunk
 
-    def messages(self, seconds: float) -> Iterator[_M]:
+    def messages(
+        self,
+        seconds: float,
+        *,
+        ping_source: Source | None = None,
+        ping_hz: int = 5,
+    ) -> Iterator[_M]:
         """Every message that arrives inside ``seconds``.  A line that does not
         validate is reported on stderr rather than dropped: an operator tool
         that hides a protocol mismatch is worse than none."""
         deadline = time.monotonic() + seconds
-        while True:
-            line = self.readline(deadline)
+        next_ping = time.monotonic()
+        while time.monotonic() < deadline:
+            if ping_source is not None and time.monotonic() >= next_ping:
+                self.send(PingMessage(source=ping_source))
+                next_ping = time.monotonic() + 1 / ping_hz
+            line = self.readline(min(deadline, next_ping) if ping_source else deadline)
             if line is None:
-                return
+                if self._eof or ping_source is None:
+                    return
+                continue
             try:
                 yield self._adapter.validate_json(line)
             except ValidationError as exc:
-                print(f"roverctl: undecodable line: {exc.error_count()} errors",
-                      file=sys.stderr)
+                print(
+                    f"roverctl: undecodable line: {exc.error_count()} errors",
+                    file=sys.stderr,
+                )
 
     def close(self) -> None:
         if self._sock is not None:
@@ -166,7 +193,10 @@ def _hello(client: BusClient[Any], source: Source, caps: Sequence[BusCap]) -> No
 
 def stop_flag_names(mask: int) -> str:
     """``st`` by name: ``tof|bumper``, or ``-`` when clear."""
-    return "|".join(flag.name.lower() for flag in StopFlag if mask & flag) or "-"
+    # Enum iteration yields declared, named members, never unnamed bit masks.
+    return (
+        "|".join(cast(str, flag.name).lower() for flag in StopFlag if mask & flag) or "-"
+    )
 
 
 def render_state(state: StateMessage) -> str:
@@ -231,20 +261,79 @@ def goal_ttl_ms(skill: str, args: BaseModel, limits: LimitsConfig) -> int:
     if skill == "drive_for":
         seconds = goal_deadline_s(float(values["duration_s"]))
     elif skill == "turn_to":
-        seconds = goal_deadline_s(float(values["timeout_s"]))
+        seconds = goal_deadline_s(float(values["timeout_s"]), skill=SkillName.TURN_TO)
     else:
         return limits.goal_ttl_ms_max
     return max(100, min(limits.goal_ttl_ms_max, math.ceil(seconds * 1000)))
 
 
+def _motion_observation(config: RobotConfig) -> SkillObs:
+    """Capture a real still for this operator command; robotd checks its age."""
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+        sock.settimeout(2.0)
+        sock.connect(config.bus.frames_sock)
+        sock.sendall(b'{"type":"still","plane":"lores"}\n')
+        deadline = time.monotonic() + 2.0
+        with sock.makefile("rb") as frames:
+            while time.monotonic() < deadline:
+                sock.settimeout(max(0.001, deadline - time.monotonic()))
+                header = FrameHeader.model_validate_json(frames.readline(65536))
+                if header.bytes > 16 * 1024 * 1024:
+                    raise ValueError("camera frame exceeds 16 MiB")
+                if len(frames.read(header.bytes)) != header.bytes:
+                    raise ConnectionError("camera disconnected during frame")
+                if header.kind is FrameKind.STILL:
+                    return SkillObs(
+                        frame_id=header.frame_id,
+                        frame_mono_ns=header.frame_mono_ns,
+                    )
+    raise TimeoutError("camera did not provide a still within 2 seconds")
+
+
+def _request_brain_skill(args: argparse.Namespace, skill: str, payload: object) -> int:
+    call = skill_call_adapter.validate_python(
+        {"skill": skill, "args": payload, "speech": ""}
+    )
+    request_id = new_cmd_id()
+    with BusClient(args.brain_sock, brain_server_adapter) as client:
+        client.send(BrainSkillRequest(request_id=request_id, call=call))
+        complete = False
+        try:
+            for message in client.messages(args.wait):
+                if isinstance(message, ResultMessage):
+                    print(_render(message))
+                    if (
+                        message.cmd_id == request_id
+                        and message.status is not ResultStatus.ACCEPTED
+                    ):
+                        complete = True
+                        return 0 if message.status is ResultStatus.DONE else 1
+            print("roverctl: no terminal execution result", file=sys.stderr)
+            return 1
+        finally:
+            if not complete:
+                with suppress(OSError):
+                    client.send(
+                        BrainCancelMessage(
+                            source=UtteranceSource.CLI, request_id=request_id
+                        )
+                    )
+
+
 def _send_skill(
-    args: argparse.Namespace, config: RobotConfig, skill: str, payload: dict[str, object]
+    args: argparse.Namespace,
+    config: RobotConfig,
+    skill: str,
+    payload: Mapping[str, object],
 ) -> int:
+    if skill in {"say", "find", "describe_scene", "set_face"}:
+        return _request_brain_skill(args, skill, payload)
     model = BUS_SKILL_ARGS.get(skill)
     if model is None:
         known = ", ".join(sorted(BUS_SKILL_ARGS))
-        print(f"roverctl: {skill!r} does not cross the bus; known: {known}",
-              file=sys.stderr)
+        print(
+            f"roverctl: {skill!r} does not cross the bus; known: {known}", file=sys.stderr
+        )
         return 2
     try:
         skill_args = model.model_validate(payload)
@@ -254,6 +343,8 @@ def _send_skill(
 
     ttl = args.goal_ttl_ms or goal_ttl_ms(skill, skill_args, config.limits)
     turn_id = args.turn_id or new_turn_id()
+    obs = _motion_observation(config) if skill in {"drive_for", "turn_to"} else None
+    cmd_id = new_cmd_id()
     with BusClient(args.sock, server_adapter) as client:
         _hello(client, args.source, [BusCap.SKILL, BusCap.SUBSCRIBE])
         client.send(
@@ -263,24 +354,38 @@ def _send_skill(
         client.send(
             SkillMessage(
                 source=args.source,
-                cmd_id=new_cmd_id(),
+                cmd_id=cmd_id,
                 seq=1,
                 turn_id=turn_id,
                 issued_mono_ns=time.monotonic_ns(),
                 goal_ttl_ms=ttl,
                 skill=skill,  # type: ignore[arg-type]
                 args=skill_args,  # type: ignore[arg-type]
+                obs=obs,
+                trace=SkillTrace(authorized_motion=True),
             )
         )
-        status = 0
-        for message in client.messages(args.wait):
-            print(_render(message))
-            if isinstance(message, ResultMessage):
-                if message.status is ResultStatus.DONE:
-                    return 0
-                if message.status is not ResultStatus.ACCEPTED:
-                    status = 1
-        return status
+        complete = False
+        try:
+            for message in client.messages(
+                args.wait,
+                ping_source=args.source,
+                ping_hz=config.bus.client_ping_hz,
+            ):
+                print(_render(message))
+                if (
+                    isinstance(message, ResultMessage)
+                    and message.cmd_id == cmd_id
+                    and message.status is not ResultStatus.ACCEPTED
+                ):
+                    complete = True
+                    return 0 if message.status is ResultStatus.DONE else 1
+            print("roverctl: no terminal execution result", file=sys.stderr)
+            return 1
+        finally:
+            if not complete:
+                with suppress(OSError):
+                    client.send(CancelMessage(source=args.source, cmd_id=cmd_id))
 
 
 def _cmd_skill(args: argparse.Namespace, config: RobotConfig) -> int:
@@ -327,6 +432,9 @@ def _cmd_utter(args: argparse.Namespace, config: RobotConfig) -> int:
             )
         )
         for message in client.messages(args.watch):
+            if isinstance(message, ResultMessage):
+                print(_render(message))
+                continue
             value = message.expr if isinstance(message, FaceMessage) else message.state
             print(f"{message.type:8s}{value.value}")
     return 0
@@ -455,7 +563,8 @@ def _parser() -> argparse.ArgumentParser:
     )
     drive.add_argument("seconds", type=float, help="0 < s <= [limits] drive_for_max_s")
     drive.add_argument(
-        "power", type=float,
+        "power",
+        type=float,
         help="Waveshare units, |p| <= [limits] power_max (0.30); negative reverses",
     )
     _add_dispatch_options(drive)
@@ -467,7 +576,9 @@ def _parser() -> argparse.ArgumentParser:
         "--timeout", type=float, default=None, help="default: [limits] turn_timeout_max_s"
     )
     turn.add_argument(
-        "--tolerance", type=float, default=None,
+        "--tolerance",
+        type=float,
+        default=None,
         help="degrees; default: [limits] turn_tolerance_deg",
     )
     _add_dispatch_options(turn)
@@ -479,7 +590,7 @@ def _parser() -> argparse.ArgumentParser:
     say.set_defaults(run=_cmd_say)
 
     skill = sub.add_parser("skill", help="dispatch any bus skill")
-    skill.add_argument("name", choices=sorted(BUS_SKILL_ARGS))
+    skill.add_argument("name", choices=sorted(set(BUS_SKILL_ARGS) | {"set_face"}))
     skill.add_argument("--args", default="{}", metavar="JSON")
     _add_dispatch_options(skill)
     skill.set_defaults(run=_cmd_skill)
@@ -500,7 +611,9 @@ def _parser() -> argparse.ArgumentParser:
 
     clear = sub.add_parser("clear", help="clear a latched fault, or estop_sw")
     clear.add_argument(
-        "faults", nargs="+", metavar="FAULT",
+        "faults",
+        nargs="+",
+        metavar="FAULT",
         help="one of " + ", ".join(f.value for f in ClearableFault),
     )
     clear.set_defaults(run=_cmd_clear)
@@ -535,6 +648,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
     except KeyboardInterrupt:
         return 130
+    except (OSError, ValueError) as exc:
+        print(f"roverctl: {exc}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":  # pragma: no cover

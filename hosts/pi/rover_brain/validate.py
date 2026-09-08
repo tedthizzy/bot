@@ -22,23 +22,27 @@ from __future__ import annotations
 
 import json
 import math
-from typing import Any, Final
+from typing import Final, TypeGuard
 
 from pydantic import ValidationError
+from pydantic_core import ErrorDetails
 from rover_contracts.config import LimitsConfig
 from rover_contracts.messages import (
+    DescribeSceneCall,
     DriveForBusArgs,
+    DriveForCall,
     NoArgs,
     ResultReason,
     SayBusArgs,
+    SayCall,
     SkillCall,
     SkillMessage,
     SkillName,
     SkillObs,
     SkillTrace,
     Source,
-    StrictModel,
     TurnToBusArgs,
+    TurnToCall,
     skill_call_adapter,
 )
 from rover_contracts.skills import MOTION_SKILLS, goal_deadline_s, power_from_pct
@@ -106,7 +110,7 @@ def _no_constants(token: str) -> float:
     )
 
 
-def _describe(error: dict[str, Any]) -> ValidationFailure:
+def _describe(error: ErrorDetails) -> ValidationFailure:
     """Turn the first pydantic error into a reason the model can act on."""
     loc = ".".join(str(part) for part in error["loc"] if part != "function-after")
     kind = str(error["type"])
@@ -178,33 +182,14 @@ def authorized_motion(
 
 
 def turn_timeout_s(limits: LimitsConfig) -> float:
-    """The deadline a ``turn_to`` is given: ``[limits] turn_timeout_max_s``,
-    lowered to the largest value whose T2 still fits ``goal_ttl_ms_max``.
-
-    T2 for a turn is :func:`goal_deadline_s` of its timeout, the same formula
-    as a drive's.  At the defaults that is 6.5 s for a 4 s timeout against a
-    5 s ceiling, so the timeout has to give: a call brain mints and robotd then
-    refuses ``goal_ttl_too_long`` is the worst of both.  Whole milliseconds,
-    and the fit is checked with the formula itself rather than its inverse, so
-    a float round trip cannot land one millisecond over the ceiling.
-    """
-    timeout_ms = min(
-        round(limits.turn_timeout_max_s * 1000),
-        math.floor((limits.goal_ttl_ms_max - 500) / 1.5),  # goal_deadline_s, inverted
-    )
-    while timeout_ms > 0 and _t2_ms(timeout_ms / 1000.0) > limits.goal_ttl_ms_max:
-        timeout_ms -= 1
-    if timeout_ms <= 0:
-        raise ValidationFailure(
-            "goal_ttl_too_long",
-            f"no turn fits inside the {limits.goal_ttl_ms_max} ms deadline",
-        )
-    return timeout_ms / 1000.0
-
-
-def _t2_ms(seconds: float) -> int:
-    """The T2 estimate robotd derives, in whole milliseconds, rounded up."""
-    return math.ceil(goal_deadline_s(seconds) * 1000)
+    """A turn's timeout is its deadline, bounded by the configured TTL ceiling."""
+    timeout = min(limits.turn_timeout_max_s, limits.goal_ttl_ms_max / 1000.0)
+    if (
+        math.ceil(goal_deadline_s(timeout, skill=SkillName.TURN_TO) * 1000)
+        > limits.goal_ttl_ms_max
+    ):
+        timeout = math.nextafter(timeout, 0.0)
+    return timeout
 
 
 def power_clamped_to(call: SkillCall, limits: LimitsConfig) -> float | None:
@@ -214,14 +199,16 @@ def power_clamped_to(call: SkillCall, limits: LimitsConfig) -> float | None:
     clamp is reported so the completion can say "at my top power" rather than
     let the model believe it got what it asked for.
     """
-    if call.skill != SkillName.DRIVE_FOR:
+    if call.skill != "drive_for":
         return None
     if abs(power_from_pct(call.args.power_pct)) > limits.power_default:
         return limits.power_default
     return None
 
 
-def bus_args_for(call: SkillCall, limits: LimitsConfig) -> StrictModel:
+def bus_args_for(
+    call: SkillCall, limits: LimitsConfig
+) -> DriveForBusArgs | TurnToBusArgs | SayBusArgs | NoArgs:
     """The model's integers as the bus-unit arguments robotd validates.
 
     Raises :class:`ValidationFailure` for a ``duration_ms`` above the configured
@@ -230,7 +217,7 @@ def bus_args_for(call: SkillCall, limits: LimitsConfig) -> StrictModel:
     """
     if not crosses_bus(call):
         raise ValueError(f"{call.skill} is not dispatched over the robotd bus")
-    if call.skill == SkillName.DRIVE_FOR:
+    if call.skill == "drive_for":
         duration_s = call.args.duration_ms / 1000.0
         if duration_s > limits.drive_for_max_s:
             raise ValidationFailure(
@@ -243,13 +230,13 @@ def bus_args_for(call: SkillCall, limits: LimitsConfig) -> StrictModel:
         if clamp is not None:
             power = math.copysign(clamp, power)
         return DriveForBusArgs(duration_s=duration_s, power=power)
-    if call.skill == SkillName.TURN_TO:
+    if call.skill == "turn_to":
         return TurnToBusArgs(
             heading_deg=float(call.args.heading_deg),
             timeout_s=turn_timeout_s(limits),
             tolerance_deg=limits.turn_tolerance_deg,
         )
-    if call.skill == SkillName.SAY:
+    if call.skill == "say":
         return SayBusArgs(text=call.args.text)
     return NoArgs()
 
@@ -264,12 +251,13 @@ def goal_ttl_ms_for(call: SkillCall, limits: LimitsConfig) -> int:
     below it, so a second implementation disagrees by one millisecond and
     robotd refuses the deadline brain itself computed.
     """
-    if call.skill == SkillName.DRIVE_FOR:
-        estimate = _t2_ms(call.args.duration_ms / 1000.0)
-    elif call.skill == SkillName.TURN_TO:
-        estimate = _t2_ms(turn_timeout_s(limits))
+    if call.skill == "drive_for":
+        seconds = call.args.duration_ms / 1000.0
+    elif call.skill == "turn_to":
+        seconds = turn_timeout_s(limits)
     else:
         return min(_NON_MOTION_GOAL_TTL_MS, limits.goal_ttl_ms_max)
+    estimate = math.ceil(goal_deadline_s(seconds, skill=SkillName(call.skill)) * 1000)
     if estimate > limits.goal_ttl_ms_max:
         raise ValidationFailure(
             "goal_ttl_too_long",
@@ -304,7 +292,9 @@ def refusal_reason(failure: ValidationFailure) -> ResultReason:
     return ResultReason.OUT_OF_BOUNDS
 
 
-def crosses_bus(call: SkillCall) -> bool:
+def crosses_bus(
+    call: SkillCall,
+) -> TypeGuard[DriveForCall | TurnToCall | SayCall | DescribeSceneCall]:
     """True when this call is dispatched to robotd as ``type:"skill"``."""
     return call.skill in BUS_SKILLS
 
@@ -330,6 +320,8 @@ def to_bus_message(
     bus carries.  ``authorized_motion`` rides in ``trace`` so G1 can assert it
     per trial (ARCHITECTURE 7).
     """
+    if not crosses_bus(call):
+        raise ValueError(f"{call.skill} is not dispatched over the robotd bus")
     return SkillMessage(
         source=Source.BRAIN,
         cmd_id=cmd_id,

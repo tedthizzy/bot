@@ -52,6 +52,7 @@ void scanFlashContents() {
     jsonInfoHttp["info"] = "reading files and the first line";
     File file = root.openNextFile();
     while (file) {
+      bot_serviceSafety();
         if (!file.isDirectory()) {
         	Serial.println(">>>---=== File Name and First line ===---<<<");
         	Serial.println("[file]: [" + String(file.name()) + "]");
@@ -126,6 +127,7 @@ int readFile(String fileName) {
 
 	int _LineNum = -1;
 	while (file.available()) {
+		bot_serviceSafety();
 		_LineNum++;
 		String line = file.readStringUntil('\n');
 		Serial.print("[lineNum: ");Serial.print(_LineNum+1);Serial.print(" ] - ");
@@ -200,6 +202,7 @@ void insertLine(String filename, int lineNum, String newLineString) {
 
 	int i = 0;
 	while (file.available()) {
+		bot_serviceSafety();
 		if (i == lineNum - 1) {
 			lines[i] = newLineString;
 			i++;
@@ -237,6 +240,7 @@ void replaceLine(String filename, int lineNum, String newLineString) {
 
 	int i = 0;
 	while (file.available()) {
+		bot_serviceSafety();
 		lines[i] = file.readStringUntil('\n');
 		i++;
 	}
@@ -267,6 +271,7 @@ String readSingleLine(String filename, int lineNum) {
 	String line;
 	int i = 0;
 	while (file.available()) {
+		bot_serviceSafety();
 		line = file.readStringUntil('\n');
 		if (i == lineNum-1) {
 			file.close();
@@ -300,6 +305,7 @@ void deleteSingleLine(String fileName, int lineNum){
   int i = 1;
 
   while(file.available()){
+    bot_serviceSafety();
     String line = file.readStringUntil('\n');
     if(i != lineNum){
       contents += line + "\n";  

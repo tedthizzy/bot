@@ -1,16 +1,14 @@
 {
-  "pose_cm": {"x": 0, "y": 0},
   "heading_deg": 0,
   "battery_pct": 88,
   "obstacle_ahead": false,
-  "front_range_cm": 600,
-  "front_at_max": true,
+  "front_range_cm": null,
   "bumper": false,
   "moving": false,
-  "speed_cap_cms": 30,
+  "power_cap_pct": 30,
   "last_result": null,
   "last_scene": "a long empty hallway with a closed door at the far end",
   "recently_seen": [],
-  "allowed_skills": ["drive", "turn", "stop", "say", "describe_scene", "find", "set_face"],
-  "motion_budget_left": {"path_cm": 150, "seconds": 12}
+  "allowed_skills": ["drive_for", "turn_to", "stop", "say", "describe_scene", "find", "set_face"],
+  "motion_budget_left": {"seconds": 12}
 }

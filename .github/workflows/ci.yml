@@ -33,7 +33,7 @@ jobs:
       - name: lint
         run: make lint
   mac:
-    name: unit + gates (macOS)
+    name: unit + native firmware + isolated gates (macOS)
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v5
@@ -44,8 +44,12 @@ jobs:
         run: uv sync --frozen --group dev
       - name: unit
         run: make test
-      - name: gates (fast subset, against a booted sim rover)
-        run: make gates-sim GATES_SIM_ARGS='-k "g2 or g4"'
+      - name: native firmware dependency (pinned ArduinoJson only)
+        run: bash firmware/tests/run.sh --setup
+      - name: native firmware headers (ASan + UBSan, mocked hardware)
+        run: bash firmware/tests/run.sh
+      - name: isolated software gates (no Docker or existing rover)
+        run: make gates-full
       - name: gate results
         if: always()
         uses: actions/upload-artifact@v4

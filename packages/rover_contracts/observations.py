@@ -95,8 +95,6 @@ class SceneObservation(StrictModel):
     hazards: list[EnumValue[Hazard]] = Field(max_length=6)
 
 
-Observation = Annotated[
-    FindObservation | SceneObservation, Field(discriminator="kind")
-]
+Observation = Annotated[FindObservation | SceneObservation, Field(discriminator="kind")]
 
-observation_adapter: Final = TypeAdapter(Observation)
+observation_adapter: Final[TypeAdapter[Observation]] = TypeAdapter(Observation)

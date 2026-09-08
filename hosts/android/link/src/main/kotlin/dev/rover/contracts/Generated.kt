@@ -165,8 +165,9 @@ data class DescribeSceneCall(
 /**
  * ``drive_for`` as the model writes it.  Open loop: a power for a time.
  *
- * ``power_pct`` is percent of Waveshare full scale, so 30 is the 0.30 cap the
- * firmware compiles in; the sign is the direction.  Zero is not a drive.
+ * ``power_pct`` is a legacy name for hundredths of a Waveshare power unit:
+ * 30 means 0.30, or 60% duty at full scale 0.5. The sign is the direction.
+ * Zero is not a drive.
  */
 @Serializable
 data class DriveForArgs(
@@ -717,7 +718,8 @@ data class StopMessage(
 /**
  * ``turn_to`` as the model writes it: an absolute compass-style heading in
  * whole degrees, 0..359, in the frame the WorldState's ``heading_deg`` uses.
- * The model turns left 90 by asking for ``(heading - 90) mod 360``.
+ * Host headings increase leftward. Turn left 90 with
+ * ``(heading + 90) mod 360``.
  */
 @Serializable
 data class TurnToArgs(

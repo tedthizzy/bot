@@ -40,6 +40,8 @@ from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
+from rover_contracts.units import heading_left_of
+
 __all__ = [
     "CASES",
     "CATEGORIES",
@@ -105,12 +107,29 @@ to the schema's 2000 ms.  Not a claim about the chassis; G5 measures that."""
 TURN_DEFAULT_DEG = 90
 
 _UNITS: dict[str, int] = {
-    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7,
-    "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12, "fifteen": 15,
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+    "eleven": 11,
+    "twelve": 12,
+    "fifteen": 15,
 }
 _TENS: dict[str, int] = {
-    "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50, "sixty": 60,
-    "seventy": 70, "eighty": 80, "ninety": 90,
+    "twenty": 20,
+    "thirty": 30,
+    "forty": 40,
+    "fifty": 50,
+    "sixty": 60,
+    "seventy": 70,
+    "eighty": 80,
+    "ninety": 90,
 }
 _ONES = "|".join(word for word, value in _UNITS.items() if value < 10)
 _NUMBER = (
@@ -133,9 +152,16 @@ _ABSOLUTE_HEADING = re.compile(
     r"(?:\s*(?:deg|degrees?))?(?![a-z])"
 )
 _FACES = {
-    "happy": "happy", "smile": "happy", "sad": "confused", "confused": "confused",
-    "thinking": "thinking", "think": "thinking", "alert": "alert",
-    "sleepy": "sleepy", "sleep": "sleepy", "neutral": "neutral",
+    "happy": "happy",
+    "smile": "happy",
+    "sad": "confused",
+    "confused": "confused",
+    "thinking": "thinking",
+    "think": "thinking",
+    "alert": "alert",
+    "sleepy": "sleepy",
+    "sleep": "sleepy",
+    "neutral": "neutral",
 }
 _STOP_WORDS = re.compile(r"^(the|a|an|my|your|for|at|to|it|that|this)\b\s*")
 _FIND_VERB = re.compile(r"\b(find|look for|search for|where is|where's)\b")
@@ -242,13 +268,12 @@ def _turn(text: str, heading: int) -> dict[str, Any]:
         if found is None:
             found = _number(text)
         degrees = TURN_DEFAULT_DEG if found is None else abs(found)
-    # Compass frame, as TurnToArgs states it: left is (heading - 90) mod 360.
-    sign = 1 if re.search(r"\b(right|clockwise)\b", text) else -1
+    sign = -1 if re.search(r"\b(right|clockwise)\b", text) else 1
     degrees = int(round(degrees)) % 360
-    target = (heading + sign * degrees) % 360
+    target = heading_left_of(heading, sign * degrees)
     return {
         "speech": (
-            f"Turning {'right' if sign > 0 else 'left'} {degrees} degrees "
+            f"Turning {'left' if sign > 0 else 'right'} {degrees} degrees "
             f"to heading {target}."
         ),
         "skill": "turn_to",
@@ -259,38 +284,63 @@ def _turn(text: str, heading: int) -> dict[str, Any]:
 _Builder = Callable[[str, "re.Match[str]", int], dict[str, Any]]
 
 _ROUTES: tuple[tuple[re.Pattern[str], _Builder], ...] = (
-    (re.compile(r"\b(stop|halt|freeze|hold still|stay)\b"),
-     lambda text, m, h: {"speech": "Stopping.", "skill": "stop", "args": {}}),
-    (_FIND_VERB,
-     lambda text, m, h: {
-         "speech": "Looking for it.",
-         "skill": "find",
-         "args": {"object": _object_after(text, m), "max_sweeps": 8},
-     }),
-    (re.compile(r"\b(describe|what do you see|look around|what(?: is|'s) around)\b"),
-     lambda text, m, h: {
-         "speech": "Let me look.", "skill": "describe_scene", "args": {},
-     }),
-    (re.compile(r"\b(smile|look (happy|sad|confused|sleepy|alert)|set your face|face)\b"),
-     lambda text, m, h: {
-         "speech": "",
-         "skill": "set_face",
-         "args": {"expr": next(
-             (v for k, v in _FACES.items() if re.search(rf"\b{k}\b", text)), "neutral"
-         )},
-     }),
-    (re.compile(r"\b(say|tell me|repeat)\b"),
-     lambda text, m, h: {
-         "speech": "",
-         "skill": "say",
-         "args": {"text": (_object_after(text, m) or "Hello.")[:240]},
-     }),
-    (re.compile(r"\b(turn|rotate|spin|left|right|heading)\b"),
-     lambda text, m, h: _turn(text, h)),
-    (re.compile(r"\b(back|backward|backwards|reverse)\b"),
-     lambda text, m, h: _drive(text, -1)),
-    (re.compile(r"\b(forward|ahead|straight|go|come|drive|move|approach|walk|advance)\b"),
-     lambda text, m, h: _drive(text, 1)),
+    (
+        re.compile(r"\b(stop|halt|freeze|hold still|stay)\b"),
+        lambda text, m, h: {"speech": "Stopping.", "skill": "stop", "args": {}},
+    ),
+    (
+        _FIND_VERB,
+        lambda text, m, h: {
+            "speech": "Looking for it.",
+            "skill": "find",
+            "args": {"object": _object_after(text, m), "max_sweeps": 8},
+        },
+    ),
+    (
+        re.compile(r"\b(describe|what do you see|look around|what(?: is|'s) around)\b"),
+        lambda text, m, h: {
+            "speech": "Let me look.",
+            "skill": "describe_scene",
+            "args": {},
+        },
+    ),
+    (
+        re.compile(
+            r"\b(smile|look (happy|sad|confused|sleepy|alert)|set your face|face)\b"
+        ),
+        lambda text, m, h: {
+            "speech": "",
+            "skill": "set_face",
+            "args": {
+                "expr": next(
+                    (v for k, v in _FACES.items() if re.search(rf"\b{k}\b", text)),
+                    "neutral",
+                )
+            },
+        },
+    ),
+    (
+        re.compile(r"\b(say|tell me|repeat)\b"),
+        lambda text, m, h: {
+            "speech": "",
+            "skill": "say",
+            "args": {"text": (_object_after(text, m) or "Hello.")[:240]},
+        },
+    ),
+    (
+        re.compile(r"\b(turn|rotate|spin|left|right|heading)\b"),
+        lambda text, m, h: _turn(text, h),
+    ),
+    (
+        re.compile(r"\b(back|backward|backwards|reverse)\b"),
+        lambda text, m, h: _drive(text, -1),
+    ),
+    (
+        re.compile(
+            r"\b(forward|ahead|straight|go|come|drive|move|approach|walk|advance)\b"
+        ),
+        lambda text, m, h: _drive(text, 1),
+    ),
 )
 
 
@@ -337,7 +387,12 @@ def observe(text: str, kind: str) -> dict[str, Any]:
 # --------------------------------------------------------------------------
 
 CATEGORIES: tuple[str, ...] = (
-    "motion", "speech", "vision", "oob", "unknown_skill", "ambiguous",
+    "motion",
+    "speech",
+    "vision",
+    "oob",
+    "unknown_skill",
+    "ambiguous",
 )
 """ARCHITECTURE 13's six scored categories; the adversarial block is the
 ``injection`` fault, not a phrase."""
@@ -574,6 +629,20 @@ def _schema_kind(body: dict[str, Any]) -> str:
         return "find"
     if "scene" in name:
         return "scene"
+    if fmt.get("type") == "json_object":
+        for message in body.get("messages", []):
+            if message.get("role") != "system" or not isinstance(
+                message.get("content"), str
+            ):
+                continue
+            _, separator, schema_text = message["content"].partition(
+                "\n\nRequired JSON schema:\n"
+            )
+            if separator:
+                schema = json.loads(schema_text)
+                kind = schema.get("properties", {}).get("kind", {}).get("const")
+                if kind in {"find", "scene"}:
+                    return str(kind)
     return "skill_call"
 
 
@@ -812,15 +881,17 @@ class _Handler(BaseHTTPRequestHandler):
         for index, piece in enumerate(_chunks(content)):
             if index and gap:
                 box.sleep_ms(gap)
-            delta = {"role": "assistant", "content": piece} if index == 0 else {
-                "content": piece
-            }
-            self._sse({**base, "choices": [
-                {"index": 0, "delta": delta, "finish_reason": None}
-            ]})
-        self._sse({**base, "choices": [
-            {"index": 0, "delta": {}, "finish_reason": "stop"}
-        ]})
+            delta = (
+                {"role": "assistant", "content": piece}
+                if index == 0
+                else {"content": piece}
+            )
+            self._sse(
+                {**base, "choices": [{"index": 0, "delta": delta, "finish_reason": None}]}
+            )
+        self._sse(
+            {**base, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+        )
         if (body.get("stream_options") or {}).get("include_usage"):
             usage = _completion(entry, content)["usage"]
             self._sse({**base, "choices": [], "usage": usage})
@@ -844,8 +915,9 @@ class FakeBoxServer(ThreadingHTTPServer):
         super().__init__(address, _Handler)
 
 
-def make_server(host: str = "127.0.0.1", port: int = 8000, box: FakeBox | None = None
-                ) -> FakeBoxServer:
+def make_server(
+    host: str = "127.0.0.1", port: int = 8000, box: FakeBox | None = None
+) -> FakeBoxServer:
     """A bound, not-yet-serving server.  Port 0 asks the OS for a free port."""
     return FakeBoxServer((host, port), box or FakeBox())
 

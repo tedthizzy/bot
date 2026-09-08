@@ -38,6 +38,7 @@ __all__ = [
     "BrainCancelMessage",
     "BrainClientMessage",
     "BrainServerMessage",
+    "BrainSkillRequest",
     "BusCap",
     "CancelMessage",
     "ClearMessage",
@@ -284,8 +285,9 @@ Scalar = bool | int | float | str | None
 class DriveForArgs(StrictModel):
     """``drive_for`` as the model writes it.  Open loop: a power for a time.
 
-    ``power_pct`` is percent of Waveshare full scale, so 30 is the 0.30 cap the
-    firmware compiles in; the sign is the direction.  Zero is not a drive."""
+    ``power_pct`` is a legacy name for hundredths of a Waveshare power unit:
+    30 means 0.30, or 60% duty at full scale 0.5. The sign is the direction.
+    Zero is not a drive."""
 
     duration_ms: int = Field(ge=100, le=2000)
     power_pct: int = Field(ge=-30, le=30)
@@ -300,7 +302,8 @@ class DriveForArgs(StrictModel):
 class TurnToArgs(StrictModel):
     """``turn_to`` as the model writes it: an absolute compass-style heading in
     whole degrees, 0..359, in the frame the WorldState's ``heading_deg`` uses.
-    The model turns left 90 by asking for ``(heading - 90) mod 360``."""
+    Host headings increase leftward. Turn left 90 with
+    ``(heading + 90) mod 360``."""
 
     heading_deg: int = Field(ge=0, le=359)
 
@@ -438,7 +441,7 @@ SkillCall = Annotated[
     Field(discriminator="skill"),
 ]
 
-skill_call_adapter: Final = TypeAdapter(SkillCall)
+skill_call_adapter: Final[TypeAdapter[SkillCall]] = TypeAdapter(SkillCall)
 
 
 # --------------------------------------------------------------------------
@@ -751,8 +754,8 @@ ServerMessage = Annotated[
     Field(discriminator="type"),
 ]
 
-client_adapter: Final = TypeAdapter(ClientMessage)
-server_adapter: Final = TypeAdapter(ServerMessage)
+client_adapter: Final[TypeAdapter[ClientMessage]] = TypeAdapter(ClientMessage)
+server_adapter: Final[TypeAdapter[ServerMessage]] = TypeAdapter(ServerMessage)
 
 
 # --------------------------------------------------------------------------
@@ -788,6 +791,20 @@ class FrameHeader(StrictModel):
 # --------------------------------------------------------------------------
 
 
+class BrainSkillRequest(StrictModel):
+    """An explicit operator skill, not text to reinterpret through the model.
+
+    Completion uses ResultMessage with cmd_id equal to request_id. Motion
+    still passes normal observation, authorization, and robotd admission checks.
+    """
+
+    v: Literal[1] = 1
+    type: Literal["request_skill"] = "request_skill"
+    request_id: Ulid
+    source: EnumValue[UtteranceSource] = UtteranceSource.CLI
+    call: SkillCall
+
+
 class UtteranceMessage(StrictModel):
     """Text, PTT and the wake word all emit this identical shape (A30).
 
@@ -820,6 +837,7 @@ class BrainCancelMessage(StrictModel):
     v: Literal[1] = 1
     type: Literal["cancel"] = "cancel"
     source: EnumValue[UtteranceSource]
+    request_id: Ulid | None = None
 
 
 class FaceMessage(StrictModel):
@@ -839,14 +857,22 @@ class FsmMessage(StrictModel):
 
 
 BrainClientMessage = Annotated[
-    UtteranceMessage | PttStartMessage | PttEndMessage | BrainCancelMessage,
+    UtteranceMessage
+    | PttStartMessage
+    | PttEndMessage
+    | BrainCancelMessage
+    | BrainSkillRequest,
     Field(discriminator="type"),
 ]
 
 BrainServerMessage = Annotated[
-    FaceMessage | FsmMessage,
+    FaceMessage | FsmMessage | ResultMessage,
     Field(discriminator="type"),
 ]
 
-brain_client_adapter: Final = TypeAdapter(BrainClientMessage)
-brain_server_adapter: Final = TypeAdapter(BrainServerMessage)
+brain_client_adapter: Final[TypeAdapter[BrainClientMessage]] = TypeAdapter(
+    BrainClientMessage
+)
+brain_server_adapter: Final[TypeAdapter[BrainServerMessage]] = TypeAdapter(
+    BrainServerMessage
+)

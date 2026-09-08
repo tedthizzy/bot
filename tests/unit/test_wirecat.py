@@ -14,6 +14,7 @@ import shutil
 import socket
 import sys
 import tempfile
+import termios
 import threading
 import tty
 from pathlib import Path
@@ -327,6 +328,25 @@ def test_request_sends_feedback_on_and_a_banner_request_once(
         assert code == 0
         assert "fw=bot-wr-1" in capsys.readouterr().out
         assert os.read(master, 4096) == feedback_flow(True) + banner_request()
+    finally:
+        os.close(slave)
+        os.close(master)
+
+
+@pytest.mark.parametrize("send_request", [False, True])
+def test_serial_access_refuses_live_robotd_even_without_writes(
+    send_request: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr("rover_devtools.wirecat._socket_is_live", lambda _: True)
+    master, slave = pty.openpty()
+    try:
+        original = termios.tcgetattr(slave)
+        args = [os.ttyname(slave)] + (["--request"] if send_request else [])
+        assert main(args) == 2
+        assert termios.tcgetattr(slave) == original
+        assert "another serial reader" in capsys.readouterr().err
     finally:
         os.close(slave)
         os.close(master)

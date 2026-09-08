@@ -28,7 +28,7 @@ from typing import Any
 import pytest
 from rover_contracts.config import LinkConfig, RobotConfig, SafetyConfig
 from rover_contracts.units import wrap_deg_180
-from rover_contracts.wave_proto import Banner, LinkProtocol as _Unused  # noqa: F401
+from rover_contracts.wave_proto import Banner
 from rover_robotd.link import Link, LinkProtocol
 
 REPO = Path(__file__).resolve().parents[2]
@@ -213,7 +213,13 @@ class FakeRover:
     def send_banner(self) -> None:
         self.banners_sent += 1
         self._send(
-            {"T": 1006, "fw": self.fw, "hb_ms": self.hb_ms, "cap": self.cap, "proto": self.proto}
+            {
+                "T": 1006,
+                "fw": self.fw,
+                "hb_ms": self.hb_ms,
+                "cap": self.cap,
+                "proto": self.proto,
+            }
         )
 
     def reboot(self) -> None:
@@ -381,7 +387,9 @@ async def test_bring_up_sends_the_protocol_sequence_then_waits_for_the_banner() 
         assert by_type[605]["cmd"] == 0, "quiet"
         assert by_type[143]["cmd"] == 0, "echo off"
         assert by_type[136]["cmd"] == 300, "heartbeat at [safety] heartbeat_ms"
-        assert by_type[142]["cmd"] == 50, "feedback interval at [link] feedback_interval_ms"
+        assert by_type[142]["cmd"] == 50, (
+            "feedback interval at [link] feedback_interval_ms"
+        )
         assert by_type[131]["cmd"] == 1, "feedback on"
         assert link.fw == "bot-wr-1"
         assert link.banner is not None and link.banner.proto == 1
@@ -478,14 +486,18 @@ async def test_feedback_is_stamped_on_arrival_and_ages_on_the_host_clock() -> No
         assert link.feedback_age_ms(arrival + 100_000_000) == pytest.approx(100.0)
         assert link.feedback_fresh(arrival + 150_000_000)
         assert not link.feedback_fresh(arrival + 151_000_000)
-        gaps = [b - a for a, b in zip(recorder.feedback, recorder.feedback[1:], strict=False)]
+        gaps = [
+            b - a for a, b in zip(recorder.feedback, recorder.feedback[1:], strict=False)
+        ]
         assert all(gap > 0 for gap in gaps)
 
 
 def test_dropped_and_unknown_lines_are_counted_and_renew_nothing() -> None:
     link = Link(RobotConfig(), clock=lambda: 777)
-    link.ingest(b'{"T":1001,"L":0,"R":0,"r":0,"p":0,"y":10,"temp":30,"v":11.5,'
-                b'"hb":1,"st":0,"tf":-1,"bp":0,"cc":0}')
+    link.ingest(
+        b'{"T":1001,"L":0,"R":0,"r":0,"p":0,"y":10,"temp":30,"v":11.5,'
+        b'"hb":1,"st":0,"tf":-1,"bp":0,"cc":0}'
+    )
     assert link.feedback_arrival_ns == 777
     link._clock = lambda: 999  # noqa: SLF001 - a later arrival would stamp 999
     link.ingest(b"UGV started.")
@@ -498,7 +510,7 @@ def test_dropped_and_unknown_lines_are_counted_and_renew_nothing() -> None:
     assert link.feedback is not None and link.feedback.yaw_deg == 10.0
 
 
-def test_a_run_of_bytes_without_a_newline_is_dropped_once_and_the_buffer_stays_bounded() -> None:
+def test_oversized_line_is_dropped_once_and_buffer_stays_bounded() -> None:
     link = Link(RobotConfig())
     protocol = LinkProtocol(link)
     for _ in range(10):
@@ -506,7 +518,9 @@ def test_a_run_of_bytes_without_a_newline_is_dropped_once_and_the_buffer_stays_b
     protocol.data_received(b"tail\n")
     assert link.dropped == 1
     assert len(protocol._rx) == 0  # noqa: SLF001 - the bound is the point
-    protocol.data_received(b'{"T":1006,"fw":"bot-wr-1","hb_ms":300,"cap":0.3,"proto":1}\n')
+    protocol.data_received(
+        b'{"T":1006,"fw":"bot-wr-1","hb_ms":300,"cap":0.3,"proto":1}\n'
+    )
     assert link.unknown == 0 and link.dropped == 1, "the next line decodes normally"
 
 
@@ -566,7 +580,7 @@ async def test_command_sends_zeros_before_feedback_and_after_it_goes_stale() -> 
         rover.feedback_enabled = False
         await until(lambda: not link.feedback_fresh(), timeout=2.0)
         assert link.command(0.2, 0.2) == (0.0, 0.0), "T0: zeros to a silent controller"
-        assert speeds_of(rover)[-1] == (0.0, 0.0)
+        await until(lambda: speeds_of(rover)[-1] == (0.0, 0.0))
 
 
 @pytest.mark.timeout(30)
@@ -586,15 +600,22 @@ async def test_a_second_banner_is_a_restart_that_re_runs_bring_up() -> None:
     async with linked() as (link, rover, recorder):
         await until(lambda: link.motion_allowed())
         first_bring_up = len(rover.received)
+
+        def on_restart(banner: Banner) -> None:
+            # Inspect the restart boundary itself, before the async handshake
+            # can finish again; polling a transient state races the TCP peer.
+            assert not link.up
+            assert link.command(0.2, 0.2) == (0.0, 0.0)
+            recorder.on_restart(banner)
+
+        link._on_restart = on_restart
         rover.reboot()
         await until(lambda: len(recorder.restarts) == 1)
         assert recorder.restarts[0].fw == "bot-wr-1"
-        assert not link.up
-        assert link.command(0.2, 0.2) == (0.0, 0.0), "zeros until bring-up finishes again"
         await until(lambda: link.up and recorder.ups == 2)
         types = [o["T"] for o in rover.received[first_bring_up:] if o["T"] != 1]
         assert types[:6] == [605, 143, 136, 142, 131, 1007], "the same sequence again"
-        assert rover.banners_sent == 2
+        assert rover.banners_sent == 3, "initial request, reboot, and repeated request"
         await until(lambda: link.motion_allowed())
 
 
@@ -623,7 +644,14 @@ async def test_the_link_reopens_after_a_loss_and_replays_nothing() -> None:
         boundary = len(rover.received)
         await until(lambda: rover.connections == 2 and link.up, timeout=TIMEOUT_S)
         after = rover.received[boundary:]
-        assert [o["T"] for o in after if o["T"] != 1][:6] == [605, 143, 136, 142, 131, 1007]
+        assert [o["T"] for o in after if o["T"] != 1][:6] == [
+            605,
+            143,
+            136,
+            142,
+            131,
+            1007,
+        ]
         assert all((o["L"], o["R"]) == (0.0, 0.0) for o in after if o["T"] == 1)
         assert recorder.ups == 2
 
@@ -767,7 +795,9 @@ def rover_stub(*flags: str):  # type: ignore[no-untyped-def]
 @pytest.mark.skipif(_stub_reason() is not None, reason=_stub_reason() or "")
 async def test_the_link_brings_up_the_real_stub_over_a_pty() -> None:
     with rover_stub() as path:
-        config = RobotConfig(link=LinkConfig(backend="serial", port=path, open_retry_ms=100))
+        config = RobotConfig(
+            link=LinkConfig(backend="serial", port=path, open_retry_ms=100)
+        )
         link = Link(config)
         task = asyncio.create_task(link.run())
         try:
@@ -779,9 +809,11 @@ async def test_the_link_brings_up_the_real_stub_over_a_pty() -> None:
             await until(lambda: link.feedback is not None and link.feedback.left > 0.0)
             await stream(link, 0.0, 0.0, 0.4)
             await until(
-                lambda: link.feedback is not None
-                and link.feedback.left == 0.0
-                and link.feedback.right == 0.0
+                lambda: (
+                    link.feedback is not None
+                    and link.feedback.left == 0.0
+                    and link.feedback.right == 0.0
+                )
             )
             await link.close()
         finally:
@@ -793,7 +825,9 @@ async def test_the_link_brings_up_the_real_stub_over_a_pty() -> None:
 @pytest.mark.skipif(_stub_reason() is not None, reason=_stub_reason() or "")
 async def test_the_stock_stub_is_refused() -> None:
     with rover_stub("--stock") as path:
-        config = RobotConfig(link=LinkConfig(backend="serial", port=path, open_retry_ms=100))
+        config = RobotConfig(
+            link=LinkConfig(backend="serial", port=path, open_retry_ms=100)
+        )
         link = Link(config)
         task = asyncio.create_task(link.run())
         try:

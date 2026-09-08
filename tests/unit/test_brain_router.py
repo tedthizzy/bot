@@ -75,10 +75,10 @@ def test_back_is_the_same_drive_with_negative_power(text: str) -> None:
 
 @pytest.mark.parametrize(
     ("heading", "expected"),
-    [(87, 357), (90, 0), (30, 300), (0, 270), (180, 90)],
+    [(87, 177), (90, 180), (30, 120), (0, 90), (180, 270)],
 )
-def test_left_is_ninety_degrees_less_wrapped(heading: int, expected: int) -> None:
-    """The model is told: turn left 90 is (heading - 90) mod 360."""
+def test_left_is_ninety_degrees_more_wrapped(heading: int, expected: int) -> None:
+    """The model and controller share positive-left host headings."""
     call = route("turn left", world(heading), DEFAULTS)
     assert call is not None and call.skill == "turn_to"
     assert call.args.heading_deg == expected
@@ -87,9 +87,9 @@ def test_left_is_ninety_degrees_less_wrapped(heading: int, expected: int) -> Non
 
 @pytest.mark.parametrize(
     ("heading", "expected"),
-    [(87, 177), (270, 0), (300, 30), (359, 89), (0, 90)],
+    [(87, 357), (270, 180), (300, 210), (359, 269), (0, 270)],
 )
-def test_right_is_ninety_degrees_more_wrapped(heading: int, expected: int) -> None:
+def test_right_is_ninety_degrees_less_wrapped(heading: int, expected: int) -> None:
     call = route("turn right", world(heading), DEFAULTS)
     assert call is not None and call.skill == "turn_to"
     assert call.args.heading_deg == expected

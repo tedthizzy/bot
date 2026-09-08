@@ -75,6 +75,18 @@ def test_the_system_prompt_is_hash_pinned() -> None:
     assert len(system_sha256()) == 64
 
 
+@pytest.mark.parametrize("kind", ["find", "scene"])
+def test_observation_prompt_includes_its_canonical_schema_without_backend_grammar(
+    kind,
+) -> None:
+    from rover_contracts.observations import FindObservation, SceneObservation
+
+    messages = build_observation_messages(kind, image_jpeg=b"jpeg", target="mug")
+    schema = json.loads(messages[0]["content"].split("\n\nRequired JSON schema:\n", 1)[1])
+    expected = FindObservation if kind == "find" else SceneObservation
+    assert schema == expected.model_json_schema()
+
+
 def test_the_system_prompt_is_the_shipped_prompt_file() -> None:
     """G1 prefers box/prompts/system.md when it exists; brain sends
     SYSTEM_PROMPT.  One text, or the gate measures a prompt the robot never
@@ -102,7 +114,7 @@ def test_the_system_prompt_states_the_seven_skills_and_their_bounds() -> None:
 
 
 def test_the_system_prompt_explains_headings_and_the_unknown_range() -> None:
-    assert "(heading - 90) mod 360" in SYSTEM_PROMPT
+    assert "To turn left 90 ask turn_to for\n(heading + 90) mod 360" in SYSTEM_PROMPT
     assert "(heading + 90) mod 360" in SYSTEM_PROMPT
     assert "(heading + 180) mod 360" in SYSTEM_PROMPT
     assert "null means" in SYSTEM_PROMPT and "unknown, not clear" in SYSTEM_PROMPT

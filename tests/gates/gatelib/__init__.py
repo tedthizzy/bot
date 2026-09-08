@@ -3,7 +3,7 @@
 ``runner``  the three-way result model, the per-case print and the JSONL metrics
 ``env``     what is present to gate against -- config, sockets, modules, a Pi
 ``bus``     a deliberately impolite NDJSON client for robotd.sock and brain.sock
-``link``    the gate's own end of the Pi-MCU link, and ``mcu-sim`` as a process
+``checks``  isolated current-runtime tests and native firmware checks
 
 Importing this package puts ``packages/`` on ``sys.path``, so the gates run from
 any working directory whether or not ``rover_contracts`` is installed.

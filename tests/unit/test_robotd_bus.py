@@ -151,7 +151,9 @@ def drive_message(**overrides: Any) -> dict[str, Any]:
 
 
 @pytest.mark.timeout(30)
-async def test_the_socket_is_group_readable_and_not_world_accessible(tmp_path: Path) -> None:
+async def test_the_socket_is_group_readable_and_not_world_accessible(
+    tmp_path: Path,
+) -> None:
     async with daemon(tmp_path) as robotd:
         mode = stat.S_IMODE(robotd.bus.path.stat().st_mode)
         assert mode == 0o660, f"the bus must be 0660, got {mode:o}"
@@ -191,7 +193,9 @@ async def test_a_malformed_line_is_answered_and_the_connection_survives(
 
 
 @pytest.mark.timeout(30)
-async def test_a_subscriber_receives_state_that_says_the_link_is_down(tmp_path: Path) -> None:
+async def test_a_subscriber_receives_state_that_says_the_link_is_down(
+    tmp_path: Path,
+) -> None:
     async with daemon(tmp_path) as robotd, client(robotd) as web:
         await web.hello(source="web", caps=("subscribe",))
         await web.send(type="subscribe", topics=["state"], state_hz=10)
@@ -228,7 +232,9 @@ async def test_stop_class_is_never_answered_rejected(tmp_path: Path, kind: str) 
 
 
 @pytest.mark.timeout(30)
-async def test_a_stop_missing_every_optional_field_is_still_a_stop(tmp_path: Path) -> None:
+async def test_a_stop_missing_every_optional_field_is_still_a_stop(
+    tmp_path: Path,
+) -> None:
     """brain's restart path sends one on connect, before any turn exists."""
     async with daemon(tmp_path) as robotd, client(robotd) as brain:
         await brain.hello()
@@ -248,7 +254,9 @@ async def test_a_stop_before_hello_is_still_honoured(tmp_path: Path) -> None:
 
 
 @pytest.mark.timeout(30)
-async def test_a_stop_from_a_source_that_may_not_command_is_ignored(tmp_path: Path) -> None:
+async def test_a_stop_from_a_source_that_may_not_command_is_ignored(
+    tmp_path: Path,
+) -> None:
     """``teleop`` is not in the default ``allow_sources``; rover-web's STOP
     button is its ``web`` session, which is."""
     async with daemon(tmp_path) as robotd, client(robotd) as anonymous:
@@ -261,7 +269,9 @@ async def test_a_stop_from_a_source_that_may_not_command_is_ignored(tmp_path: Pa
 
 
 @pytest.mark.timeout(30)
-async def test_estop_latches_persists_and_blocks_every_later_skill(tmp_path: Path) -> None:
+async def test_estop_latches_persists_and_blocks_every_later_skill(
+    tmp_path: Path,
+) -> None:
     async with daemon(tmp_path) as robotd, client(robotd) as web:
         await web.hello(source="web", caps=("skill",))
         await web.send(type="estop", source="web", reason="user")
@@ -389,7 +399,9 @@ def test_the_estop_latch_survives_a_restart(tmp_path: Path) -> None:
 
 
 @pytest.mark.timeout(60)
-async def test_a_hostile_message_costs_that_message_and_nothing_else(tmp_path: Path) -> None:
+async def test_a_hostile_message_costs_that_message_and_nothing_else(
+    tmp_path: Path,
+) -> None:
     """I-8's fuzz corpus lands on this path: no case may kill the connection
     or the daemon, and no stop-class case may be answered ``rejected``."""
     corpus: list[dict[str, Any]] = [
@@ -397,7 +409,12 @@ async def test_a_hostile_message_costs_that_message_and_nothing_else(tmp_path: P
         {"type": "skill", "skill": "fly", "args": {}},
         {"type": "skill", "cmd_id": "not-a-ulid", "skill": "drive_for", "args": {}},
         {"type": "skill", "cmd_id": 7, "skill": "drive_for", "args": {"duration_s": "x"}},
-        {"type": "skill", "cmd_id": CMD, "skill": "drive_for", "args": {"duration_s": 1, "power": 0}},
+        {
+            "type": "skill",
+            "cmd_id": CMD,
+            "skill": "drive_for",
+            "args": {"duration_s": 1, "power": 0},
+        },
         {"type": "twist", "twist": {"lin": 9e9, "ang": 0}},
         {"type": "twist", "cmd_id": None, "seq": -1, "twist": {}},
         {"type": "turn", "turn_id": ""},

@@ -27,6 +27,7 @@ import os
 import time
 from collections.abc import Awaitable, Callable, Iterable
 from pathlib import Path
+from typing import cast
 
 from aiohttp import WSMsgType, web
 from pydantic import BaseModel
@@ -71,7 +72,9 @@ MAX_BODY_BYTES = 64 * 1024
 """The robotd bus line cap of ARCHITECTURE 5.2, applied to browser uploads too."""
 MAX_WS_MESSAGE_BYTES = 8 * 1024
 MAX_UTTERANCE_CHARS = 500
-STOP_FLAG_BITS: dict[str, int] = {flag.name.lower(): int(flag) for flag in StopFlag}
+STOP_FLAG_BITS: dict[str, int] = {
+    cast(str, flag.name).lower(): int(flag) for flag in StopFlag
+}
 """``state.rover.stop_flags`` by name, for the pages' readout.  Served from
 ``rover_contracts`` rather than restated in JavaScript: the bit table has one
 home, ``docs/protocol.md``."""

@@ -71,7 +71,7 @@ float tiltAngleCompute(int inputPos) {
 void gimbalCtrlStop() {
   st.EnableTorque(GIMBAL_PAN_ID, 0);
   st.EnableTorque(GIMBAL_TILT_ID, 0);
-  delay(SERVO_STOP_DELAY);
+  bot_delayMillis(SERVO_STOP_DELAY);
   st.EnableTorque(GIMBAL_PAN_ID, 1);
   st.EnableTorque(GIMBAL_TILT_ID, 1);
 }
@@ -181,14 +181,14 @@ void gimbalUserCtrl(int inputX, int inputY, int inputSpd) {
     gimbalCtrlSimple(goalX, goalY, inputSpd, 0);
     if(inputX == 0){
       servoTorqueCtrl(GIMBAL_PAN_ID, 0);
-      delay(5);
+      bot_delayMillis(5);
       servoTorqueCtrl(GIMBAL_PAN_ID, 1);
       getGimbalFeedback();
       goalX = panAngleCompute(gimbalFeedback[0].pos);
     }
     if(inputY == 0){
       servoTorqueCtrl(GIMBAL_TILT_ID, 0);
-      delay(5);
+      bot_delayMillis(5);
       servoTorqueCtrl(GIMBAL_TILT_ID, 1);
       getGimbalFeedback();
       goalY = tiltAngleCompute(gimbalFeedback[1].pos);

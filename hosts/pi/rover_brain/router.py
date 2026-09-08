@@ -40,9 +40,16 @@ from rover_contracts.worldstate import WorldState
 
 from rover_brain.heading import heading_left_of
 
-__all__ = ["RouterDefaults", "route"]
+__all__ = ["RouterDefaults", "is_stop", "route"]
 
 _STOP = re.compile(r"\b(stop|halt|freeze|whoa|hold\s+it|hold\s+up)\b", re.I)
+
+
+def is_stop(text: str) -> bool:
+    """Recognize stop before planning, authorization, speech, or camera work."""
+    return _STOP.search(text) is not None
+
+
 _LOOK = re.compile(
     r"^\s*(?:(?:have|take)\s+a\s+)?look(?:\s+around)?\s*[.!?]?\s*$"
     r"|\bwhat\s+(?:do|can)\s+you\s+see\b",
@@ -128,7 +135,7 @@ def route(
     can widen a bound -- the only numbers a local call carries are the
     configured defaults and a heading derived from the WorldState.
     """
-    if _STOP.search(text):
+    if is_stop(text):
         return StopCall(speech=_SPEECH["stop"], skill="stop", args=NoArgs())
     if _LOOK.search(text):
         return DescribeSceneCall(

@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import Any
 
 from pydantic import BaseModel, ValidationError
 from rover_contracts.config import RobotConfig
@@ -27,6 +27,7 @@ from rover_contracts.messages import (
     DriveForBusArgs,
     ResultReason,
     SkillMessage,
+    SkillName,
     Source,
     TurnToBusArgs,
     TwistMessage,
@@ -128,7 +129,7 @@ class Validator:
             if not isinstance(name, str) or name not in SKILLS:
                 return Rejection(ResultReason.UNKNOWN_SKILL, f"skill={name!r}")
         try:
-            return cast(ClientMessage, client_adapter.validate_python(payload))
+            return client_adapter.validate_python(payload)
         except ValidationError as exc:
             return Rejection(ResultReason.BAD_ARGS, _first_error(exc))
 
@@ -263,9 +264,7 @@ class Validator:
             return bounds
 
         allow = tuple(
-            s
-            for s in self.config.bus.allow_sources
-            if s in self.config.bus.allow_stream
+            s for s in self.config.bus.allow_sources if s in self.config.bus.allow_stream
         )
         source = self._check_source(message.source, session, allow)
         if source is not None:
@@ -436,10 +435,14 @@ class Validator:
                 power_clamped_to = limits.power_default
                 args = DriveForBusArgs(duration_s=args.duration_s, power=power)
             est_motion_s = args.duration_s
-            t2_ms = math.ceil(goal_deadline_s(args.duration_s) * 1000.0)
+            t2_ms = math.ceil(
+                goal_deadline_s(args.duration_s, skill=SkillName(message.skill)) * 1000.0
+            )
         elif isinstance(args, TurnToBusArgs):
             est_motion_s = 0.0
-            t2_ms = math.ceil(args.timeout_s * 1000.0)
+            t2_ms = math.ceil(
+                goal_deadline_s(args.timeout_s, skill=SkillName(message.skill)) * 1000.0
+            )
         else:  # pragma: no cover - only drive_for and turn_to move
             return Rejection(ResultReason.UNKNOWN_SKILL, message.skill)
 
@@ -463,9 +466,7 @@ class Validator:
             )
         return (args, power_clamped_to, est_motion_s, min(message.goal_ttl_ms, t2_ms))
 
-    def _check_cooldown(
-        self, turn_id: str, ctx: ValidationContext
-    ) -> Rejection | None:
+    def _check_cooldown(self, turn_id: str, ctx: ValidationContext) -> Rejection | None:
         """``motion_cooldown_ms`` applies to the **first** motion of a
         ``turn_id``; later skills sharing that id are exempt, because the
         per-instruction budget is the limiter inside a turn."""
@@ -478,8 +479,7 @@ class Validator:
         if elapsed_ms < cooldown_ms:
             return Rejection(
                 ResultReason.RATE_LIMITED,
-                f"{elapsed_ms:.0f} ms since the last motion, "
-                f"cooldown {cooldown_ms} ms",
+                f"{elapsed_ms:.0f} ms since the last motion, cooldown {cooldown_ms} ms",
             )
         return None
 

@@ -75,8 +75,9 @@ class LinkProtocol(asyncio.Protocol):
             if end < 0:
                 if len(self._rx) > LINE_MAX_BYTES:
                     self._rx.clear()
+                    if not self._skipping:
+                        self._link.dropped += 1
                     self._skipping = True
-                    self._link.dropped += 1
                 return
             line = bytes(self._rx[:end])
             del self._rx[: end + 1]

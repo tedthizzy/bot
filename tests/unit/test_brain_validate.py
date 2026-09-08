@@ -204,8 +204,7 @@ def test_an_extra_field_is_rejected() -> None:
 def test_a_non_finite_value_is_rejected() -> None:
     """All three spellings: the JSON constants, and a float that overflows."""
     for line in (
-        '{"speech":"","skill":"drive_for",'
-        '"args":{"duration_ms":NaN,"power_pct":15}}',
+        '{"speech":"","skill":"drive_for","args":{"duration_ms":NaN,"power_pct":15}}',
         '{"speech":"","skill":"drive_for",'
         '"args":{"duration_ms":1000,"power_pct":Infinity}}',
     ):
@@ -333,16 +332,14 @@ def test_goal_ttl_is_the_skills_own_time_through_one_formula() -> None:
     )
 
 
-def test_a_turns_deadline_is_its_timeout_through_the_same_formula() -> None:
-    """4 s x 1.5 + 0.5 s is 6.5 s against a 5 s ceiling, so the timeout gives:
-    3.0 s is the largest whose T2 fits, and the message carries 5000."""
-    assert turn_timeout_s(LIMITS) == 3.0
-    assert goal_ttl_ms_for(turn(), LIMITS) == 5000
-    assert message(turn()).goal_ttl_ms == 5000
-    assert message(turn()).args.timeout_s == 3.0
+def test_a_turns_deadline_is_its_timeout_without_drive_overhead() -> None:
+    assert turn_timeout_s(LIMITS) == 4.0
+    assert goal_ttl_ms_for(turn(), LIMITS) == 4000
+    assert message(turn()).goal_ttl_ms == 4000
+    assert message(turn()).args.timeout_s == 4.0
     shorter = LimitsConfig(turn_timeout_max_s=2.0)
     assert turn_timeout_s(shorter) == 2.0
-    assert goal_ttl_ms_for(turn(), shorter) == 3500
+    assert goal_ttl_ms_for(turn(), shorter) == 2000
 
 
 def test_the_turn_timeout_never_puts_T2_over_the_ceiling() -> None:
@@ -353,14 +350,16 @@ def test_the_turn_timeout_never_puts_T2_over_the_ceiling() -> None:
         limits = LimitsConfig(goal_ttl_ms_max=ttl_max)
         timeout = turn_timeout_s(limits)
         assert 0.0 < timeout <= limits.turn_timeout_max_s
-        assert math.ceil(goal_deadline_s(timeout) * 1000) <= ttl_max
+        assert (
+            math.ceil(goal_deadline_s(timeout, skill=SkillName.TURN_TO) * 1000) <= ttl_max
+        )
         assert goal_ttl_ms_for(turn(), limits) <= ttl_max
 
 
-def test_no_turn_fits_a_deadline_shorter_than_the_formulas_floor() -> None:
-    with pytest.raises(ValidationFailure) as caught:
-        turn_timeout_s(LimitsConfig(goal_ttl_ms_max=400))
-    assert caught.value.reason == "goal_ttl_too_long"
+def test_a_short_turn_has_no_artificial_drive_deadline_floor() -> None:
+    limits = LimitsConfig(goal_ttl_ms_max=400)
+    assert turn_timeout_s(limits) == 0.4
+    assert goal_ttl_ms_for(turn(), limits) == 400
 
 
 def test_non_motion_skills_get_a_short_fixed_expiry() -> None:
@@ -427,7 +426,7 @@ def test_a_heading_passes_through_with_the_configured_turn_defaults() -> None:
     bus = message(turn(heading_deg=357))
     assert isinstance(bus.args, TurnToBusArgs)
     assert bus.args.heading_deg == 357.0
-    assert bus.args.timeout_s == 3.0
+    assert bus.args.timeout_s == 4.0
     assert bus.args.tolerance_deg == 5.0
     wider = LimitsConfig(turn_tolerance_deg=8.0)
     assert message(turn(), wider).args.tolerance_deg == 8.0

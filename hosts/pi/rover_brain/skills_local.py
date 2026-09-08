@@ -19,13 +19,15 @@ angle (5.5).
 
 from __future__ import annotations
 
+import asyncio
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
-from rover_contracts.messages import Face, ResultReason, ResultStatus
+from rover_contracts.messages import Face, ResultReason, ResultStatus, SkillObs
 from rover_contracts.observations import FindObservation, Observation, SceneObservation
+from rover_contracts.skills import FIND_BUDGET_S
 from rover_contracts.units import bearing_deg_from_center_x
 
 from rover_brain.audio.tts import Tts
@@ -50,7 +52,6 @@ MAX_SWEEPS: int = 8
 """A14.  Six sweeps leave a 52 degree blind wedge that G5 cannot pass."""
 
 SWEEP_DEG: int = 45
-FIND_BUDGET_S: float = 60.0
 
 CENTRE_TOLERANCE_DEG: float = 5.0
 """Below this the object is centred enough; G5 calibrates the bearing to +-5."""
@@ -70,6 +71,10 @@ class Still:
     w: int
     h: int
 
+    @property
+    def obs(self) -> SkillObs:
+        return SkillObs(frame_id=self.frame_id, frame_mono_ns=self.frame_mono_ns)
+
 
 class Stills(Protocol):
     """The frames.sock subscriber, from brain's point of view."""
@@ -82,7 +87,9 @@ class Stills(Protocol):
 class Motion(Protocol):
     """The one motion primitive ``find`` uses, dispatched through robotd."""
 
-    async def turn_to(self, heading_deg: int) -> tuple[ResultStatus, ResultReason]: ...
+    async def turn_to(
+        self, heading_deg: int, *, observation: Still
+    ) -> tuple[ResultStatus, ResultReason]: ...
 
 
 class Vision(Protocol):
@@ -133,7 +140,7 @@ class LocalSkills:
         tts: Tts,
         box: Vision,
         stills: Stills,
-        motion: Motion,
+        motion: Motion | None = None,
         scene: SceneRing,
         face: Callable[[Face], Awaitable[None]],
         hfov_deg: float,
@@ -174,14 +181,21 @@ class LocalSkills:
         await self.say(observation.description)
         return observation
 
-    async def find(self, target: str, max_sweeps: int) -> FindOutcome:
-        """A stationary scan of at most ``max_sweeps`` captures (A14).
+    async def find(
+        self, target: str, max_sweeps: int, *, motion: Motion | None = None
+    ) -> FindOutcome:
+        """At most eight scan captures, plus one centring re-capture.
 
-        Cancellation is ordinary ``asyncio`` cancellation -- every await here
-        is cancellable and no state is left behind -- and the 60 second budget
-        is checked before each capture and each turn, so a slow box cannot
-        stretch the scan past it.
+        The whole operation times out after 60 seconds, including adapter
+        awaits. Cancellation propagates to the caller, which stops robotd.
         """
+        motion = motion if motion is not None else self._motion
+        if motion is None:
+            raise ValueError("find requires an instruction-scoped motion adapter")
+        async with asyncio.timeout(FIND_BUDGET_S):
+            return await self._find(target, max_sweeps, motion)
+
+    async def _find(self, target: str, max_sweeps: int, motion: Motion) -> FindOutcome:
         sweeps = max(1, min(int(max_sweeps), MAX_SWEEPS))
         deadline = self._clock() + FIND_BUDGET_S
         start = self._heading_deg()
@@ -189,14 +203,16 @@ class LocalSkills:
         for index in range(sweeps):
             if self._clock() >= deadline:
                 break
-            observation = await self._look(target)
+            observation, still = await self._look(target)
             captures += 1
             if observation.present:
-                return await self._centre(target, observation, captures, deadline)
+                return await self._centre(
+                    target, observation, still, captures, deadline, motion
+                )
             if index == sweeps - 1 or self._clock() >= deadline:
                 break
-            status, reason = await self._motion.turn_to(
-                heading_left_of(start, SWEEP_DEG * (index + 1))
+            status, reason = await motion.turn_to(
+                heading_left_of(start, SWEEP_DEG * (index + 1)), observation=still
             )
             if status is not ResultStatus.DONE:
                 # A rejection aborts the sweep with spoken feedback; it never
@@ -205,49 +221,57 @@ class LocalSkills:
                 return FindOutcome(False, captures, reason=_or_not_ready(reason))
         return FindOutcome(False, captures)
 
-    async def _look(self, target: str) -> FindObservation:
+    async def _look(self, target: str) -> tuple[FindObservation, Still]:
         still = await self._stills.still(wide=True)
         observation = await self._box.observe(
             "find", image_jpeg=still.jpeg, target=target
         )
         if not isinstance(observation, FindObservation):
             raise BoxRejected("wrong_kind", "asked for a find, got a scene")
-        return observation
+        return observation, still
 
     async def _centre(
         self,
         target: str,
         observation: FindObservation,
+        still: Still,
         captures: int,
         deadline: float,
+        motion: Motion,
     ) -> FindOutcome:
         """Turn to the Pi-computed bearing, re-capture, re-centre once (5.5)."""
         bearing = self._bearing(observation)
         self._remember(target, bearing)
         if abs(bearing) < CENTRE_TOLERANCE_DEG or self._clock() >= deadline:
             return FindOutcome(True, captures, observation.description, bearing)
-        status, reason = await self._turn_by(bearing)
+        status, reason = await self._turn_by(bearing, still, motion)
         if status is not ResultStatus.DONE:
             return FindOutcome(True, captures, observation.description, bearing, reason)
         if self._clock() >= deadline:
             return FindOutcome(True, captures, observation.description, 0.0)
-        again = await self._look(target)
+        again, still = await self._look(target)
         captures += 1
         if not again.present:
             return FindOutcome(True, captures, observation.description, 0.0)
         bearing = self._bearing(again)
         self._remember(target, bearing)
         if abs(bearing) >= CENTRE_TOLERANCE_DEG and self._clock() < deadline:
-            await self._turn_by(bearing)
+            status, reason = await self._turn_by(bearing, still, motion)
+            if status is not ResultStatus.DONE:
+                return FindOutcome(
+                    True, captures, again.description, bearing, _or_not_ready(reason)
+                )
         return FindOutcome(True, captures, again.description, bearing)
 
     def _bearing(self, observation: FindObservation) -> float:
         return bearing_deg_from_center_x(observation.center_x_permille, self._hfov_deg)
 
-    async def _turn_by(self, bearing_deg: float) -> tuple[ResultStatus, ResultReason]:
+    async def _turn_by(
+        self, bearing_deg: float, observation: Still, motion: Motion
+    ) -> tuple[ResultStatus, ResultReason]:
         """Face the object: the heading ``bearing_deg`` to the left of now."""
         target = heading_left_of(self._heading_deg(), bearing_deg)
-        return await self._motion.turn_to(target)
+        return await motion.turn_to(target, observation=observation)
 
     def _remember(self, target: str, bearing_deg: float) -> None:
         self._scene.remember(

@@ -1,4 +1,4 @@
-void jsonCmdReceiveHandler(){
+void jsonCmdReceiveHandler(uint32_t receivedAt){
 	int cmdType = jsonCmdReceive["T"].as<int>();
 	switch(cmdType){
 	case CMD_SPEED_CTRL:	if (jsonCmdReceive.containsKey("T") &&
@@ -7,7 +7,7 @@ void jsonCmdReceiveHandler(){
 													if (jsonCmdReceive["L"].is<float>() &&
 															jsonCmdReceive["R"].is<float>()){
 														heartbeatStopFlag = false;
-														lastCmdRecvTime = millis();
+														lastCmdRecvTime = receivedAt;
 														bot_stopFlags &= ~BOT_ST_COAST;  // bot: a speed command ends a coast
 														setGoalSpeed(
 														jsonCmdReceive["L"],
@@ -16,7 +16,7 @@ void jsonCmdReceiveHandler(){
 												} break;
 	case CMD_PWM_INPUT:		usePIDCompute = false;
 												heartbeatStopFlag = false;
-												lastCmdRecvTime = millis();
+												lastCmdRecvTime = receivedAt;
 												bot_stopFlags &= ~BOT_ST_COAST;  // bot
 												leftCtrl(jsonCmdReceive["L"]);
 												rightCtrl(jsonCmdReceive["R"]);
@@ -25,7 +25,7 @@ void jsonCmdReceiveHandler(){
 												jsonCmdReceive["X"],
 												jsonCmdReceive["Z"]);
 												heartbeatStopFlag = false;
-												lastCmdRecvTime = millis();
+												lastCmdRecvTime = receivedAt;
 												bot_stopFlags &= ~BOT_ST_COAST;break;  // bot
 	case CMD_SET_MOTOR_PID:
 												setPID(
@@ -216,8 +216,7 @@ void jsonCmdReceiveHandler(){
 	// case CMD_LIGHT_CTRL:	lightCtrl(
 	// 											jsonCmdReceive["led"]
 	// 											);break;
-	case CMD_SWITCH_OFF:  switchEmergencyStop();
-												bot_onCoast();break;  // bot: stop flag 16, request pair zeroed
+	case CMD_SWITCH_OFF:  bot_onCoast();break;  // bot: zero PWM, coast, and stop flag 16
 	case CMD_SINGLE_JOINT_ANGLE:
 												RoArmM2_singleJointAngleCtrl(
 												jsonCmdReceive["joint"],
@@ -481,7 +480,7 @@ void jsonCmdReceiveHandler(){
 												createFile("boot", "these cmds run automatically at boot.");
 												break;
 	case CMD_NVS_CLEAR:		nvs_flash_erase();
-												delay(1000);
+												bot_delayMillis(1000);
 												nvs_flash_init();
 												break;
 	case CMD_INFO_PRINT:	configInfoPrint(
@@ -501,27 +500,4 @@ void jsonCmdReceiveHandler(){
 }
 
 
-void serialCtrl() {
-  static String receivedData;
-
-  while (Serial.available() > 0) {
-    char receivedChar = Serial.read();
-    receivedData += receivedChar;
-
-    // Detect the end of the JSON string based on a specific termination character
-    if (receivedChar == '\n') {
-      // Now we have received the complete JSON string
-      DeserializationError err = deserializeJson(jsonCmdReceive, receivedData);
-      if (err == DeserializationError::Ok) {
-  			if (InfoPrint == 1 && uartCmdEcho) {
-  				Serial.print(receivedData);
-  			}
-        jsonCmdReceiveHandler();
-      } else {
-        // Handle JSON parsing error here
-      }
-      // Reset the receivedData for the next JSON string
-      receivedData = "";
-    }
-  }
-}
+#include "bot_serial_ctrl.h"

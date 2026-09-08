@@ -31,9 +31,21 @@ FINITE_DEG = st.floats(
 
 @pytest.mark.parametrize(
     ("deg", "expected"),
-    [(180.0, 180.0), (-180.0, 180.0), (360.0, 0.0), (-0.0, 0.0), (359.999, -0.001),
-     (0.0, 0.0), (540.0, 180.0), (-540.0, 180.0), (180.001, -179.999),
-     (-179.999, -179.999), (90.0, 90.0), (-90.0, -90.0), (270.0, -90.0)],
+    [
+        (180.0, 180.0),
+        (-180.0, 180.0),
+        (360.0, 0.0),
+        (-0.0, 0.0),
+        (359.999, -0.001),
+        (0.0, 0.0),
+        (540.0, 180.0),
+        (-540.0, 180.0),
+        (180.001, -179.999),
+        (-179.999, -179.999),
+        (90.0, 90.0),
+        (-90.0, -90.0),
+        (270.0, -90.0),
+    ],
 )
 def test_wrap_180_boundaries(deg, expected):
     # Both ends of a half turn are spelled +180: -180 is not in the range.
@@ -52,7 +64,7 @@ def test_wrap_180_lands_in_range_and_agrees_with_wrap_360(deg):
     half = wrap_deg_180(deg)
     full = wrap_deg_360(deg)
     assert -180.0 < half <= 180.0
-    turns = (full - half) % 360.0          # the two spellings differ by whole turns
+    turns = (full - half) % 360.0  # the two spellings differ by whole turns
     assert min(turns, 360.0 - turns) < 1e-6
     assert wrap_deg_180(half) == pytest.approx(half, abs=1e-9)
 
@@ -64,9 +76,19 @@ def test_wrap_180_lands_in_range_and_agrees_with_wrap_360(deg):
 
 @pytest.mark.parametrize(
     ("deg", "expected"),
-    [(180.0, 180.0), (-180.0, 180.0), (360.0, 0.0), (-0.0, 0.0), (359.999, 359.999),
-     (-0.001, 359.999), (0.0, 0.0), (720.0, 0.0), (-360.0, 0.0), (-90.0, 270.0),
-     (450.0, 90.0)],
+    [
+        (180.0, 180.0),
+        (-180.0, 180.0),
+        (360.0, 0.0),
+        (-0.0, 0.0),
+        (359.999, 359.999),
+        (-0.001, 359.999),
+        (0.0, 0.0),
+        (720.0, 0.0),
+        (-360.0, 0.0),
+        (-90.0, 270.0),
+        (450.0, 90.0),
+    ],
 )
 def test_wrap_360_boundaries(deg, expected):
     assert wrap_deg_360(deg) == pytest.approx(expected, abs=1e-9)
@@ -78,15 +100,9 @@ def test_wrap_360_never_returns_negative_zero():
         assert math.copysign(1.0, wrap_deg_360(zero)) > 0
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="units.wrap_deg_360 returns 360.0 for a tiny negative input: "
-    "-1e-20 % 360.0 rounds up to 360.0, so the result is outside [0, 360).  It "
-    "needs the guard wrap_deg_180 has for -180.0 (return 0.0 for a 360.0 remainder).",
-)
 @given(FINITE_DEG)
 def test_wrap_360_lands_in_range_and_is_idempotent(deg):
-    assert wrap_deg_360(-1e-20) == 0.0     # the pinned counterexample
+    assert wrap_deg_360(-1e-20) == 0.0  # the pinned counterexample
     full = wrap_deg_360(deg)
     assert 0.0 <= full < 360.0
     assert wrap_deg_360(full) == pytest.approx(full, abs=1e-9)
@@ -100,14 +116,14 @@ def test_wrap_360_lands_in_range_and_is_idempotent(deg):
 @pytest.mark.parametrize(
     ("target", "current", "expected"),
     [
-        (90.0, 0.0, 90.0),        # left is positive, the sign of a positive yaw rate
-        (0.0, 90.0, -90.0),       # right is negative
-        (350.0, 10.0, -20.0),     # the short way across the wrap, not +340
+        (90.0, 0.0, 90.0),  # left is positive, the sign of a positive yaw rate
+        (0.0, 90.0, -90.0),  # right is negative
+        (350.0, 10.0, -20.0),  # the short way across the wrap, not +340
         (10.0, 350.0, 20.0),
-        (180.0, 0.0, 180.0),      # a half turn is +180, never -180
+        (180.0, 0.0, 180.0),  # a half turn is +180, never -180
         (0.0, 180.0, 180.0),
-        (270.0, 0.0, -90.0),      # a quarter turn the short way round
-        (-90.0, 0.0, -90.0),      # a (-180, 180] current or target is fine too
+        (270.0, 0.0, -90.0),  # a quarter turn the short way round
+        (-90.0, 0.0, -90.0),  # a (-180, 180] current or target is fine too
         (359.0, 1.0, -2.0),
         (45.5, 44.0, 1.5),
         (87.0, 87.0, 0.0),
@@ -145,21 +161,29 @@ def test_heading_error_is_antisymmetric_except_for_the_half_turn(a, b):
 
 @pytest.mark.parametrize(
     ("value", "expected"),
-    [(0.5, 1), (-0.5, -1), (1.5, 2), (-1.5, -2), (2.5, 3), (-2.5, -3),
-     (0.49, 0), (-0.49, 0), (0.51, 1), (-0.51, -1), (0.0, 0), (-0.0, 0),
-     (7.0, 7), (-7.0, -7), (0.999, 1), (-0.999, -1)],
+    [
+        (0.5, 1),
+        (-0.5, -1),
+        (1.5, 2),
+        (-1.5, -2),
+        (2.5, 3),
+        (-2.5, -3),
+        (0.49, 0),
+        (-0.49, 0),
+        (0.51, 1),
+        (-0.51, -1),
+        (0.0, 0),
+        (-0.0, 0),
+        (7.0, 7),
+        (-7.0, -7),
+        (0.999, 1),
+        (-0.999, -1),
+    ],
 )
 def test_round_half_away_on_the_halves(value, expected):
     result = round_half_away(value)
     assert result == expected
     assert isinstance(result, int)
-
-
-def test_round_half_away_is_not_bankers_rounding():
-    # Python's round() sends both halves to the even neighbour.
-    assert (round(0.5), round(2.5), round(-0.5)) == (0, 2, 0)
-    halves = (round_half_away(0.5), round_half_away(2.5), round_half_away(-0.5))
-    assert halves == (1, 3, -1)
 
 
 @given(st.integers(min_value=-(10**6), max_value=10**6))
@@ -230,8 +254,10 @@ def test_permille_out_of_range_rejected(bad):
         bearing_deg_from_center_x(bad, 83.0)
 
 
-@given(st.integers(min_value=0, max_value=PERMILLE_FULL),
-       st.floats(min_value=1.0, max_value=179.0))
+@given(
+    st.integers(min_value=0, max_value=PERMILLE_FULL),
+    st.floats(min_value=1.0, max_value=179.0),
+)
 def test_bearing_stays_inside_half_the_field_of_view(center_x, hfov):
     bearing = bearing_deg_from_center_x(center_x, hfov)
     assert abs(bearing) <= hfov / 2 + 1e-9

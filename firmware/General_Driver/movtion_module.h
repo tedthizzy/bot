@@ -328,6 +328,18 @@ float bot_req_B = 0;
 float bot_applied_L = 0;
 float bot_applied_R = 0;
 
+// Stop the physical outputs regardless of mainType or whether PID is running.
+void bot_stopMotors() {
+  usePIDCompute = false;
+  setpointA = setpointB = 0;
+  setpointA_buffer = setpointB_buffer = 0;
+  outputA = outputB = 0;
+  bot_req_A = bot_req_B = 0;
+  bot_applied_L = bot_applied_R = 0;
+  leftCtrlRaw(0);
+  rightCtrlRaw(0);
+}
+
 // Applies the request pair under the stop flags and drives both H-bridges.
 // Forward block (docs/protocol.md): with st bit 2 or 4 set, a pair with L>0
 // and R>0 is applied as zeros; reverse and rotation pass. Low battery (bit 8)
@@ -364,10 +376,8 @@ void rightCtrl(float pwmInputB){
 // low. Zero the request pair so a later re-drive cannot restart the old
 // motion, and raise stop flag 16 until the next speed command clears it.
 void bot_onCoast() {
-  bot_req_A = 0;
-  bot_req_B = 0;
-  bot_applied_L = 0;
-  bot_applied_R = 0;
+  bot_stopMotors();
+  switchEmergencyStop();  // retain the all-inputs-low coast state
   bot_stopFlags |= BOT_ST_COAST;
 }
 
@@ -375,6 +385,10 @@ void setGoalSpeed(float inputLeft, float inputRight) {
   // bot: cap the request first, in the host's units, and count it.
   inputLeft = bot_clampPower(inputLeft);
   inputRight = bot_clampPower(inputRight);
+  if (inputLeft == 0 && inputRight == 0) {
+    bot_stopMotors();
+    return;
+  }
   // setpoint_cmd_recv = millis();
   if (mainType == 3) {
     usePIDCompute = true;
@@ -478,12 +492,10 @@ void rosCtrl(float rosX, float rosZ) {
 }
 
 void heartBeatCtrl() {
-  if (currentTimeMillis - lastCmdRecvTime > HEART_BEAT_DELAY) {
+  if (millis() - lastCmdRecvTime >= (unsigned long)HEART_BEAT_DELAY) {
     if (!heartbeatStopFlag) {
       heartbeatStopFlag = true;
-      setGoalSpeed(0, 0);
-      // leftCtrl(0);
-      // rightCtrl(0);
+      bot_stopMotors();
     }
   }
 }
@@ -499,6 +511,9 @@ void changeHeartBeatDelay(int inputCmd) {
 }
 
 void mm_settings(byte inputMain, byte inputModule) {
+  // Changing the chassis mode cannot leave the old PWM running behind an
+  // inactive PID path. Module-only changes retain their existing behaviour.
+  if (inputMain != mainType) bot_stopMotors();
   mainType = inputMain;
   moduleType = inputModule;
 

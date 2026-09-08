@@ -30,19 +30,21 @@ from typing import Annotated, Final, Literal
 
 from pydantic import Field
 from rover_contracts.config import BoxConfig, SttConfig
-from rover_contracts.ids import ULID_PATTERN, new_turn_id
+from rover_contracts.ids import ULID_PATTERN, new_cmd_id, new_turn_id
 from rover_contracts.messages import (
     FsmState,
     ResultDetail,
     ResultReason,
     ResultStatus,
     SkillCall,
-    SkillName,
+    SkillObs,
     StrictModel,
     UtteranceSource,
 )
+from rover_contracts.skills import FIND_BUDGET_S
 
 from rover_brain.filler import APOLOGY, BOX_LOST, completion_sentence, reason_sentence
+from rover_brain.router import is_stop
 from rover_brain.validate import MOTION_CAPABLE, authorized_motion
 
 __all__ = [
@@ -121,6 +123,7 @@ class SpeechEnd(StrictModel):
     """The VAD found A27's 400 ms of trailing silence."""
 
     type: Literal["speech_end"] = "speech_end"
+    listening_id: Ulid | None = None
 
 
 class Heard(StrictModel):
@@ -134,6 +137,24 @@ class Heard(StrictModel):
     text: str = Field(max_length=500)
     confidence: float | None = Field(default=None, ge=0.0, le=1.0)
     source: UtteranceSource = UtteranceSource.STT
+    listening_id: Ulid | None = None
+    """Present for a microphone callback; absent for public text input."""
+
+
+class RequestSkill(StrictModel):
+    """An explicit operator request; no transcript, router, or model call."""
+
+    type: Literal["request_skill"] = "request_skill"
+    request_id: Ulid
+    call: SkillCall
+    obs: SkillObs | None = None
+
+
+class CancelRequest(StrictModel):
+    """Cancel only this explicit request, never a newer instruction."""
+
+    type: Literal["cancel_request"] = "cancel_request"
+    request_id: Ulid
 
 
 class Planned(StrictModel):
@@ -143,6 +164,8 @@ class Planned(StrictModel):
     turn_id: Ulid
     call: SkillCall
     local: bool = False
+    obs: SkillObs | None = None
+    request_id: Ulid | None = None
 
 
 class PlanFailed(StrictModel):
@@ -157,6 +180,7 @@ class Spoke(StrictModel):
     """The sentence that was playing has finished."""
 
     type: Literal["spoke"] = "spoke"
+    speech_id: Ulid
 
 
 class Executed(StrictModel):
@@ -185,6 +209,7 @@ class BoxLost(StrictModel):
     """T3: three consecutive probe failures, inside A20's 3 s."""
 
     type: Literal["box_lost"] = "box_lost"
+    turn_id: Ulid | None = None
 
 
 class Timeout(StrictModel):
@@ -192,6 +217,7 @@ class Timeout(StrictModel):
 
     type: Literal["timeout"] = "timeout"
     state: FsmState
+    turn_id: Ulid | None = None
 
 
 BrainEvent = Annotated[
@@ -200,6 +226,8 @@ BrainEvent = Annotated[
     | PttEnd
     | SpeechEnd
     | Heard
+    | RequestSkill
+    | CancelRequest
     | Planned
     | PlanFailed
     | Spoke
@@ -235,6 +263,8 @@ class AnnounceTurn:
 @dataclass(frozen=True, slots=True)
 class StartListening:
     """Open the microphone."""
+
+    listening_id: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -285,6 +315,7 @@ class Speak:
 
     text: str
     kind: SpeechKind
+    speech_id: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -299,6 +330,8 @@ class Dispatch:
     call: SkillCall
     turn_id: str
     authorized_motion: bool
+    obs: SkillObs | None = None
+    request_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -313,6 +346,16 @@ class SendStop:
     """The stop-class bus message (5.2), which is never rejected."""
 
     reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class RequestResult:
+    """A terminal response to an explicit operator request on brain.sock."""
+
+    request_id: str
+    status: ResultStatus
+    reason: ResultReason = ResultReason.NONE
+    detail: ResultDetail | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -335,6 +378,7 @@ Action = (
     | Speak
     | CancelSpeech
     | Dispatch
+    | RequestResult
     | CancelDispatch
     | SendStop
     | Publish
@@ -398,13 +442,22 @@ class Fsm:
         self.state: FsmState = FsmState.IDLE
         self.turn_id: str | None = None
         self.authorized_motion = False
-        self.pending: SkillCall | None = None
+        self.pending: Dispatch | None = None
+        self.listening_id: str | None = None
+        self.speech_id: str | None = None
 
     # -- the runner's two questions ---------------------------------------
 
     @property
     def timeout_s(self) -> float | None:
         """How long the current state may last before a :class:`Timeout`."""
+        if (
+            self.state is FsmState.EXECUTING
+            and self.pending is not None
+            and self.pending.call.skill == "find"
+        ):
+            # find owns its 60-second deadline; allow completion speech afterward.
+            return FIND_BUDGET_S + self._timeouts.speaking
         return {
             FsmState.IDLE: None,
             FsmState.LISTENING: self._timeouts.listening,
@@ -417,14 +470,40 @@ class Fsm:
 
     def handle(self, event: BrainEvent) -> tuple[Action, ...]:
         """Apply one event.  The state is updated before the actions return."""
+        if (
+            isinstance(event, (Heard, SpeechEnd))
+            and event.listening_id is not None
+            and event.listening_id != self.listening_id
+        ):
+            return ()  # cancellation does not guarantee an adapter stopped
+        if isinstance(event, Spoke) and event.speech_id != self.speech_id:
+            return ()  # speech identity also covers STOP, which has no turn
         if isinstance(event, Stop):
             return self._on_stop(event.reason)
+        if isinstance(event, CancelRequest):
+            if self.pending is not None and self.pending.request_id == event.request_id:
+                return self._on_stop("request_cancel")
+            return ()
+        if isinstance(event, RequestSkill):
+            if event.call.skill == "stop":
+                return (
+                    self._on_stop("operator_stop")
+                    + (RequestResult(event.request_id, ResultStatus.DONE),)
+                    + self._speak_result(event.call.speech or "Stopping.")
+                )
+            return self._supersede(event)
+        if isinstance(event, Heard) and is_stop(event.text):
+            return self._on_stop("utterance_stop") + self._speak_result("Stopping.")
         if isinstance(event, Heard) and self.state in _BUSY:
             return self._supersede(event)
         if isinstance(event, BoxLost):
+            if event.turn_id is not None and not self._is_current(event.turn_id):
+                return ()
             return self._on_box_lost()
         if isinstance(event, Timeout):
-            if event.state is not self.state:
+            if event.state is not self.state or (
+                event.turn_id is not None and not self._is_current(event.turn_id)
+            ):
                 return ()  # a timer for a state we have already left
             return self._on_timeout()
         handler: _Handler = getattr(self, f"_in_{self.state.value.lower()}")
@@ -435,7 +514,9 @@ class Fsm:
     def _in_idle(self, event: BrainEvent) -> tuple[Action, ...]:
         if isinstance(event, (Wake, PttStart)):
             listening = self._enter(FsmState.LISTENING)
-            return self._begin_turn() + (StartListening(), listening)
+            actions = self._begin_turn()
+            self.listening_id = new_cmd_id()
+            return actions + (StartListening(self.listening_id), listening)
         if isinstance(event, Heard):
             return self._begin_turn() + self._plan(event)
         return ()
@@ -451,7 +532,10 @@ class Fsm:
 
     def _in_transcribing(self, event: BrainEvent) -> tuple[Action, ...]:
         if isinstance(event, Heard):
-            return self._plan(event)
+            # The recognizer has finished for a scoped callback. Public text
+            # can arrive while it is still finishing, so abandon it first.
+            cancel = (CancelListening(),) if event.listening_id is None else ()
+            return cancel + self._plan(event)
         return ()
 
     def _in_planning(self, event: BrainEvent) -> tuple[Action, ...]:
@@ -461,21 +545,31 @@ class Fsm:
             refusal = self._refuse(event.call)
             if refusal is not None:
                 return (StopFiller(),) + self._speak_result(reason_sentence(refusal))
-            self.pending = event.call
-            if event.call.skill == SkillName.STOP:
+            self.pending = Dispatch(
+                event.call,
+                event.turn_id,
+                self.authorized_motion,
+                event.obs,
+                event.request_id,
+            )
+            if event.call.skill == "stop":
                 # A stop is dispatched immediately and spoken afterwards: A31's
                 # dispatch-after-speech rule exists to keep the recognizer live
                 # while the wheels turn, and delaying a stop inverts it.
                 return (
-                    StopFiller(),
-                    SendStop("model_stop"),
-                ) + self._speak_result(event.call.speech or "Stopping.")
+                    (
+                        StopFiller(),
+                        SendStop("model_stop"),
+                    )
+                    + self._request_result(ResultStatus.DONE)
+                    + self._speak_result(event.call.speech or "Stopping.")
+                )
             if not event.call.speech:
-                return (StopFiller(),) + self._dispatch(event.call)
+                return (StopFiller(),) + self._dispatch()
             self.state = FsmState.SPEAKING_INTENT
             return (
                 StopFiller(),
-                Speak(event.call.speech, SpeechKind.INTENT),
+                self._speech(event.call.speech, SpeechKind.INTENT),
                 Publish(self.state),
             )
         if isinstance(event, PlanFailed):
@@ -486,7 +580,7 @@ class Fsm:
 
     def _in_speaking_intent(self, event: BrainEvent) -> tuple[Action, ...]:
         if isinstance(event, Spoke) and self.pending is not None:
-            return self._dispatch(self.pending)
+            return self._dispatch()
         return ()
 
     def _in_executing(self, event: BrainEvent) -> tuple[Action, ...]:
@@ -495,8 +589,10 @@ class Fsm:
                 return ()
             if event.status is ResultStatus.ACCEPTED:
                 return ()  # robotd acknowledges first and reports later
-            skill = self.pending.skill if self.pending is not None else None
-            return self._speak_result(
+            skill = self.pending.call.skill if self.pending is not None else None
+            return self._request_result(
+                event.status, event.reason, event.detail
+            ) + self._speak_result(
                 completion_sentence(
                     event.status, event.reason, skill=skill, detail=event.detail
                 )
@@ -514,10 +610,12 @@ class Fsm:
         """Mint the turn and announce it to robotd before any box call."""
         self.turn_id = self._mint()
         self.pending = None
+        self.listening_id = self.speech_id = None
         return (AnnounceTurn(self.turn_id),)
 
     def _plan(self, event: Heard) -> tuple[Action, ...]:
         assert self.turn_id is not None
+        self.listening_id = None
         self.authorized_motion = authorized_motion(
             event.text,
             event.confidence,
@@ -538,23 +636,27 @@ class Fsm:
             return ResultReason.UNAUTHORIZED_UTTERANCE
         return None
 
-    def _dispatch(self, call: SkillCall) -> tuple[Action, ...]:
-        assert self.turn_id is not None
+    def _dispatch(self) -> tuple[Action, ...]:
+        assert self.pending is not None
+        self.speech_id = None
         self.state = FsmState.EXECUTING
-        return (
-            Dispatch(call, self.turn_id, self.authorized_motion),
-            Publish(self.state),
-        )
+        return (self.pending, Publish(self.state))
 
     def _speak_result(self, sentence: str) -> tuple[Action, ...]:
         self.pending = None
+        self.listening_id = None
         self.state = FsmState.SPEAKING_RESULT
-        return (Speak(sentence, SpeechKind.RESULT), Publish(self.state))
+        return (self._speech(sentence, SpeechKind.RESULT), Publish(self.state))
+
+    def _speech(self, text: str, kind: SpeechKind) -> Speak:
+        self.speech_id = new_cmd_id()
+        return Speak(text, kind, self.speech_id)
 
     def _to_idle(self) -> tuple[Action, ...]:
         self.state = FsmState.IDLE
         self.turn_id = None
         self.pending = None
+        self.listening_id = self.speech_id = None
         self.authorized_motion = False
         return (Publish(self.state),)
 
@@ -564,6 +666,16 @@ class Fsm:
 
     def _is_current(self, turn_id: str) -> bool:
         return self.turn_id is not None and turn_id == self.turn_id
+
+    def _request_result(
+        self,
+        status: ResultStatus,
+        reason: ResultReason = ResultReason.NONE,
+        detail: ResultDetail | None = None,
+    ) -> tuple[Action, ...]:
+        if self.pending is None or self.pending.request_id is None:
+            return ()
+        return (RequestResult(self.pending.request_id, status, reason, detail),)
 
     # -- events every state answers ----------------------------------------
 
@@ -575,7 +687,8 @@ class Fsm:
         is the property.
         """
         actions: list[Action] = [SendStop(reason)]
-        if self.state is FsmState.LISTENING:
+        actions += self._request_result(ResultStatus.ABORTED)
+        if self.state in (FsmState.LISTENING, FsmState.TRANSCRIBING):
             actions.append(CancelListening())
         if self.state is FsmState.PLANNING:
             actions += [CancelPlan(), StopFiller()]
@@ -586,13 +699,16 @@ class Fsm:
         actions += self._to_idle()
         return tuple(actions)
 
-    def _supersede(self, event: Heard) -> tuple[Action, ...]:
+    def _supersede(self, event: Heard | RequestSkill) -> tuple[Action, ...]:
         """A new utterance advances the turn immediately (ARCHITECTURE 7).
 
         The ``turn`` message the new turn announces is what cancels the old
         turn's command at robotd; cancelling here only stops brain's own task.
         """
         actions: list[Action] = []
+        actions += self._request_result(ResultStatus.PREEMPTED)
+        if self.state in (FsmState.LISTENING, FsmState.TRANSCRIBING):
+            actions.append(CancelListening())
         if self.state is FsmState.PLANNING:
             actions += [CancelPlan(), StopFiller()]
         if self.state in (FsmState.SPEAKING_INTENT, FsmState.SPEAKING_RESULT):
@@ -600,7 +716,20 @@ class Fsm:
         if self.state is FsmState.EXECUTING:
             actions.append(CancelDispatch("superseded"))
         actions += self._begin_turn()
-        actions += self._plan(event)
+        if isinstance(event, RequestSkill):
+            self.authorized_motion = True
+            self.state = FsmState.PLANNING
+            assert self.turn_id is not None
+            actions += self._in_planning(
+                Planned(
+                    turn_id=self.turn_id,
+                    call=event.call,
+                    obs=event.obs,
+                    request_id=event.request_id,
+                )
+            )
+        else:
+            actions += self._plan(event)
         return tuple(actions)
 
     def _on_box_lost(self) -> tuple[Action, ...]:
@@ -618,16 +747,20 @@ class Fsm:
             ) + self._speak_result(BOX_LOST)
         if self.state is FsmState.EXECUTING:
             return (
-                CancelDispatch("box_lost"),
-                SendStop("box_lost"),
-            ) + self._speak_result(BOX_LOST)
+                (
+                    CancelDispatch("box_lost"),
+                    SendStop("box_lost"),
+                )
+                + self._request_result(ResultStatus.ABORTED, ResultReason.BOX_LOST)
+                + self._speak_result(BOX_LOST)
+            )
         return ()
 
     def _on_timeout(self) -> tuple[Action, ...]:
         if self.state is FsmState.LISTENING:
             return (CancelListening(),) + self._to_idle()
         if self.state is FsmState.TRANSCRIBING:
-            return self._speak_result(APOLOGY)
+            return (CancelListening(),) + self._speak_result(APOLOGY)
         if self.state is FsmState.PLANNING:
             # T3, or a box that never finished a sentence: second filler is
             # already playing, then the apology, then stop (ARCHITECTURE 7).
@@ -638,13 +771,21 @@ class Fsm:
             ) + self._speak_result(APOLOGY)
         if self.state is FsmState.SPEAKING_INTENT:
             # The sentence never finished, so the skill was never dispatched.
-            return (CancelSpeech(), SendStop("speech_timeout")) + self._to_idle()
+            return (
+                (CancelSpeech(), SendStop("speech_timeout"))
+                + self._request_result(ResultStatus.TIMEOUT)
+                + self._to_idle()
+            )
         if self.state is FsmState.EXECUTING:
             return (
-                CancelDispatch("deadline"),
-                SendStop("goal_deadline"),
-            ) + self._speak_result(
-                completion_sentence(ResultStatus.TIMEOUT, ResultReason.NONE)
+                (
+                    CancelDispatch("deadline"),
+                    SendStop("goal_deadline"),
+                )
+                + self._request_result(ResultStatus.TIMEOUT)
+                + self._speak_result(
+                    completion_sentence(ResultStatus.TIMEOUT, ResultReason.NONE)
+                )
             )
         if self.state is FsmState.SPEAKING_RESULT:
             return (CancelSpeech(),) + self._to_idle()

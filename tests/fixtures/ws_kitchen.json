@@ -1,16 +1,14 @@
 {
-  "pose_cm": {"x": 142, "y": -30},
   "heading_deg": 87,
   "battery_pct": 62,
   "obstacle_ahead": false,
   "front_range_cm": 120,
-  "front_at_max": false,
   "bumper": false,
   "moving": false,
-  "speed_cap_cms": 30,
+  "power_cap_pct": 30,
   "last_result": "done",
   "last_scene": "a kitchen, table on the left, doorway ahead",
-  "recently_seen": [{"label": "red mug", "where_deg": 40, "age_s": 94}],
-  "allowed_skills": ["drive", "turn", "stop", "say", "describe_scene", "find", "set_face"],
-  "motion_budget_left": {"path_cm": 110, "seconds": 9}
+  "recently_seen": [{"label": "red mug", "heading_deg": 40, "age_s": 94}],
+  "allowed_skills": ["drive_for", "turn_to", "stop", "say", "describe_scene", "find", "set_face"],
+  "motion_budget_left": {"seconds": 9}
 }

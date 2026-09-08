@@ -24,8 +24,9 @@ import logging
 import os
 import time
 from collections.abc import AsyncIterator, Coroutine, Sequence
+from dataclasses import replace
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any
 
 from rover_contracts.config import LimitsConfig, RobotConfig, SafetyConfig, load_config
 from rover_contracts.ids import new_cmd_id
@@ -33,6 +34,7 @@ from rover_contracts.jsonl import to_json_line
 from rover_contracts.messages import (
     BrainClientMessage,
     BrainServerMessage,
+    BrainSkillRequest,
     BusCap,
     CancelMessage,
     Face,
@@ -50,8 +52,6 @@ from rover_contracts.messages import (
     ResultStatus,
     SkillCall,
     SkillMessage,
-    SkillName,
-    SkillObs,
     Source,
     StateMessage,
     StopMessage,
@@ -77,6 +77,7 @@ from rover_brain.audio.vad import VadEvent, make_vad
 from rover_brain.audio.wake import make_wake
 from rover_brain.box import BoxClient, BoxError
 from rover_brain.box_probe import load_caps
+from rover_brain.bus import BrainBus
 from rover_brain.filler import FillerPlayer
 from rover_brain.prompt import build_world_state, system_sha256
 from rover_brain.router import RouterDefaults, route
@@ -86,6 +87,7 @@ from rover_brain.validate import (
     MOTION_CAPABLE,
     ValidationFailure,
     crosses_bus,
+    permit,
     power_clamped_to,
     refusal_reason,
     to_bus_message,
@@ -100,19 +102,6 @@ _RECONNECT_S = 1.0
 """Backoff between robotd bus reconnect attempts, matching rover_web's."""
 _ROBOTD_CONNECT_S = 5.0
 """How long startup waits for the first connection before carrying on."""
-
-
-class BrainSocket(Protocol):
-    """What :mod:`rover_brain.bus` serves on ``brain.sock`` (5.9).
-
-    It is constructed with the socket path and a callback taking one validated
-    ``BrainClientMessage``; ``serve()`` runs until cancelled and
-    ``broadcast()`` fans a ``face`` or ``fsm`` message out to every client.
-    """
-
-    async def serve(self) -> None: ...
-
-    async def broadcast(self, message: BrainServerMessage) -> None: ...
 
 
 # --------------------------------------------------------------------------
@@ -339,62 +328,72 @@ class RobotdClient:
 
 
 class FrameSource:
-    """Newest-only subscriber to ``frames.sock`` (5.3).
+    """Newest stills, with explicit main-plane capture for vision skills."""
 
-    v1 has no request channel to ``rover-cam`` -- the architecture defines
-    none, and cam MUST NOT talk to robotd -- so brain reads the newest ``still``
-    the camera has published and refuses to use one older than
-    ``[safety] obs_max_age_ms``.  Age is measured on ``frame_mono_ns``, the
-    only clock the freshness gate reads (I-23).
-    """
-
-    def __init__(self, path: str, *, max_age_ms: int) -> None:
+    def __init__(self, path: str, *, max_age_ms: int, main_size: tuple[int, int]) -> None:
         self._path = path
         self._max_age_ns = max_age_ms * 1_000_000
         self._latest: Still | None = None
+        self._main: Still | None = None
+        self._main_size = main_size
+        self._writer: asyncio.StreamWriter | None = None
         self._arrived = asyncio.Event()
 
     async def serve(self) -> None:
         while True:
             try:
-                reader, _ = await asyncio.open_unix_connection(self._path)
-            except OSError:
-                await asyncio.sleep(0.5)
-                continue
-            with contextlib.suppress(OSError, asyncio.IncompleteReadError):
+                reader, self._writer = await asyncio.open_unix_connection(self._path)
                 await self._read(reader)
+            except (OSError, ValueError, asyncio.IncompleteReadError) as exc:
+                log.warning("camera connection lost: %s", exc)
+            finally:
+                self._latest = self._main = None
+                if self._writer is not None:
+                    self._writer.close()
+                    with contextlib.suppress(OSError):
+                        await self._writer.wait_closed()
+                    self._writer = None
+            await asyncio.sleep(0.5)
 
     async def _read(self, reader: asyncio.StreamReader) -> None:
         while line := await reader.readline():
-            # A malformed header costs that frame and nothing else, the way
-            # BrainBus._read_lines already treats a malformed line.  Pydantic's
-            # ValidationError is a ValueError, not an OSError, so it used to
-            # propagate out of serve() -- and serve() is a member of BrainApp's
-            # TaskGroup, so one bad line from cam killed wake, VAD, STT, TTS and
-            # the whole conversational path, then restart-looped into it.
-            try:
-                header = FrameHeader.model_validate_json(line)
-                payload = await reader.readexactly(header.bytes)
-            except ValueError:
-                log.warning("dropping a frame with an unreadable header")
-                continue
+            # A bad header loses framing: its JPEG payload has unknown length.
+            # Reconnect instead of guessing where the next header starts.
+            header = FrameHeader.model_validate_json(line)
+            if header.bytes > 16 * 1024 * 1024:
+                raise ValueError("camera frame exceeds 16 MiB")
+            payload = await reader.readexactly(header.bytes)
             if header.kind == "still":
                 self._latest = Still(
                     header.frame_id, header.frame_mono_ns, payload, header.w, header.h
                 )
+                if (header.w, header.h) == self._main_size:
+                    self._main = self._latest
                 self._arrived.set()
 
     async def still(self, *, wide: bool = False) -> Still:
-        """The newest fresh still, waiting briefly for one to arrive."""
-        if self._fresh() is None:
-            self._arrived.clear()
-            with contextlib.suppress(TimeoutError):
-                async with asyncio.timeout(1.0):
+        """Use a fresh still; wide requests a new main-plane capture."""
+        requested_ns = 0
+        if wide:
+            if self._writer is None:
+                raise LookupError("camera is disconnected")
+            requested_ns = time.monotonic_ns()
+            self._writer.write(b'{"type":"still","plane":"main"}\n')
+            await self._writer.drain()
+        with contextlib.suppress(TimeoutError):
+            async with asyncio.timeout(1.0):
+                while True:
+                    self._arrived.clear()
+                    frame = self._main if wide else self._latest
+                    if frame is not None:
+                        age = time.monotonic_ns() - frame.frame_mono_ns
+                        if (
+                            0 <= age <= self._max_age_ns
+                            and frame.frame_mono_ns >= requested_ns
+                        ):
+                            return frame
                     await self._arrived.wait()
-        frame = self._fresh()
-        if frame is None:
-            raise LookupError("no still within obs_max_age_ms")
-        return frame
+        raise LookupError("no requested still within obs_max_age_ms")
 
     def latest(self) -> Still | None:
         """The newest fresh still, or ``None``: a planning call without an
@@ -406,7 +405,7 @@ class FrameSource:
         if frame is None:
             return None
         age = time.monotonic_ns() - frame.frame_mono_ns
-        return frame if age <= self._max_age_ns else None
+        return frame if 0 <= age <= self._max_age_ns else None
 
 
 # --------------------------------------------------------------------------
@@ -420,12 +419,18 @@ class BrainApp:
     def __init__(self, config: RobotConfig, *, root: Path = Path(".")) -> None:
         self.config = config
         self.events: asyncio.Queue[F.BrainEvent] = asyncio.Queue()
-        self.fsm = F.Fsm(
-            stt=config.stt, timeouts=F.Timeouts.from_config(config.box)
-        )
+        self.fsm = F.Fsm(stt=config.stt, timeouts=F.Timeouts.from_config(config.box))
         self.robotd = RobotdClient(config.bus.sock, ping_hz=config.bus.client_ping_hz)
+        main_size = (config.camera.main[0], config.camera.main[1])
+        if config.camera.backend == "fake" and config.camera.fake_still:
+            from rover_cam.fake_backend import jpeg_size
+
+            # The fixture backend serves its JPEG verbatim on either plane.
+            main_size = jpeg_size(Path(config.camera.fake_still).read_bytes())
         self.frames = FrameSource(
-            config.bus.frames_sock, max_age_ms=config.safety.obs_max_age_ms
+            config.bus.frames_sock,
+            max_age_ms=config.safety.obs_max_age_ms,
+            main_size=main_size,
         )
         self.scene = SceneRing(Path(config.log.dir) / "scene.jsonl")
         self.tts = make_tts(
@@ -446,14 +451,13 @@ class BrainApp:
             tts=self.tts,
             box=self.box,
             stills=self.frames,
-            motion=_BusTurns(self),
             scene=self.scene,
             face=self._publish_face,
             hfov_deg=config.camera.hfov_deg,
             heading_deg=lambda: self.robotd.heading_deg,
         )
         self._router_defaults = RouterDefaults.from_limits(config.limits)
-        self._bus: BrainSocket | None = None
+        self._bus: BrainBus | None = None
         self._tasks: dict[str, asyncio.Task[Any]] = {}
         self._timer: asyncio.Task[None] | None = None
         self._active_cmd: str | None = None
@@ -465,8 +469,6 @@ class BrainApp:
 
     async def run(self) -> None:
         """Connect everything and pump the event queue until cancelled."""
-        from rover_brain.bus import BrainBus  # serves brain.sock (5.9)
-
         self._bus = BrainBus(self.config.bus.brain_sock, self._on_bus_message)
         # 4.6: brain probes the box at boot.  It is also where the OpenAI
         # client's first-call cost is paid -- lazy submodule imports and the TLS
@@ -488,13 +490,24 @@ class BrainApp:
     async def _pump(self) -> None:
         while True:
             event = await self.events.get()
+            before = (self.fsm.state, self.fsm.turn_id)
             for action in self.fsm.handle(event):
                 await self._perform(action)
-            self._arm_timer()
+            if before != (self.fsm.state, self.fsm.turn_id):
+                self._arm_timer()
 
     def _on_bus_message(self, message: BrainClientMessage) -> None:
         """Everything that arrives on brain.sock, mapped onto one FSM event."""
-        if isinstance(message, UtteranceMessage):
+        if isinstance(message, BrainSkillRequest):
+            frame = self.frames.latest()
+            self.post(
+                F.RequestSkill(
+                    request_id=message.request_id,
+                    call=message.call,
+                    obs=frame.obs if frame is not None else None,
+                )
+            )
+        elif isinstance(message, UtteranceMessage):
             if message.is_final:
                 log.info(
                     "utterance: %s",
@@ -512,7 +525,10 @@ class BrainApp:
         elif isinstance(message, PttEndMessage):
             self.post(F.PttEnd())
         else:  # cancel
-            self.post(F.Stop(reason="bus_cancel"))
+            if message.request_id is not None:
+                self.post(F.CancelRequest(request_id=message.request_id))
+            else:
+                self.post(F.Stop(reason="bus_cancel"))
 
     def post(self, event: F.BrainEvent) -> None:
         self.events.put_nowait(event)
@@ -538,10 +554,11 @@ class BrainApp:
         if seconds is None:
             return
         state = self.fsm.state
+        turn_id = self.fsm.turn_id
 
         async def fire() -> None:
             await asyncio.sleep(seconds)
-            self.post(F.Timeout(state=state))
+            self.post(F.Timeout(state=state, turn_id=turn_id))
 
         self._timer = asyncio.create_task(fire())
 
@@ -560,9 +577,9 @@ class BrainApp:
         match action:
             case F.AnnounceTurn(turn_id=turn_id):
                 await self.robotd.announce_turn(turn_id)
-            case F.StartListening():
+            case F.StartListening(listening_id=listening_id):
                 await self.capture.start()
-                self._spawn("listen", self._listen())
+                self._spawn("listen", self._listen(listening_id))
             case F.StopListening():
                 # The recogniser keeps running on what it already heard; the
                 # frame stream ends, so it finishes on its own.
@@ -570,8 +587,8 @@ class BrainApp:
             case F.CancelListening():
                 self._cancel_task("listen")
                 await self.capture.stop()
-            case F.StartPlanning(text=text, turn_id=turn_id):
-                self._spawn("plan", self._plan(text, turn_id))
+            case F.StartPlanning():
+                self._spawn("plan", self._plan(action))
             case F.CancelPlan():
                 self._cancel_task("plan")
             case F.PlayAck():
@@ -580,18 +597,30 @@ class BrainApp:
                 self.filler.start_waiting()
             case F.StopFiller():
                 self.filler.stop()
-            case F.Speak(text=text):
-                self._spawn("speak", self._speak(text))
+            case F.Speak(text=text, speech_id=speech_id):
+                self._spawn("speak", self._speak(text, speech_id))
             case F.CancelSpeech():
                 self._cancel_task("speak")
-            case F.Dispatch(call=call, turn_id=turn_id):
-                self._spawn("execute", self._execute(call, turn_id))
+            case F.Dispatch():
+                self._spawn("execute", self._execute(action))
             case F.CancelDispatch(reason=reason):
                 self._cancel_task("execute")
                 await self.robotd.cancel(self._active_cmd, reason)
             case F.SendStop(reason=reason):
                 self._cancel_task("execute")
                 await self.robotd.stop(reason)
+            case F.RequestResult(
+                request_id=request_id, status=status, reason=reason, detail=detail
+            ):
+                await self._broadcast(
+                    ResultMessage(
+                        cmd_id=request_id,
+                        status=status,
+                        reason=reason,
+                        detail=detail,
+                        t_utc_ns=time.time_ns(),
+                    )
+                )
             case F.Publish(state=state):
                 # The wake word may own the microphone only while nothing else
                 # does: one reader of the ring at a time.
@@ -601,43 +630,54 @@ class BrainApp:
                     self._idle.clear()
                 await self._broadcast(FsmMessage(state=state))
 
-    async def _listen(self) -> None:
+    async def _listen(self, listening_id: str) -> None:
         """Feed the detector and the recogniser from one capture."""
         frames = self.capture.frames()
 
         async def tapped() -> AsyncIterator[bytes]:
             async for frame in frames:
                 if self.vad.accept(frame) is VadEvent.SPEECH_END:
-                    self.post(F.SpeechEnd())
+                    self.post(F.SpeechEnd(listening_id=listening_id))
                 yield frame
 
         transcript = await self.stt.transcribe(tapped())
         if transcript.text:
-            self.post(F.Heard(text=transcript.text, confidence=transcript.confidence))
+            self.post(
+                F.Heard(
+                    text=transcript.text,
+                    confidence=transcript.confidence,
+                    listening_id=listening_id,
+                )
+            )
 
-    async def _plan(self, text: str, turn_id: str) -> None:
+    async def _plan(self, instruction: F.StartPlanning) -> None:
         """The local router first, then the box.  A dead box still answers
         stop, forward, back, left, right, turn around and look (4.6)."""
-        world = self._world_state()
+        text, turn_id = instruction.text, instruction.turn_id
+        world = self._world_state(instruction.authorized_motion)
+        frame = self.frames.latest()
+        obs = frame.obs if frame is not None else None
         local = route(text, world, self._router_defaults)
         if local is not None:
-            self._log_plan(local, origin="router")
-            self.post(F.Planned(turn_id=turn_id, call=local, local=True))
+            self._log_plan(
+                local, origin="router", authorized=instruction.authorized_motion
+            )
+            self.post(F.Planned(turn_id=turn_id, call=local, local=True, obs=obs))
             return
         try:
             plan = await self.box.plan(
                 world=world,
                 utterance=text,
-                image_jpeg=self._image(),
+                image_jpeg=frame.jpeg if frame is not None else None,
             )
         except BoxError as exc:
             log.warning("plan failed: %s (%s)", exc.detail, exc.reason)
             self.post(F.PlanFailed(turn_id=turn_id, reason=exc.reason[:64]))
             return
-        self._log_plan(plan.call, origin="box")
-        self.post(F.Planned(turn_id=turn_id, call=plan.call))
+        self._log_plan(plan.call, origin="box", authorized=instruction.authorized_motion)
+        self.post(F.Planned(turn_id=turn_id, call=plan.call, obs=obs))
 
-    def _log_plan(self, call: SkillCall, *, origin: str) -> None:
+    def _log_plan(self, call: SkillCall, *, origin: str, authorized: bool) -> None:
         """One line per proposed skill, after ``validate_output`` and before any
         dispatch, so `make sim` shows what the model asked for beside what the
         validator allowed."""
@@ -649,25 +689,34 @@ class BrainApp:
                     "skill": str(call.skill),
                     "args": call.args.model_dump(mode="json"),
                     "speech": call.speech,
-                    "authorized_motion": self.fsm.authorized_motion,
+                    "authorized_motion": authorized,
                 }
             ),
         )
 
-    async def _speak(self, text: str) -> None:
+    async def _speak(self, text: str, speech_id: str) -> None:
         log.info("speak: %s", json.dumps({"text": text}))
         await self.tts.speak(text)
-        self.post(F.Spoke())
+        self.post(F.Spoke(speech_id=speech_id))
 
-    async def _execute(self, call: SkillCall, turn_id: str) -> None:
+    async def _execute(self, instruction: F.Dispatch) -> None:
         """Run one call and report exactly one :class:`~rover_brain.fsm.Executed`."""
+        call, turn_id = instruction.call, instruction.turn_id
         status, reason = ResultStatus.DONE, ResultReason.NONE
         detail: ResultDetail | None = None
-        if call.skill in MOTION_CAPABLE:
-            self._spawn("box_watch", self._watch_box())
+        watch: asyncio.Task[None] | None = None
         try:
-            if crosses_bus(call):
-                result = await self.dispatch_bus(call, turn_id)
+            refusal = permit(
+                call, authorized=instruction.authorized_motion, limits=self.config.limits
+            )
+            if refusal is None and call.skill in MOTION_CAPABLE:
+                watch = asyncio.create_task(self._watch_box(turn_id))
+            if call.skill == "stop":
+                await self.robotd.stop("operator_stop")
+            elif refusal is not None:
+                status, reason = ResultStatus.REJECTED, refusal
+            elif crosses_bus(call):
+                result = await self.dispatch_bus(instruction)
                 status, reason, detail = result.status, result.reason, result.detail
                 if status is ResultStatus.ACCEPTED:
                     # Only a non-motion skill can still be `accepted` here --
@@ -677,14 +726,18 @@ class BrainApp:
                     # brain owns the completion that follows.
                     status = ResultStatus.DONE
                 if status is ResultStatus.DONE:
-                    if call.skill == SkillName.SAY:
+                    if call.skill == "say":
                         await self.local.say(call.args.text)
-                    elif call.skill == SkillName.DESCRIBE_SCENE:
+                    elif call.skill == "describe_scene":
                         await self.local.describe_scene()
-            elif call.skill == SkillName.SET_FACE:
+            elif call.skill == "set_face":
                 await self.local.set_face(Face(call.args.expr))
-            elif call.skill == SkillName.FIND:
-                outcome = await self.local.find(call.args.object, call.args.max_sweeps)
+            elif call.skill == "find":
+                outcome = await self.local.find(
+                    call.args.object,
+                    call.args.max_sweeps,
+                    motion=_BusTurns(self, instruction),
+                )
                 reason = outcome.reason
                 status = ResultStatus.DONE if outcome.found else ResultStatus.ABORTED
                 await self.local.say(
@@ -692,6 +745,9 @@ class BrainApp:
                     if outcome.found
                     else f"I couldn't find the {call.args.object}."
                 )
+        except TimeoutError:
+            await self.robotd.stop("find_deadline")
+            status, reason = ResultStatus.TIMEOUT, ResultReason.NONE
         except BoxError as exc:
             log.warning("execute failed: %s", exc.detail)
             status, reason = ResultStatus.ABORTED, ResultReason.BOX_LOST
@@ -704,8 +760,8 @@ class BrainApp:
             log.warning("execute refused: %s", exc.detail)
             status, reason = ResultStatus.REJECTED, refusal_reason(exc)
         finally:
-            self._cancel_task("box_watch")
-            self._active_cmd = None
+            if watch is not None:
+                watch.cancel()
         self._last_result = status
         log.info(
             "executed: %s",
@@ -717,36 +773,42 @@ class BrainApp:
             F.Executed(turn_id=turn_id, status=status, reason=reason, detail=detail)
         )
 
-    async def _watch_box(self) -> None:
+    async def _watch_box(self, turn_id: str) -> None:
         """T3, and only while a brain-owned motion command is active, so it
         costs nothing at idle.
 
-        Three consecutive failures of a probe every ``health_probe_s`` is
-        2.4 s, inside A20's 3 s.  Teleop is exempt by construction: it never
-        reaches this process.
+        Start probes on a monotonic cadence, including their execution time.
+        The default three 0.8 s timeouts take about 2.4 s, not three sleeps
+        plus three timeouts. Teleop never reaches this process.
         """
         failures = 0
+        loop = asyncio.get_running_loop()
+        next_probe = loop.time()
         while failures < self.config.box.health_probe_fails:
-            await asyncio.sleep(self.config.box.health_probe_s)
+            await asyncio.sleep(max(0.0, next_probe - loop.time()))
             failures = 0 if await self.box.probe() else failures + 1
-        self.post(F.BoxLost())
+            next_probe += self.config.box.health_probe_s
+        self.post(F.BoxLost(turn_id=turn_id))
 
-    async def dispatch_bus(self, call: SkillCall, turn_id: str) -> ResultMessage:
-        frame = self.frames.latest()
+    async def dispatch_bus(self, instruction: F.Dispatch) -> ResultMessage:
+        call = instruction.call
+        obs = instruction.obs
+        if call.skill in MOTION_SKILLS:
+            age_ns = time.monotonic_ns() - obs.frame_mono_ns if obs else -1
+            if not 0 <= age_ns <= self.config.safety.obs_max_age_ms * 1_000_000:
+                raise LookupError(
+                    "planning observation is missing, stale, or from the future"
+                )
         clamped = power_clamped_to(call, self.config.limits)
         message = to_bus_message(
             call,
             cmd_id=new_cmd_id(),
-            turn_id=turn_id,
+            turn_id=instruction.turn_id,
             seq=self.robotd.next_seq(),
             issued_mono_ns=time.monotonic_ns(),
             limits=self.config.limits,
-            authorized=self.fsm.authorized_motion,
-            obs=(
-                SkillObs(frame_id=frame.frame_id, frame_mono_ns=frame.frame_mono_ns)
-                if frame is not None
-                else None
-            ),
+            authorized=instruction.authorized_motion,
+            obs=obs,
             model=self.config.box.model,
             prompt_sha256=system_sha256(),
         )
@@ -765,7 +827,11 @@ class BrainApp:
                 }
             ),
         )
-        result = await self.robotd.run(message)
+        try:
+            result = await self.robotd.run(message)
+        finally:
+            if self._active_cmd == message.cmd_id:
+                self._active_cmd = None
         if (
             clamped is not None
             and result.status is ResultStatus.DONE
@@ -801,16 +867,12 @@ class BrainApp:
 
     # -- the world the model sees -----------------------------------------
 
-    def _image(self) -> bytes | None:
-        frame = self.frames.latest()
-        return frame.jpeg if frame is not None else None
-
-    def _world_state(self) -> WorldState:
+    def _world_state(self, authorized: bool) -> WorldState:
         return world_from_state(
             self.robotd.state,
             limits=self.config.limits,
             safety=self.config.safety,
-            allow_motion=self.fsm.authorized_motion,
+            allow_motion=authorized,
             last_result=self._last_result,
             last_scene=self.scene.last_scene,
             recently_seen=self.scene.recently_seen(),
@@ -874,19 +936,21 @@ class _BusTurns:
     """``find``'s motion primitive: a ``turn_to`` skill on the current turn id,
     so every sweep after the first is exempt from ``motion_cooldown_ms``."""
 
-    def __init__(self, app: BrainApp) -> None:
+    def __init__(self, app: BrainApp, instruction: F.Dispatch) -> None:
         self._app = app
+        self._instruction = instruction
 
-    async def turn_to(self, heading_deg: int) -> tuple[ResultStatus, ResultReason]:
-        turn_id = self._app.fsm.turn_id
-        if turn_id is None:
-            return ResultStatus.ABORTED, ResultReason.STALE_TURN
+    async def turn_to(
+        self, heading_deg: int, *, observation: Still
+    ) -> tuple[ResultStatus, ResultReason]:
         call = TurnToCall(
             speech="",
             skill="turn_to",
             args=TurnToArgs(heading_deg=int(heading_deg) % 360),
         )
-        result = await self._app.dispatch_bus(call, turn_id)
+        result = await self._app.dispatch_bus(
+            replace(self._instruction, call=call, obs=observation.obs)
+        )
         return result.status, result.reason
 
 

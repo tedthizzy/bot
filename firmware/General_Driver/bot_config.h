@@ -24,6 +24,12 @@
 // nothing on the wire can weaken it.
 #define BOT_HEARTBEAT_MS 300
 
+// Bound incoming lines, per-poll work, and commands queued during vendor waits.
+// Oversized lines are discarded through LF. A full wait queue drops new lines.
+#define BOT_SERIAL_LINE_MAX 512
+#define BOT_SERIAL_BYTES_PER_POLL 128
+#define BOT_SERIAL_PENDING_LINES 4
+
 // --- power cap -----------------------------------------------------------
 // Speed units are Waveshare's: full scale +-0.5, multiplied by 512 into an
 // 8-bit duty. 0.30 is 60 percent duty on the TB6612. setGoalSpeed() clamps its

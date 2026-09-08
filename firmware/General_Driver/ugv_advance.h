@@ -1,12 +1,12 @@
 // advance funcs for RoArm-M2 ctrl
 // place holder.
-void jsonCmdReceiveHandler();
+void jsonCmdReceiveHandler(uint32_t receivedAt = millis());
 bool moveToStep(String inputName, int inputStepNum);
 
 
 // mission abort after serial received anything.
 bool serialMissionAbort() {
-	if (Serial.available()) {
+	if (Serial.available() || bot_pendingSerial() || bot_waitStopped) {
 		if (InfoPrint == 1) {Serial.println("[missionPlay abort.]");}
 		return true;
 	} else {
@@ -48,6 +48,7 @@ int missionContent(String inputName) {
 
 	int _LineNum = 0;
 	while (file.available()) {
+		bot_serviceSafety();
 		_LineNum++;
 		String line = file.readStringUntil('\n');
 		Serial.print("[StepNum: ");Serial.print(_LineNum);Serial.print(" ] - ");
@@ -222,6 +223,7 @@ void deleteStep(String inputName, int inputStepNum) {
 // it will process the cmd.
 bool moveToStep(String inputName, int inputStepNum) {
 	String stepStringBuffer = readSingleLine(inputName + ".mission", inputStepNum + 1);
+	if (bot_waitStopped) return false;  // bot: a stop during file I/O cancels this step
 	DeserializationError err = deserializeJson(jsonCmdReceive, stepStringBuffer);
 	if (err == DeserializationError::Ok) {
 		if (InfoPrint == 1) {
@@ -251,9 +253,12 @@ bool moveToStep(String inputName, int inputStepNum) {
 // when repeatTimes = -1, it will loop forever.
 // play a mission file.
 void missionPlay(String inputName, int repeatTimes) {
+	bot_waitStopped = false;
 	int _LineNum = missionContent(inputName);
 	int currentTimes = 0;
 	while (1) {
+		bot_serviceSafety();
+		if (serialMissionAbort()) return;
 		currentTimes++;
 		if (currentTimes > repeatTimes && repeatTimes != -1) {
 			if (InfoPrint == 1) {Serial.println("[missionPlay finished.]");}
@@ -265,6 +270,7 @@ void missionPlay(String inputName, int repeatTimes) {
 		}
 
 		for (int i = 1; i<=_LineNum; i++) {
+			bot_serviceSafety();
 			if (serialMissionAbort()) {
 				return;
 			}

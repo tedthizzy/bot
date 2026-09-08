@@ -15,6 +15,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "packages"))
 
+from rover_brain.main import BrainApp, FrameSource  # noqa: E402
 from rover_cam.fake_backend import FakeBackend, jpeg_size  # noqa: E402
 from rover_cam.publisher import (  # noqa: E402
     CapturedFrame,
@@ -22,10 +23,87 @@ from rover_cam.publisher import (  # noqa: E402
     _Subscriber,
     run,
 )
-from rover_contracts.config import BusConfig, CameraConfig, RobotConfig  # noqa: E402
+from rover_contracts.config import (  # noqa: E402
+    BusConfig,
+    CameraConfig,
+    RobotConfig,
+    TtsConfig,
+)
 from rover_contracts.messages import FrameHeader, FrameKind  # noqa: E402
 
 CAMERA = CameraConfig(backend="fake")
+
+
+@pytest.mark.parametrize("fixture", [False, True])
+async def test_brain_requests_a_new_main_still_and_closes_its_subscription(
+    monkeypatch, fixture
+):
+    backend = FakeBackend(CAMERA)
+    requested = []
+    with tempfile.TemporaryDirectory(prefix="cam-", dir="/tmp") as temp:
+        path = str(Path(temp) / "frames.sock")
+        camera = CAMERA
+        expected_size = tuple(CAMERA.main)
+        expected_jpeg = None
+        if fixture:
+            expected_jpeg = backend.capture_still("lores").jpeg
+            fixture_path = Path(temp) / "fixture.jpg"
+            fixture_path.write_bytes(expected_jpeg)
+            camera = CAMERA.model_copy(update={"fake_still": str(fixture_path)})
+            backend = FakeBackend(camera, still_path=fixture_path)
+            expected_size = jpeg_size(expected_jpeg)
+            assert expected_size != tuple(CAMERA.main)
+
+        def capture(plane):
+            requested.append(plane)
+            publisher.publish(backend.capture_still(plane))
+
+        publisher = FramePublisher(path, on_request=capture)
+        # Construct the production frame source without opening a box client.
+        monkeypatch.setattr("rover_brain.main.BoxClient", lambda *a, **kw: None)
+        config = RobotConfig(
+            camera=camera,
+            bus=BusConfig(frames_sock=path),
+            tts=TtsConfig(backend="null"),
+        )
+        source = BrainApp(config, root=Path(temp)).frames
+        await publisher.start()
+        task = asyncio.create_task(source.serve())
+        try:
+            async with asyncio.timeout(2):
+                while not publisher.subscriber_count:
+                    await asyncio.sleep(0.001)
+            publisher.publish(backend.capture_still("lores"))
+            lores = await source.still()
+            before = time.monotonic_ns()
+            main = await source.still(wide=True)
+            assert requested == ["main"]
+            assert (main.w, main.h) == expected_size
+            if fixture:
+                assert main.jpeg == expected_jpeg
+            assert main.frame_mono_ns >= before
+            assert main.frame_id != lores.frame_id
+            assert main.obs.frame_id == main.frame_id
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            async with asyncio.timeout(2):
+                while publisher.subscriber_count:
+                    await asyncio.sleep(0.001)
+            await publisher.close()
+        assert source.latest() is None
+
+
+@pytest.mark.parametrize("header", [b"bad-header\n", b'{"bytes":999999999}\n'])
+async def test_brain_rejects_unknown_frame_boundaries(header):
+    source = FrameSource("unused", max_age_ms=1000, main_size=tuple(CAMERA.main))
+    reader = asyncio.StreamReader()
+    reader.feed_data(header + b"unframed JPEG data")
+    reader.feed_eof()
+    with pytest.raises(ValueError):
+        await source._read(reader)
+    assert source.latest() is None
 
 
 # --------------------------------------------------------------------------

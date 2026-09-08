@@ -8,6 +8,7 @@ installed on the machine running the tests.
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import pty
@@ -40,7 +41,9 @@ from rover_devtools.doctor import (  # noqa: E402
 )
 
 ABSENT = Dependency(
-    "rover_definitely_not_installed", "a module that cannot exist", True,
+    "rover_definitely_not_installed",
+    "a module that cannot exist",
+    True,
     "uv pip install -e .",
 )
 ABSENT_OPTIONAL = Dependency(
@@ -64,6 +67,29 @@ def named(checks: list[Check], name: str) -> Check:
     matches = [check for check in checks if check.name == name]
     assert matches, f"no check named {name!r} in {[c.name for c in checks]}"
     return matches[0]
+
+
+@pytest.mark.parametrize("key", [None, "test-doctor-credential"])
+def test_box_probe_uses_configured_credentials_without_reporting_them(
+    key: str | None,
+    monkeypatch: pytest.MonkeyPatch,
+    quiet_host: Path,
+) -> None:
+    config = RobotConfig()
+    monkeypatch.delenv(config.box.api_key_env, raising=False)
+    if key:
+        monkeypatch.setenv(config.box.api_key_env, key)
+
+    def respond(request, *, timeout):
+        assert timeout == 2.0
+        assert request.full_url == config.box.url.rstrip("/") + "/models"
+        assert request.get_header("Authorization") == (f"Bearer {key}" if key else None)
+        return io.BytesIO(json.dumps({"data": [{"id": config.box.model}]}).encode())
+
+    monkeypatch.setattr(doctor.urllib.request, "urlopen", respond)
+    checks = doctor._box_check(config, probe=True)
+    assert named(checks, "box").status == OK
+    assert not key or key not in repr(checks)
 
 
 # --------------------------------------------------------------------------

@@ -1,0 +1,609 @@
+diff -ruN a/General_Driver/General_Driver.ino b/General_Driver/General_Driver.ino
+--- a/General_Driver/General_Driver.ino	2026-09-07 22:46:06
++++ b/General_Driver/General_Driver.ino	2026-09-07 22:12:29
+@@ -32,6 +32,7 @@
+ 
+ // config for ugv.
+ #include "ugv_config.h"
++#include "bot_runtime.h"
+ 
+ // functions for the leds of UGV.
+ #include "ugv_led_ctrl.h"
+@@ -264,6 +265,7 @@
+ 
+ 
+ void loop() {
++  heartBeatCtrl();  // bot: use the clock directly, before command processing
+   serialCtrl();
+ #if BOT_WIFI_ENABLED
+   server.handleClient();
+diff -ruN a/General_Driver/RoArm-M2_module.h b/General_Driver/RoArm-M2_module.h
+--- a/General_Driver/RoArm-M2_module.h	2025-11-27 20:54:04
++++ b/General_Driver/RoArm-M2_module.h	2026-09-07 22:13:10
+@@ -160,7 +160,7 @@
+       break;
+     }
+     getFeedback(InputID, true);
+-    delay(10);
++    bot_delayMillis(10);
+   }
+ }
+ 
+@@ -231,7 +231,7 @@
+   waitMove2Goal(SHOULDER_DRIVING_SERVO_ID, ARM_SERVO_MIDDLE_POS, 30);
+ 
+   // wait for the jitter to go away.
+-  delay(1200);
++  bot_delayMillis(1200);
+ 
+   // set the position as the middle of the SHOULDER_DRIVEN_SERVO.
+   if(InfoPrint == 1){Serial.println("Set this pos as the middle pos for SHOULDER_DRIVEN_SERVO.");}
+@@ -240,7 +240,7 @@
+   // SHOULDER_DRIVEN_SERVO starts producing torque.
+   if(InfoPrint == 1){Serial.println("SHOULDER_DRIVEN_SERVO starts producing torque.");}
+   servoTorqueCtrl(SHOULDER_DRIVEN_SERVO_ID, 1);
+-  delay(10);
++  bot_delayMillis(10);
+ 
+   // move ELBOW_SERVO to middle position.
+   if(InfoPrint == 1){Serial.println("Moving ELBOW_SERVO to middle position.");}
+@@ -250,7 +250,7 @@
+   if(InfoPrint == 1){Serial.println("Moving GRIPPER_SERVO to middle position.");}
+   st.WritePosEx(GRIPPER_SERVO_ID, ARM_SERVO_MIDDLE_POS, ARM_SERVO_INIT_SPEED, ARM_SERVO_INIT_ACC);
+ 
+-  delay(1000);
++  bot_delayMillis(1000);
+ }
+ 
+ 
+@@ -419,16 +419,16 @@
+   RoArmM2_baseJointCtrlRad(1, 0, 500, 20);
+   waitMove2Goal(BASE_SERVO_ID, goalPos[0], 20);
+ 
+-  delay(1000);
++  bot_delayMillis(1000);
+ 
+   RoArmM2_baseJointCtrlRad(1, -radInput, 500, 20);
+   waitMove2Goal(BASE_SERVO_ID, goalPos[0], 20);
+ 
+-  delay(1000);
++  bot_delayMillis(1000);
+ 
+   setMiddlePos(BASE_SERVO_ID);
+ 
+-  delay(5);
++  bot_delayMillis(5);
+ }
+ 
+ 
+@@ -845,7 +845,7 @@
+       bufferLastT = bufferT;
+     }
+     RoArmM2_goalPosMove();
+-    delay(2);
++    bot_delayMillis(2);
+   }
+   RoArmM2_baseCoordinateCtrl(goalX, goalY, goalZ, goalT);
+   RoArmM2_goalPosMove();
+@@ -914,7 +914,8 @@
+ 
+ // delay cmd.
+ void RoArmM2_delayMillis(int inputTime) {
+-  delay(inputTime);
++  // bot: retain the pause, but keep heartbeat, sensors and urgent stops live.
++  if (inputTime > 0) bot_delayMillis((uint32_t)inputTime);
+ }
+ 
+ 
+@@ -1300,4 +1301,4 @@
+ //     RoArmM2_goalPosMove();
+ //     delay(3);
+ //   }
+-// }
+\ No newline at end of file
++// }
+diff -ruN a/General_Driver/bot_config.h b/General_Driver/bot_config.h
+--- a/General_Driver/bot_config.h	2026-09-07 22:46:06
++++ b/General_Driver/bot_config.h	2026-09-07 22:12:29
+@@ -24,6 +24,12 @@
+ // nothing on the wire can weaken it.
+ #define BOT_HEARTBEAT_MS 300
+ 
++// Bound incoming lines, per-poll work, and commands queued during vendor waits.
++// Oversized lines are discarded through LF. A full wait queue drops new lines.
++#define BOT_SERIAL_LINE_MAX 512
++#define BOT_SERIAL_BYTES_PER_POLL 128
++#define BOT_SERIAL_PENDING_LINES 4
++
+ // --- power cap -----------------------------------------------------------
+ // Speed units are Waveshare's: full scale +-0.5, multiplied by 512 into an
+ // 8-bit duty. 0.30 is 60 percent duty on the TB6612. setGoalSpeed() clamps its
+diff -ruN a/General_Driver/bot_runtime.h b/General_Driver/bot_runtime.h
+--- a/General_Driver/bot_runtime.h	1969-12-31 18:00:00
++++ b/General_Driver/bot_runtime.h	2026-09-07 22:44:10
+@@ -0,0 +1,77 @@
++// Bounded serial intake shared by the normal loop and cooperative vendor waits.
++#ifndef BOT_RUNTIME_H
++#define BOT_RUNTIME_H
++
++#include <stddef.h>
++#include <stdint.h>
++#include <string.h>
++#include "bot_config.h"
++
++class BotSerialInput {
++ public:
++  // At most one complete line and BOT_SERIAL_BYTES_PER_POLL bytes per call.
++  template <class Port, class Handler>
++  void poll(Port& port, Handler handle) {
++    for (size_t n = 0; n < BOT_SERIAL_BYTES_PER_POLL && port.available(); ++n) {
++      char ch = port.read();
++      if (ch == '\n') {
++        if (discarding_) {
++          ++dropped;
++        } else {
++          if (used_ && line_[used_ - 1] == '\r') --used_;
++          line_[used_] = '\0';
++          size_t size = used_;
++          used_ = 0;  // a handler may service serial again during a vendor wait
++          handle(line_, size);
++          return;
++        }
++        used_ = 0;
++        discarding_ = false;
++        return;
++      }
++      if (discarding_) continue;
++      if (used_ == BOT_SERIAL_LINE_MAX) {
++        discarding_ = true;  // discard the entire oversized line, through LF
++      } else {
++        line_[used_++] = ch;
++      }
++    }
++  }
++
++  bool defer(const char* line, size_t size, uint32_t receivedAt) {
++    if (count_ == BOT_SERIAL_PENDING_LINES) {
++      ++dropped;
++      return false;
++    }
++    size_t slot = (first_ + count_) % BOT_SERIAL_PENDING_LINES;
++    memcpy(pending_[slot], line, size + 1);
++    receivedAt_[slot] = receivedAt;
++    ++count_;
++    return true;
++  }
++
++  const char* front() const { return count_ ? pending_[first_] : nullptr; }
++  uint32_t frontReceivedAt() const { return receivedAt_[first_]; }
++  void pop() {
++    if (count_) {
++      first_ = (first_ + 1) % BOT_SERIAL_PENDING_LINES;
++      --count_;
++    }
++  }
++  void cancelPending() { dropped += count_; count_ = 0; }
++  uint32_t dropped = 0;
++
++ private:
++  char line_[BOT_SERIAL_LINE_MAX + 1] = {};
++  char pending_[BOT_SERIAL_PENDING_LINES][BOT_SERIAL_LINE_MAX + 1] = {};
++  uint32_t receivedAt_[BOT_SERIAL_PENDING_LINES] = {};
++  size_t used_ = 0, first_ = 0, count_ = 0;
++  bool discarding_ = false;
++};
++
++void bot_serviceSafety();
++void bot_delayMillis(uint32_t duration);
++bool bot_pendingSerial();
++extern bool bot_waitStopped;
++
++#endif
+diff -ruN a/General_Driver/bot_serial_ctrl.h b/General_Driver/bot_serial_ctrl.h
+--- a/General_Driver/bot_serial_ctrl.h	1969-12-31 18:00:00
++++ b/General_Driver/bot_serial_ctrl.h	2026-09-07 22:45:03
+@@ -0,0 +1,86 @@
++// Serial dispatch and cooperative waits; included after the vendor command handler.
++BotSerialInput bot_serialInput;
++bool bot_waitStopped = false;
++uint32_t bot_stopGeneration = 0;
++
++bool bot_pendingSerial() { return bot_serialInput.front() != nullptr; }
++
++// Parse urgent stops separately: vendor functions can still be using the
++// global command document while their cooperative wait services the serial line.
++bool bot_tryImmediateStop(const char* line, size_t size) {
++  StaticJsonDocument<256> stop;
++  if (deserializeJson(stop, line, size)) return false;
++  int type = stop["T"].as<int>();
++  bool zero = type == CMD_SPEED_CTRL && stop["L"].is<float>() &&
++              stop["R"].is<float>() && stop["L"].as<float>() == 0 &&
++              stop["R"].as<float>() == 0;
++  zero = zero || (type == CMD_PWM_INPUT && stop["L"].as<float>() == 0 &&
++                  stop["R"].as<float>() == 0);
++  zero = zero || (type == CMD_ROS_CTRL && stop["X"].as<float>() == 0 &&
++                  stop["Z"].as<float>() == 0);
++  if (type != CMD_SWITCH_OFF && !zero) return false;
++  if (zero) {
++    heartbeatStopFlag = false;
++    lastCmdRecvTime = millis();
++    bot_stopFlags &= ~BOT_ST_COAST;
++    bot_stopMotors();
++  } else {
++    bot_onCoast();
++  }
++  // A stop cancels earlier queued commands; none can restart motion after it.
++  bot_serialInput.cancelPending();
++  bot_waitStopped = true;
++  ++bot_stopGeneration;
++  return true;
++}
++
++void bot_handleSerialLine(const char* line, size_t size) {
++  if (deserializeJson(jsonCmdReceive, line, size)) return;
++  if (InfoPrint == 1 && uartCmdEcho) Serial.println(line);
++  bot_waitStopped = false;
++  jsonCmdReceiveHandler();
++}
++
++void serialCtrl() {
++  if (const char* pending = bot_serialInput.front()) {
++    // Parsing copies strings into jsonCmdReceive before a nested wait can
++    // overwrite the vacated queue slot.
++    if (!deserializeJson(jsonCmdReceive, pending)) {
++      if (InfoPrint == 1 && uartCmdEcho) Serial.println(pending);
++      uint32_t receivedAt = bot_serialInput.frontReceivedAt();
++      bot_serialInput.pop();
++      int type = jsonCmdReceive["T"].as<int>();
++      bool motion = type == CMD_SPEED_CTRL || type == CMD_PWM_INPUT || type == CMD_ROS_CTRL;
++      if (motion && (uint32_t)(millis() - receivedAt) >= (uint32_t)HEART_BEAT_DELAY) {
++        ++bot_serialInput.dropped;
++        return;  // a vendor wait cannot extend a queued wheel command's lifetime
++      }
++      bot_waitStopped = false;
++      // Accepted wheel commands retain only the heartbeat time left at receipt.
++      jsonCmdReceiveHandler(receivedAt);
++      heartBeatCtrl();
++    } else {
++      bot_serialInput.pop();
++    }
++    return;
++  }
++  bot_serialInput.poll(Serial, bot_handleSerialLine);
++}
++
++void bot_serviceSafety() {
++  heartBeatCtrl();
++  bot_safetyUpdate();
++  bot_serialInput.poll(Serial, [](const char* line, size_t size) {
++    if (!bot_tryImmediateStop(line, size)) bot_serialInput.defer(line, size, millis());
++  });
++  heartBeatCtrl();
++}
++
++void bot_delayMillis(uint32_t duration) {
++  uint32_t start = millis();
++  uint32_t generation = bot_stopGeneration;
++  while ((uint32_t)(millis() - start) < duration && generation == bot_stopGeneration) {
++    bot_serviceSafety();
++    delay(1);  // yield to ESP32 tasks; never suspend the safety checks for a full wait
++  }
++}
+diff -ruN a/General_Driver/files_ctrl.h b/General_Driver/files_ctrl.h
+--- a/General_Driver/files_ctrl.h	2025-11-27 20:54:04
++++ b/General_Driver/files_ctrl.h	2026-09-07 22:13:10
+@@ -52,6 +52,7 @@
+     jsonInfoHttp["info"] = "reading files and the first line";
+     File file = root.openNextFile();
+     while (file) {
++      bot_serviceSafety();
+         if (!file.isDirectory()) {
+         	Serial.println(">>>---=== File Name and First line ===---<<<");
+         	Serial.println("[file]: [" + String(file.name()) + "]");
+@@ -126,6 +127,7 @@
+ 
+ 	int _LineNum = -1;
+ 	while (file.available()) {
++		bot_serviceSafety();
+ 		_LineNum++;
+ 		String line = file.readStringUntil('\n');
+ 		Serial.print("[lineNum: ");Serial.print(_LineNum+1);Serial.print(" ] - ");
+@@ -200,6 +202,7 @@
+ 
+ 	int i = 0;
+ 	while (file.available()) {
++		bot_serviceSafety();
+ 		if (i == lineNum - 1) {
+ 			lines[i] = newLineString;
+ 			i++;
+@@ -237,6 +240,7 @@
+ 
+ 	int i = 0;
+ 	while (file.available()) {
++		bot_serviceSafety();
+ 		lines[i] = file.readStringUntil('\n');
+ 		i++;
+ 	}
+@@ -267,6 +271,7 @@
+ 	String line;
+ 	int i = 0;
+ 	while (file.available()) {
++		bot_serviceSafety();
+ 		line = file.readStringUntil('\n');
+ 		if (i == lineNum-1) {
+ 			file.close();
+@@ -300,6 +305,7 @@
+   int i = 1;
+ 
+   while(file.available()){
++    bot_serviceSafety();
+     String line = file.readStringUntil('\n');
+     if(i != lineNum){
+       contents += line + "\n";  
+@@ -316,4 +322,4 @@
+   Serial.println("--- --- --- NEW FILE -- --- ---");
+   jsonInfoHttp.clear();
+   readFile(fileName);
+-}
+\ No newline at end of file
++}
+diff -ruN a/General_Driver/gimbal_module.h b/General_Driver/gimbal_module.h
+--- a/General_Driver/gimbal_module.h	2025-11-27 20:54:04
++++ b/General_Driver/gimbal_module.h	2026-09-07 22:13:10
+@@ -71,7 +71,7 @@
+ void gimbalCtrlStop() {
+   st.EnableTorque(GIMBAL_PAN_ID, 0);
+   st.EnableTorque(GIMBAL_TILT_ID, 0);
+-  delay(SERVO_STOP_DELAY);
++  bot_delayMillis(SERVO_STOP_DELAY);
+   st.EnableTorque(GIMBAL_PAN_ID, 1);
+   st.EnableTorque(GIMBAL_TILT_ID, 1);
+ }
+@@ -181,18 +181,18 @@
+     gimbalCtrlSimple(goalX, goalY, inputSpd, 0);
+     if(inputX == 0){
+       servoTorqueCtrl(GIMBAL_PAN_ID, 0);
+-      delay(5);
++      bot_delayMillis(5);
+       servoTorqueCtrl(GIMBAL_PAN_ID, 1);
+       getGimbalFeedback();
+       goalX = panAngleCompute(gimbalFeedback[0].pos);
+     }
+     if(inputY == 0){
+       servoTorqueCtrl(GIMBAL_TILT_ID, 0);
+-      delay(5);
++      bot_delayMillis(5);
+       servoTorqueCtrl(GIMBAL_TILT_ID, 1);
+       getGimbalFeedback();
+       goalY = tiltAngleCompute(gimbalFeedback[1].pos);
+     }
+   }
+ 
+-}
+\ No newline at end of file
++}
+diff -ruN a/General_Driver/movtion_module.h b/General_Driver/movtion_module.h
+--- a/General_Driver/movtion_module.h	2026-09-07 22:46:06
++++ b/General_Driver/movtion_module.h	2026-09-07 22:12:29
+@@ -328,6 +328,18 @@
+ float bot_applied_L = 0;
+ float bot_applied_R = 0;
+ 
++// Stop the physical outputs regardless of mainType or whether PID is running.
++void bot_stopMotors() {
++  usePIDCompute = false;
++  setpointA = setpointB = 0;
++  setpointA_buffer = setpointB_buffer = 0;
++  outputA = outputB = 0;
++  bot_req_A = bot_req_B = 0;
++  bot_applied_L = bot_applied_R = 0;
++  leftCtrlRaw(0);
++  rightCtrlRaw(0);
++}
++
+ // Applies the request pair under the stop flags and drives both H-bridges.
+ // Forward block (docs/protocol.md): with st bit 2 or 4 set, a pair with L>0
+ // and R>0 is applied as zeros; reverse and rotation pass. Low battery (bit 8)
+@@ -364,10 +376,8 @@
+ // low. Zero the request pair so a later re-drive cannot restart the old
+ // motion, and raise stop flag 16 until the next speed command clears it.
+ void bot_onCoast() {
+-  bot_req_A = 0;
+-  bot_req_B = 0;
+-  bot_applied_L = 0;
+-  bot_applied_R = 0;
++  bot_stopMotors();
++  switchEmergencyStop();  // retain the all-inputs-low coast state
+   bot_stopFlags |= BOT_ST_COAST;
+ }
+ 
+@@ -375,6 +385,10 @@
+   // bot: cap the request first, in the host's units, and count it.
+   inputLeft = bot_clampPower(inputLeft);
+   inputRight = bot_clampPower(inputRight);
++  if (inputLeft == 0 && inputRight == 0) {
++    bot_stopMotors();
++    return;
++  }
+   // setpoint_cmd_recv = millis();
+   if (mainType == 3) {
+     usePIDCompute = true;
+@@ -478,12 +492,10 @@
+ }
+ 
+ void heartBeatCtrl() {
+-  if (currentTimeMillis - lastCmdRecvTime > HEART_BEAT_DELAY) {
++  if (millis() - lastCmdRecvTime >= (unsigned long)HEART_BEAT_DELAY) {
+     if (!heartbeatStopFlag) {
+       heartbeatStopFlag = true;
+-      setGoalSpeed(0, 0);
+-      // leftCtrl(0);
+-      // rightCtrl(0);
++      bot_stopMotors();
+     }
+   }
+ }
+@@ -499,6 +511,9 @@
+ }
+ 
+ void mm_settings(byte inputMain, byte inputModule) {
++  // Changing the chassis mode cannot leave the old PWM running behind an
++  // inactive PID path. Module-only changes retain their existing behaviour.
++  if (inputMain != mainType) bot_stopMotors();
+   mainType = inputMain;
+   moduleType = inputModule;
+ 
+@@ -539,4 +554,4 @@
+   } else if (moduleType == 2) {
+     screenLine_2 += " PT";
+   } 
+-}
+\ No newline at end of file
++}
+diff -ruN a/General_Driver/uart_ctrl.h b/General_Driver/uart_ctrl.h
+--- a/General_Driver/uart_ctrl.h	2026-09-07 22:46:06
++++ b/General_Driver/uart_ctrl.h	2026-09-07 22:45:03
+@@ -1,4 +1,4 @@
+-void jsonCmdReceiveHandler(){
++void jsonCmdReceiveHandler(uint32_t receivedAt){
+ 	int cmdType = jsonCmdReceive["T"].as<int>();
+ 	switch(cmdType){
+ 	case CMD_SPEED_CTRL:	if (jsonCmdReceive.containsKey("T") &&
+@@ -7,7 +7,7 @@
+ 													if (jsonCmdReceive["L"].is<float>() &&
+ 															jsonCmdReceive["R"].is<float>()){
+ 														heartbeatStopFlag = false;
+-														lastCmdRecvTime = millis();
++														lastCmdRecvTime = receivedAt;
+ 														bot_stopFlags &= ~BOT_ST_COAST;  // bot: a speed command ends a coast
+ 														setGoalSpeed(
+ 														jsonCmdReceive["L"],
+@@ -16,7 +16,7 @@
+ 												} break;
+ 	case CMD_PWM_INPUT:		usePIDCompute = false;
+ 												heartbeatStopFlag = false;
+-												lastCmdRecvTime = millis();
++												lastCmdRecvTime = receivedAt;
+ 												bot_stopFlags &= ~BOT_ST_COAST;  // bot
+ 												leftCtrl(jsonCmdReceive["L"]);
+ 												rightCtrl(jsonCmdReceive["R"]);
+@@ -25,7 +25,7 @@
+ 												jsonCmdReceive["X"],
+ 												jsonCmdReceive["Z"]);
+ 												heartbeatStopFlag = false;
+-												lastCmdRecvTime = millis();
++												lastCmdRecvTime = receivedAt;
+ 												bot_stopFlags &= ~BOT_ST_COAST;break;  // bot
+ 	case CMD_SET_MOTOR_PID:
+ 												setPID(
+@@ -216,8 +216,7 @@
+ 	// case CMD_LIGHT_CTRL:	lightCtrl(
+ 	// 											jsonCmdReceive["led"]
+ 	// 											);break;
+-	case CMD_SWITCH_OFF:  switchEmergencyStop();
+-												bot_onCoast();break;  // bot: stop flag 16, request pair zeroed
++	case CMD_SWITCH_OFF:  bot_onCoast();break;  // bot: zero PWM, coast, and stop flag 16
+ 	case CMD_SINGLE_JOINT_ANGLE:
+ 												RoArmM2_singleJointAngleCtrl(
+ 												jsonCmdReceive["joint"],
+@@ -481,7 +480,7 @@
+ 												createFile("boot", "these cmds run automatically at boot.");
+ 												break;
+ 	case CMD_NVS_CLEAR:		nvs_flash_erase();
+-												delay(1000);
++												bot_delayMillis(1000);
+ 												nvs_flash_init();
+ 												break;
+ 	case CMD_INFO_PRINT:	configInfoPrint(
+@@ -501,27 +500,4 @@
+ }
+ 
+ 
+-void serialCtrl() {
+-  static String receivedData;
+-
+-  while (Serial.available() > 0) {
+-    char receivedChar = Serial.read();
+-    receivedData += receivedChar;
+-
+-    // Detect the end of the JSON string based on a specific termination character
+-    if (receivedChar == '\n') {
+-      // Now we have received the complete JSON string
+-      DeserializationError err = deserializeJson(jsonCmdReceive, receivedData);
+-      if (err == DeserializationError::Ok) {
+-  			if (InfoPrint == 1 && uartCmdEcho) {
+-  				Serial.print(receivedData);
+-  			}
+-        jsonCmdReceiveHandler();
+-      } else {
+-        // Handle JSON parsing error here
+-      }
+-      // Reset the receivedData for the next JSON string
+-      receivedData = "";
+-    }
+-  }
+-}
+\ No newline at end of file
++#include "bot_serial_ctrl.h"
+diff -ruN a/General_Driver/ugv_advance.h b/General_Driver/ugv_advance.h
+--- a/General_Driver/ugv_advance.h	2026-09-07 22:46:06
++++ b/General_Driver/ugv_advance.h	2026-09-07 22:45:03
+@@ -1,12 +1,12 @@
+ // advance funcs for RoArm-M2 ctrl
+ // place holder.
+-void jsonCmdReceiveHandler();
++void jsonCmdReceiveHandler(uint32_t receivedAt = millis());
+ bool moveToStep(String inputName, int inputStepNum);
+ 
+ 
+ // mission abort after serial received anything.
+ bool serialMissionAbort() {
+-	if (Serial.available()) {
++	if (Serial.available() || bot_pendingSerial() || bot_waitStopped) {
+ 		if (InfoPrint == 1) {Serial.println("[missionPlay abort.]");}
+ 		return true;
+ 	} else {
+@@ -48,6 +48,7 @@
+ 
+ 	int _LineNum = 0;
+ 	while (file.available()) {
++		bot_serviceSafety();
+ 		_LineNum++;
+ 		String line = file.readStringUntil('\n');
+ 		Serial.print("[StepNum: ");Serial.print(_LineNum);Serial.print(" ] - ");
+@@ -222,6 +223,7 @@
+ // it will process the cmd.
+ bool moveToStep(String inputName, int inputStepNum) {
+ 	String stepStringBuffer = readSingleLine(inputName + ".mission", inputStepNum + 1);
++	if (bot_waitStopped) return false;  // bot: a stop during file I/O cancels this step
+ 	DeserializationError err = deserializeJson(jsonCmdReceive, stepStringBuffer);
+ 	if (err == DeserializationError::Ok) {
+ 		if (InfoPrint == 1) {
+@@ -251,9 +253,12 @@
+ // when repeatTimes = -1, it will loop forever.
+ // play a mission file.
+ void missionPlay(String inputName, int repeatTimes) {
++	bot_waitStopped = false;
+ 	int _LineNum = missionContent(inputName);
+ 	int currentTimes = 0;
+ 	while (1) {
++		bot_serviceSafety();
++		if (serialMissionAbort()) return;
+ 		currentTimes++;
+ 		if (currentTimes > repeatTimes && repeatTimes != -1) {
+ 			if (InfoPrint == 1) {Serial.println("[missionPlay finished.]");}
+@@ -265,6 +270,7 @@
+ 		}
+ 
+ 		for (int i = 1; i<=_LineNum; i++) {
++			bot_serviceSafety();
+ 			if (serialMissionAbort()) {
+ 				return;
+ 			}
+@@ -463,4 +469,4 @@
+ 	String getInfoJsonString;
+ 	serializeJson(jsonInfoHttp, getInfoJsonString);
+ 	appendStepJson("boot", getInfoJsonString);
+-}
+\ No newline at end of file
++}

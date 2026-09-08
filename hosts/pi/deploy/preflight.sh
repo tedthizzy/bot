@@ -4,10 +4,8 @@
 #
 #   sudo /opt/rover/hosts/pi/deploy/preflight.sh
 #
-# It asserts; it never writes. The cliff baseline in particular is derived on
-# the MCU and only checked here, which is what keeps the down-link's
-# integer-only, narrowing-only story intact (there is no config_set on the wire,
-# by design).
+# It checks the current WAVE ROVER configuration and probes peripherals.
+# It never commands motion or starts a service.
 #
 # Every check prints ok/FAIL/skip and the script exits non-zero if anything
 # failed. A skip is a check that could not run, not a check that passed.
@@ -67,8 +65,8 @@ if "$PY" - "$CONFIG" <<'PY'
 import sys
 from rover_contracts.config import load_config
 c = load_config(sys.argv[1])
-print(f"    speed_mps={c.limits.speed_mps} tof_stop_mm={c.safety.tof_stop_mm} "
-      f"hfov_deg={c.camera.hfov_deg} port={c.serial.port}")
+print(f"    power_max={c.limits.power_max} tof_stop_mm={c.safety.tof_stop_mm} "
+      f"hfov_deg={c.camera.hfov_deg} port={c.link.port}")
 PY
 then ok "$CONFIG loads and every ceiling holds"
 else bad "$CONFIG does not validate"; fi
@@ -148,7 +146,7 @@ fi
 
 head_ "audio"
 match=$("$PY" -c "import os;from rover_contracts.config import load_config;print(load_config(os.environ['ROVER_CONFIG']).audio.device_match)" 2>/dev/null || echo ReSpeaker)
-if "$PY" - "$match" <<'PY'
+if "$BRAIN_PY" - "$match" <<'PY'
 import sys
 import sounddevice as sd
 want = sys.argv[1].lower()

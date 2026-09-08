@@ -152,9 +152,7 @@ def watchdog_period_s(default: float = 5.0) -> float:
 class Robotd:
     """The whole daemon: bus, link, arbitration, profiles, heading and logs."""
 
-    def __init__(
-        self, config: RobotConfig, *, clock: Any = time.monotonic_ns
-    ) -> None:
+    def __init__(self, config: RobotConfig, *, clock: Any = time.monotonic_ns) -> None:
         self.config = config
         self.clock = clock
         self.session_id = new_session_id()
@@ -348,8 +346,11 @@ class Robotd:
             raw = payload.get("source")
             source = Source(raw) if raw in set(Source) else None
         if source is None or str(source) not in self.config.bus.allow_sources:
-            log.warning("stop-class %r from a source that may not command: %r",
-                        message_type, payload.get("source"))
+            log.warning(
+                "stop-class %r from a source that may not command: %r",
+                message_type,
+                payload.get("source"),
+            )
             return
 
         if message_type == "estop":
@@ -378,8 +379,12 @@ class Robotd:
         verdict = self.validator.check_skill(message, connection.session, self._context())
         if isinstance(verdict, Rejection):
             self._publish_result(
-                message.cmd_id, ResultStatus.REJECTED, verdict.reason,
-                seq=message.seq, detail_text=verdict.detail, connection=connection,
+                message.cmd_id,
+                ResultStatus.REJECTED,
+                verdict.reason,
+                seq=message.seq,
+                detail_text=verdict.detail,
+                connection=connection,
             )
             return
         if not verdict.moves:
@@ -387,8 +392,11 @@ class Robotd:
             # part is the bound check, and A31 forbids reporting a completion
             # the executor has not made.
             self._publish_result(
-                message.cmd_id, ResultStatus.ACCEPTED, ResultReason.NONE,
-                seq=message.seq, connection=connection,
+                message.cmd_id,
+                ResultStatus.ACCEPTED,
+                ResultReason.NONE,
+                seq=message.seq,
+                connection=connection,
             )
             return
         self._start_motion(connection, verdict)
@@ -444,8 +452,12 @@ class Robotd:
         verdict = self.validator.check_twist(message, connection.session, self._context())
         if isinstance(verdict, Rejection):
             self._publish_result(
-                message.cmd_id, ResultStatus.REJECTED, verdict.reason,
-                seq=message.seq, detail_text=verdict.detail, connection=connection,
+                message.cmd_id,
+                ResultStatus.REJECTED,
+                verdict.reason,
+                seq=message.seq,
+                detail_text=verdict.detail,
+                connection=connection,
             )
             return
         self._renew_twist(connection, verdict)
@@ -476,8 +488,11 @@ class Robotd:
         self._install(command, verdict.arbitration)
         self.episodes.start()
         self._publish_result(
-            message.cmd_id, ResultStatus.ACCEPTED, ResultReason.NONE,
-            seq=message.seq, connection=connection,
+            message.cmd_id,
+            ResultStatus.ACCEPTED,
+            ResultReason.NONE,
+            seq=message.seq,
+            connection=connection,
         )
 
     def _install(self, command: ActiveCommand, arbitration: Arbitration) -> None:
@@ -486,8 +501,12 @@ class Robotd:
             if loser.kind is CommandKind.TWIST:
                 self.episodes.stop()
             self._publish_result(
-                loser.cmd_id, ResultStatus.PREEMPTED, ResultReason.NONE, seq=loser.seq,
-                detail=self._detail_for(loser), connection=self._owner(loser),
+                loser.cmd_id,
+                ResultStatus.PREEMPTED,
+                ResultReason.NONE,
+                seq=loser.seq,
+                detail=self._detail_for(loser),
+                connection=self._owner(loser),
             )
 
     # -- the control loop ---------------------------------------------------
@@ -569,9 +588,7 @@ class Robotd:
             self._abort(ResultStatus.ABORTED, reason, "feedback stale")
             return (0.0, 0.0)
         if not self.link.firmware_ok:
-            self._abort(
-                ResultStatus.ABORTED, ResultReason.UNPATCHED_FIRMWARE, "firmware"
-            )
+            self._abort(ResultStatus.ABORTED, ResultReason.UNPATCHED_FIRMWARE, "firmware")
             return (0.0, 0.0)
         if active.kind is CommandKind.TWIST:
             return self._step_twist(active, now)
@@ -645,8 +662,12 @@ class Robotd:
     ) -> None:
         self.arbiter.finish(active.cmd_id)
         self._publish_result(
-            active.cmd_id, status, reason, seq=active.seq,
-            detail=self._detail_for(active), connection=self._owner(active),
+            active.cmd_id,
+            status,
+            reason,
+            seq=active.seq,
+            detail=self._detail_for(active),
+            connection=self._owner(active),
         )
 
     def _abort(
@@ -659,8 +680,12 @@ class Robotd:
             self.episodes.stop()
         self.arbiter.finish(active.cmd_id)
         self._publish_result(
-            active.cmd_id, status, reason, seq=active.seq,
-            detail=self._detail_for(active), detail_text=detail_text,
+            active.cmd_id,
+            status,
+            reason,
+            seq=active.seq,
+            detail=self._detail_for(active),
+            detail_text=detail_text,
             connection=self._owner(active),
         )
 
@@ -772,15 +797,23 @@ class Robotd:
         knowing what happened to a command it sent.
         """
         message = ResultMessage(
-            cmd_id=cmd_id, seq=seq, status=status, reason=reason,
-            detail=detail, t_utc_ns=time.time_ns(),
+            cmd_id=cmd_id,
+            seq=seq,
+            status=status,
+            reason=reason,
+            detail=detail,
+            t_utc_ns=time.time_ns(),
         )
         for client in self.bus.connections:
             if client is connection or client.wants(SubscribeTopic.RESULT):
                 client.send(message)
         self.logs.command(
-            {"decision": str(status), "cmd_id": cmd_id, "reason": str(reason),
-             "detail": detail_text}
+            {
+                "decision": str(status),
+                "cmd_id": cmd_id,
+                "reason": str(reason),
+                "detail": detail_text,
+            }
         )
 
     def _publish_event(
@@ -839,7 +872,9 @@ class Robotd:
             twist=StateTwist(lin=(left + right) / 2.0, ang=(right - left) / 2.0),
             front_m=(
                 feedback.tof_mm / 1000.0
-                if feedback is not None and feedback.tof_valid
+                if feedback is not None
+                and feedback.tof_mm is not None
+                and feedback.tof_valid
                 else None
             ),
             bumper=bool(feedback.bumper) if feedback is not None else False,
@@ -907,7 +942,9 @@ class Robotd:
 
     def _flag_detail(self, feedback: Feedback) -> dict[str, Any]:
         return {
-            "front_m": feedback.tof_mm / 1000.0 if feedback.tof_valid else None,
+            "front_m": feedback.tof_mm / 1000.0
+            if feedback.tof_mm is not None and feedback.tof_valid
+            else None,
             "bumper": feedback.bumper,
             "bus_v": feedback.bus_v,
         }
@@ -958,8 +995,11 @@ class Robotd:
         if is_ulid(cmd_id):
             assert isinstance(cmd_id, str)
             self._publish_result(
-                cmd_id, ResultStatus.REJECTED, rejection.reason,
-                detail_text=rejection.detail, connection=connection,
+                cmd_id,
+                ResultStatus.REJECTED,
+                rejection.reason,
+                detail_text=rejection.detail,
+                connection=connection,
             )
             return
         connection.send(

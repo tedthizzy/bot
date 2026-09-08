@@ -26,6 +26,7 @@ from pydantic import ValidationError
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "packages"))
 
+from rover_brain.prompt import build_observation_messages  # noqa: E402
 from rover_contracts import (  # noqa: E402
     SkillName,
     WorldState,
@@ -166,7 +167,11 @@ def test_every_case_validates_and_yields_its_skill(case: Case) -> None:
 
 def test_the_cases_are_architecture_13s_mix_and_unique() -> None:
     assert Counter(case.category for case in CASES) == {
-        "motion": 20, "speech": 8, "vision": 8, "oob": 6, "unknown_skill": 4,
+        "motion": 20,
+        "speech": 8,
+        "vision": 8,
+        "oob": 6,
+        "unknown_skill": 4,
         "ambiguous": 4,
     }
     utterances = [case.utterance for case in CASES]
@@ -186,8 +191,14 @@ def test_the_cases_are_architecture_13s_mix_and_unique() -> None:
 
 @pytest.mark.parametrize(
     "utterance",
-    ["turn left ninety degrees", "drive forward for two seconds", "stop", "smile",
-     "look for the red mug", "wibble frotz"],
+    [
+        "turn left ninety degrees",
+        "drive forward for two seconds",
+        "stop",
+        "smile",
+        "look for the red mug",
+        "wibble frotz",
+    ],
 )
 def test_served_content_validates_against_the_exported_schema(utterance: str) -> None:
     with running() as (url, _):
@@ -196,9 +207,18 @@ def test_served_content_validates_against_the_exported_schema(utterance: str) ->
 
 
 @pytest.mark.parametrize("kind", ["find", "scene"])
-def test_observations_cannot_contain_a_skill(kind: str) -> None:
+@pytest.mark.parametrize("mode", ["json_schema", "json_object"])
+def test_observations_cannot_contain_a_skill(kind: str, mode: str) -> None:
+    payload = chat_request("find the red mug", schema=kind)
+    if mode == "json_object":
+        payload["response_format"] = {"type": mode}
+        payload["messages"] = build_observation_messages(
+            kind,
+            image_jpeg=b"JPEG",
+            target="red mug",
+        )
     with running() as (url, _):
-        content = content_of(url, chat_request("find the red mug", schema=kind))
+        content = content_of(url, payload)
     observation = observation_adapter.validate_json(content)
     assert observation.kind == kind
     assert not hasattr(observation, "skill")
@@ -206,15 +226,15 @@ def test_observations_cannot_contain_a_skill(kind: str) -> None:
 
 
 def test_turns_are_heading_arithmetic_in_the_compass_frame() -> None:
-    # TurnToArgs: left 90 is (heading - 90) mod 360.
-    assert plan("turn left ninety degrees", HEADING)["args"] == {"heading_deg": 357}
-    assert plan("turn left", HEADING)["args"] == {"heading_deg": 357}
-    assert plan("turn right forty five degrees", HEADING)["args"] == {"heading_deg": 132}
-    assert plan("rotate left thirty degrees", HEADING)["args"] == {"heading_deg": 57}
+    # Host headings increase leftward.
+    assert plan("turn left ninety degrees", HEADING)["args"] == {"heading_deg": 177}
+    assert plan("turn left", HEADING)["args"] == {"heading_deg": 177}
+    assert plan("turn right forty five degrees", HEADING)["args"] == {"heading_deg": 42}
+    assert plan("rotate left thirty degrees", HEADING)["args"] == {"heading_deg": 117}
     assert plan("spin around", HEADING)["args"] == {"heading_deg": 267}
-    assert plan("turn left ninety degrees", 45)["args"] == {"heading_deg": 315}
-    assert plan("turn left ninety degrees", 0)["args"] == {"heading_deg": 270}
-    assert plan("turn right 20", 350)["args"] == {"heading_deg": 10}
+    assert plan("turn left ninety degrees", 45)["args"] == {"heading_deg": 135}
+    assert plan("turn left ninety degrees", 0)["args"] == {"heading_deg": 90}
+    assert plan("turn right 20", 350)["args"] == {"heading_deg": 330}
 
 
 def test_an_absolute_heading_is_taken_as_given() -> None:
@@ -234,13 +254,15 @@ def test_drives_are_a_power_for_a_time() -> None:
         "args": {"duration_ms": 2000, "power_pct": 20},
     }
     assert plan("back up for half a second")["args"] == {
-        "duration_ms": 500, "power_pct": -20,
+        "duration_ms": 500,
+        "power_pct": -20,
     }
     assert plan("reverse for one second")["args"]["power_pct"] == -20
     assert plan("drive forward slowly")["args"] == {"duration_ms": 1000, "power_pct": 10}
     assert plan("go at thirty percent")["args"]["power_pct"] == 30
     assert plan("go forward at ten percent power for one second")["args"] == {
-        "duration_ms": 1000, "power_pct": 10,
+        "duration_ms": 1000,
+        "power_pct": 10,
     }
     assert plan("go forward a little")["args"]["duration_ms"] == 500
     assert plan("walk forward twenty centimetres")["args"]["duration_ms"] == 400
@@ -274,8 +296,10 @@ def test_out_of_schema_requests_are_clamped_into_the_schema() -> None:
         ("go at ninety percent power", {"duration_ms": 1000, "power_pct": 30}),
         ("back up two metres", {"duration_ms": 2000, "power_pct": -20}),
         ("reverse for a minute", {"duration_ms": 2000, "power_pct": -20}),
-        ("drive forward at full speed for five seconds",
-         {"duration_ms": 2000, "power_pct": 30}),
+        (
+            "drive forward at full speed for five seconds",
+            {"duration_ms": 2000, "power_pct": 30},
+        ),
     ):
         call = plan(utterance)
         assert call["args"] == args, utterance
@@ -287,9 +311,9 @@ def test_the_server_reads_the_heading_from_the_world_state() -> None:
         at_87 = json.loads(content_of(url, chat_request("turn left", heading=87)))
         at_45 = json.loads(content_of(url, chat_request("turn left", heading=45)))
         none = json.loads(content_of(url, chat_request("turn left", heading=None)))
-    assert at_87["args"]["heading_deg"] == 357
-    assert at_45["args"]["heading_deg"] == 315
-    assert none["args"]["heading_deg"] == 270
+    assert at_87["args"]["heading_deg"] == 177
+    assert at_45["args"]["heading_deg"] == 135
+    assert none["args"]["heading_deg"] == 90
     assert [r.heading_deg for r in box.requests] == [87, 45, 0]
 
 
@@ -298,9 +322,12 @@ def test_heading_of_ignores_anything_that_is_not_a_world_state() -> None:
     assert heading_of(chat_request("go", heading=None)["messages"]) == 0
     broken = [{"role": "user", "content": [{"type": "text", "text": "{not json"}]}]
     assert heading_of(broken) == 0
-    boolean = [{"role": "user", "content": [
-        {"type": "text", "text": json.dumps({"heading_deg": True})}
-    ]}]
+    boolean = [
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": json.dumps({"heading_deg": True})}],
+        }
+    ]
     assert heading_of(boolean) == 0
 
 
@@ -313,9 +340,10 @@ def test_the_same_request_twice_gives_the_same_content() -> None:
 
 
 def test_models_endpoint_lists_the_served_model() -> None:
-    with running() as (url, box), urllib.request.urlopen(
-        url + "/models", timeout=5.0
-    ) as response:
+    with (
+        running() as (url, box),
+        urllib.request.urlopen(url + "/models", timeout=5.0) as response,
+    ):
         body = json.loads(response.read())
     assert [entry["id"] for entry in body["data"]] == [box.model]
 
@@ -341,7 +369,7 @@ def test_streaming_reassembles_to_the_same_content() -> None:
                     pieces.append(choice["delta"].get("content") or "")
     assert "".join(pieces) == plain
     call = skill_call_adapter.validate_json(plain)
-    assert call.args.heading_deg == 357
+    assert call.args.heading_deg == 177
 
 
 # --------------------------------------------------------------------------
@@ -376,8 +404,9 @@ def test_the_recorder_sees_every_request_in_order() -> None:
     with running() as (url, box):
         content_of(url, chat_request("stop"))
         content_of(url, chat_request("what do you see", schema="scene"))
-        with urllib.request.urlopen(url.replace("/v1", "") + "/_fakebox/requests",
-                                    timeout=5.0) as response:
+        with urllib.request.urlopen(
+            url.replace("/v1", "") + "/_fakebox/requests", timeout=5.0
+        ) as response:
             recorded = json.loads(response.read())
     assert recorded["count"] == 2
     assert [r["utterance"] for r in recorded["requests"]] == [
@@ -424,8 +453,17 @@ def test_parse_fault_rejects_an_unknown_name() -> None:
 
 def test_every_documented_fault_is_implemented() -> None:
     documented = {
-        "malformed_json", "out_of_range", "unknown_skill", "extra_field",
-        "nonfinite", "empty", "http_500", "stall", "slow", "truncate", "injection",
+        "malformed_json",
+        "out_of_range",
+        "unknown_skill",
+        "extra_field",
+        "nonfinite",
+        "empty",
+        "http_500",
+        "stall",
+        "slow",
+        "truncate",
+        "injection",
     }
     assert documented == FAULTS
 
@@ -504,8 +542,9 @@ def test_stall_never_answers() -> None:
     # The T3 first-token timeout from the client's side: the connection closes
     # with no status line, which reaches urllib as one of these three.
     no_answer = (urllib.error.URLError, http.client.HTTPException, OSError)
-    with running(FakeBox(fault="stall", fault_arg=150.0)) as (url, _), pytest.raises(
-        no_answer
+    with (
+        running(FakeBox(fault="stall", fault_arg=150.0)) as (url, _),
+        pytest.raises(no_answer),
     ):
         post(url, chat_request("drive forward"), timeout=3.0)
 
@@ -532,11 +571,13 @@ def test_ttft_pacing_delays_the_first_token() -> None:
 
 def test_from_env_reads_the_three_documented_variables() -> None:
     box = FakeBox.from_env(
-        {"FAKEBOX_FAULT": "slow:300", "FAKEBOX_TTFT_MS": "50",
-         "FAKEBOX_TOK_PER_S": "40"}
+        {"FAKEBOX_FAULT": "slow:300", "FAKEBOX_TTFT_MS": "50", "FAKEBOX_TOK_PER_S": "40"}
     )
     assert (box.fault, box.fault_arg, box.ttft_ms, box.tok_per_s) == (
-        "slow", 300.0, 50.0, 40.0
+        "slow",
+        300.0,
+        50.0,
+        40.0,
     )
 
 

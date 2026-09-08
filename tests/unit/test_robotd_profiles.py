@@ -81,7 +81,9 @@ def test_a_drive_refuses_zero_power_or_a_non_positive_duration() -> None:
         DriveForProfile(0.2, 0.0)
 
 
-@pytest.mark.parametrize(("duration", "expected_s"), [(1.0, 2.0), (2.0, 3.5), (0.1, 0.65)])
+@pytest.mark.parametrize(
+    ("duration", "expected_s"), [(1.0, 2.0), (2.0, 3.5), (0.1, 0.65)]
+)
 def test_goal_deadline_is_the_t2_estimate(duration: float, expected_s: float) -> None:
     assert goal_deadline_s(duration) == pytest.approx(expected_s)
 
@@ -131,7 +133,11 @@ def test_a_turn_converges_on_a_simulated_heading() -> None:
     assert profile.error_deg is not None
     assert abs(profile.error_deg) <= LIMITS.turn_tolerance_deg
     assert profile.turned_deg == pytest.approx(heading, abs=1e-6)
-    assert all(left < 0.0 < right for left, right in commands), "left turn: left back, right forward"
+    moving = [(left, right) for left, right in commands if left or right]
+    assert moving and all(left < 0.0 < right for left, right in moving), (
+        "left turn: left back, right forward"
+    )
+    assert commands[-1] == (0.0, 0.0), "the in-tolerance sample stops the motors"
 
 
 def test_a_positive_error_turns_left_and_a_negative_one_right() -> None:
@@ -267,9 +273,7 @@ def test_nothing_active_means_start() -> None:
 
 def test_a_twist_preempts_an_active_skill() -> None:
     active = _active(CommandKind.SKILL, Source.BRAIN)
-    assert (
-        arbitrate(Source.TELEOP, CommandKind.TWIST, "B", active) is Arbitration.PREEMPT
-    )
+    assert arbitrate(Source.TELEOP, CommandKind.TWIST, "B", active) is Arbitration.PREEMPT
 
 
 def test_a_skill_preempts_an_active_twist_from_a_lower_source() -> None:
@@ -291,9 +295,7 @@ def test_one_motion_in_flight_refuses_a_second_skill() -> None:
 
 def test_the_same_stream_renews_rather_than_restarting() -> None:
     active = _active(CommandKind.TWIST, Source.TELEOP)
-    assert (
-        arbitrate(Source.TELEOP, CommandKind.TWIST, "B", active) is Arbitration.RENEW
-    )
+    assert arbitrate(Source.TELEOP, CommandKind.TWIST, "B", active) is Arbitration.RENEW
 
 
 def test_the_arbiter_hands_back_the_loser_to_report() -> None:

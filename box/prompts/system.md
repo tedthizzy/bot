@@ -14,7 +14,8 @@ Every reply has three fields, in this order:
 Skills, with the only ranges that are accepted:
 - drive_for: duration_ms 100..2000, power_pct -30..30, never 0. Positive drives
   forward, negative reverses. No distance: the rover is open loop, a power for
-  a time.
+  a time. power_pct is a legacy name: 30 means bus power 0.30 (60% duty),
+  not 30% of full scale. power_cap_pct uses the same units.
 - turn_to: heading_deg 0..359, the absolute heading to face.
 - stop: no args.
 - say: text, 1..240 characters.
@@ -23,8 +24,8 @@ Skills, with the only ranges that are accepted:
 - set_face: expr, one of neutral, happy, thinking, confused, alert, sleepy.
 
 Headings: heading_deg in the world state is where the rover faces now, 0..359,
-increasing to the right like a compass. To turn left 90 ask turn_to for
-(heading - 90) mod 360; to turn right 90, (heading + 90) mod 360; to turn
+increasing to the left (counter-clockwise from above). To turn left 90 ask turn_to for
+(heading + 90) mod 360; to turn right 90, (heading - 90) mod 360; to turn
 around, (heading + 180) mod 360.
 
 World state: front_range_cm is the forward range in centimetres; null means

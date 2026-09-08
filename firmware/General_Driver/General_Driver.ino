@@ -32,6 +32,7 @@ StaticJsonDocument<512> jsonInfoHttp;
 
 // config for ugv.
 #include "ugv_config.h"
+#include "bot_runtime.h"
 
 // functions for the leds of UGV.
 #include "ugv_led_ctrl.h"
@@ -264,6 +265,7 @@ void setup() {
 
 
 void loop() {
+  heartBeatCtrl();  // bot: use the clock directly, before command processing
   serialCtrl();
 #if BOT_WIFI_ENABLED
   server.handleClient();
