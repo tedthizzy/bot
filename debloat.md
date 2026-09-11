@@ -904,6 +904,9 @@ A future rover-only vendor command surface or retirement of the Pi/legacy host r
 
 ## 7. Verification and handoff record
 
+These are the results for commit `354256d`. Section 8 supersedes the counts below
+for the current tree; this section is kept unedited as the record of that commit.
+
 Verification uses a clean locked Python 3.13.2 environment outside the cloud-backed checkout.
 The original local environment and its data were preserved.
 Checks use temporary sockets, OS-assigned loopback ports and owned subprocesses.
@@ -959,3 +962,88 @@ stop latency, coast distance, IMU sign/accuracy, fitted sensor failures, battery
 hysteresis, stall current and Pi thermal/power stability.
 Real speech, real GPU model quality/latency, Android build/behavior and episode conversion
 remain separate completion work, not results inferred from passing simulation.
+
+## 8. Structure and performance audit (2026-09-08)
+
+Section 7 records commit `354256d`. Two commits landed after it, so the counts
+above are that commit's, not this one's. This section records the audit pass and
+restates the numbers; nothing in section 7 was edited.
+
+Six auditors read the tree and measured the running system under three structure
+lenses and three performance lenses. Each actionable finding was then attacked by
+two independent skeptics, one looking for what the change would break or lose and
+one judging whether it made the repo simpler or merely smaller. Only findings both
+skeptics cleared were applied. Twenty-one of the eighty-one agents died mid-run on
+a model quota and were re-run from cache; the completed pass had no errors.
+
+### The defect
+
+State reached the browser and brain at 7.8 Hz against a configured 10, with 150 ms
+gaps, and the feedback log ran at 4.4 Hz against 5. Both decimators compared
+elapsed time against the period (`main.py` `_publish_state`, `log.py`
+`RobotdLog.feedback`) on a 50 ms tick grid, so roughly half a millisecond of wake
+jitter made every second window miss its deadline and be skipped. Reproduced
+deterministically: the same predicate fed a 20 Hz grid with 0-0.6 ms of jitter
+yields 7.57 Hz and a p50 gap of 149.72 ms, and with zero jitter yields 9.98 Hz.
+Both now bucket the timestamp by period, so a tick either lands in a new bucket or
+it does not and jitter cannot move it. `subscribe.state_hz` was also accepted and
+ignored.
+
+### What was removed
+
+Twenty-two tracked files, taking the tree from 327 files in 79 directories to 305
+in 63: fourteen vendor example sketches for a bus-servo library this chassis never
+drives and no build compiles, a five-line re-export shim, a three-file package
+collapsed into one module, a redundant gate test configuration, two inert typing
+markers, and a placeholder for a directory the gate runner creates itself.
+
+The audit's own answer to whether the count was excessive: mostly it was not. The
+firmware carries a vendored sketch whose nine patches must reconstruct it byte for
+byte, the tests track one file per module, and the frozen architecture cites every
+research note and decision record it rests on.
+
+### Performance, measured
+
+The control path is not CPU-bound. With a stub rover, three state subscribers, a
+10 Hz teleop stream and episode recording, robotd used 1.65% of one M4 core
+against 1.16% idle, 40 MB resident, with cProfile placing 96.8% of forty seconds
+inside the event loop's wait and no function above 1% of wall. Per-tick and
+per-request work measured 2-11 microseconds. The 20 Hz command stream measured at
+the stub had p50 50.00 ms, p99 52.5 ms, max 59 ms, against the architecture's
+requirement of p99 under 100 ms. A Pi 4 at five to eight times slower implies
+roughly 6-13% of one core under the same load, which G3a on the Pi remains the
+measurement that settles.
+
+### Executed results at this commit
+
+| Check | Executed result | Limit |
+| --- | --- | --- |
+| Full unit suite | 1,377 passed in 65.20 s | Python 3.13.2; no physical devices |
+| Strict mypy | No issues in 52 source files | Three fewer files than section 7; the removed modules |
+| Ruff and shell syntax | Passed | Not runtime or hardware evidence |
+| Schema and Kotlin generation | Up to date, no regeneration diff | Kotlin classes carry no validators and compile nothing |
+| Runtime dependency closure | No ML package in the base runtime | Optional speech dependencies are separate |
+| Secret scan | Clean across 305 published files | Pattern-based, not proof against every secret format |
+| Native firmware tests | Pass: motor stop, bounded serial intake, cooperative waits | Fake clock and GPIO; blocking library calls unmeasured |
+| Arduino firmware compile | 887,533 bytes flash, 50,332 bytes globals | Not flashed; two retained vendor warnings |
+| Full gate suite | 11 passed, 1 skipped in 76.73 s | G3 physical soak skipped; each gate reports its own physical skips |
+
+### Not applied, and why
+
+Three measured findings survived both skeptics only in narrowed form and were left
+for a decision rather than applied blind. The acknowledgement tone is awaited
+before the model request is spawned, adding about 200 ms to every box turn and
+contradicting the comment above it. The OpenAI SDK costs roughly 580 ms of import
+at each service start and its streaming path does not reuse connections. The
+camera runs its stream encoder unconditionally although nothing consumes stream
+frames. Each has a cost and a behavioural consequence that is not free to change.
+
+### Environment
+
+Tool caches now live beside the interpreter rather than in the checkout. This tree
+sits inside a synced folder that evicts unread files and mints `name 2` conflict
+copies; one such copy corrupted a branch reference and broke fetching, another
+stalled the unit suite for over ten minutes on a single cached bytecode file, and
+a third made mypy fail with an internal error until the cache was deleted by hand.
+Moving the repository off the synced folder is the better fix and has not been
+done.
